@@ -272,7 +272,7 @@ impl Importer<'_> {
             ),
         };
         self.store
-            .upsert(&message)
+            .insert(&message)
             .await
             .with_context(|| format!("storing imported message {:?}", message.id))?;
         if read {
