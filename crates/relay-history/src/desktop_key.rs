@@ -88,6 +88,8 @@ mod tests {
 
     const LINUX_V10_VECTOR: &str = "43fb2f60f0307fa4a0844f86e33b7bc5af3b95cb4cfa8e9e37626472ec7216d1070a2368c3860e13d417f10883ede0130409987ea65ec44d6f4f9692d9539f4400b66e2d72ed03895d74d44f172cd71c";
 
+    const LINUX_V11_VECTOR: &str = "118e9e7f9956e1c17ea731c68b9a8e50717935067f960e9485be36c2dc3a88c4ba811cbd375f8fe4fff9b62574811473a798bb790d452592ca76a5cf0bbbab028cb06a5ec5c6df042f9413bd223d4898";
+
     fn hex(s: &str) -> Vec<u8> {
         (0..s.len())
             .step_by(2)
@@ -116,5 +118,24 @@ mod tests {
         })
         .expect("decrypt");
         assert_eq!(key.0, DB_KEY);
+    }
+
+    /// Linux "v11" values use the keyring's password, still with one iteration.
+    #[test]
+    fn linux_v11_value_decrypts_with_the_keyring_password() {
+        let key = decrypt_linux(&versioned(b"v11", LINUX_V11_VECTOR), || {
+            Ok(b"libsecret-pw".to_vec())
+        })
+        .expect("decrypt");
+        assert_eq!(key.0, DB_KEY);
+    }
+
+    /// Hex-encoding the decrypted key again (as an earlier importer's Windows
+    /// path did) yields a key that opens nothing; it must be refused loudly.
+    #[test]
+    fn a_double_hex_encoded_key_is_refused() {
+        let double: String = DB_KEY.bytes().map(|b| format!("{b:02x}")).collect();
+        let err = DatabaseKey::new(double.as_bytes()).expect_err("accepted a 128-char key");
+        assert!(err.to_string().contains("64 hex"), "unhelpful error: {err}");
     }
 }
