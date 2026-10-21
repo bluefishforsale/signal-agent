@@ -8,10 +8,11 @@ mod key_file;
 #[cfg(target_os = "macos")]
 mod keychain;
 mod memory;
+#[cfg(target_os = "linux")]
+mod secret_service;
 
 use std::{fmt, path::PathBuf};
 
-use anyhow::bail;
 use relay_core::{ProfileName, ProfilePaths};
 
 #[cfg(windows)]
@@ -21,6 +22,12 @@ pub use key_file::KeyFileStore;
 #[cfg(target_os = "macos")]
 pub use keychain::KeychainStore;
 pub use memory::MemorySecretStore;
+#[cfg(target_os = "linux")]
+pub use secret_service::SecretServiceStore;
+
+/// The name keys are filed under in OS keyrings.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const SERVICE: &str = "signal-agent";
 
 /// The 32-byte key both of a profile's SQLCipher databases are encrypted with.
 #[derive(Clone, PartialEq, Eq)]
@@ -65,7 +72,17 @@ pub trait SecretStore: Send + Sync {
 /// The best secret store this machine offers: Keychain, DPAPI, Secret Service,
 /// or the 0600 key file on headless Linux.
 pub fn platform_store() -> anyhow::Result<Box<dyn SecretStore>> {
-    bail!("platform secret stores are not implemented yet (lane L2)")
+    #[cfg(target_os = "macos")]
+    return Ok(Box::new(KeychainStore::new(SERVICE)));
+    #[cfg(windows)]
+    return Ok(Box::new(DpapiFileStore::default()));
+    #[cfg(target_os = "linux")]
+    return Ok(match SecretServiceStore::connect(SERVICE) {
+        Ok(store) => Box::new(store),
+        Err(_) => Box::new(KeyFileStore::default()),
+    });
+    #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+    return Ok(Box::new(KeyFileStore::default()));
 }
 
 /// Where a file-backed store keeps `profile`'s key: its platform data
@@ -108,6 +125,13 @@ mod tests {
             let dir = tempfile::tempdir().expect("tempdir");
             let store = DpapiFileStore::under(dir.path().to_owned());
             out.push(("dpapi file", Box::new(store), Some(dir)));
+        }
+        // NOTE: CI's Linux runner has no D-Bus session, so this store is
+        // skipped there with the reason printed; desktop Linux runs it.
+        #[cfg(target_os = "linux")]
+        match SecretServiceStore::connect("signal-agent-test") {
+            Ok(store) => out.push(("secret service", Box::new(store), None)),
+            Err(e) => eprintln!("skipping the Secret Service store: {e:#}"),
         }
         #[cfg(target_os = "macos")]
         out.push((
@@ -159,6 +183,30 @@ mod tests {
             );
             store.delete(&b).expect("cleanup");
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn expects_file_fallback() -> bool {
+        SecretServiceStore::connect(SERVICE).is_err()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn expects_file_fallback() -> bool {
+        false
+    }
+
+    /// Setup warns about key storage only when it really fell back to a
+    /// plain file; a native keyring must not trigger the warning.
+    #[test]
+    fn platform_store_warns_only_for_the_file_fallback() {
+        let store = platform_store().expect("platform store");
+        let fell_back = expects_file_fallback();
+        assert_eq!(
+            store.caveat().is_some(),
+            fell_back,
+            "caveat {:?} on a store that fell back: {fell_back}",
+            store.caveat()
+        );
     }
 
     /// A key must never print its bytes, whatever wraps it.
