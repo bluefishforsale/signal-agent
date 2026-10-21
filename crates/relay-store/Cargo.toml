@@ -8,8 +8,22 @@ license.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 relay-core.workspace = true
+relay-secrets.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+sqlx = { version = "0.9.0", default-features = false, features = ["sqlite", "runtime-tokio", "migrate", "macros"] }
+# NOTE: must stay the same libsqlite3-sys presage-store-sqlite links, with
+# SQLCipher bundled; a second SQLite build can't link into the binary
+# (docs/slices.md, "One SQLCipher").
+libsqlite3-sys = { version = "0.36.0", features = ["bundled-sqlcipher"] }
+log = "0.4.34"
+
+# Windows has no system OpenSSL for SQLCipher to link, so build it in.
+[target.'cfg(windows)'.dependencies]
+libsqlite3-sys = { version = "0.36.0", features = ["bundled-sqlcipher-vendored-openssl"] }
 
 [dev-dependencies]
+proptest.workspace = true
+tempfile = "3.27.0"
 tokio.workspace = true
 uuid.workspace = true

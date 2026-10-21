@@ -4,11 +4,11 @@
 
 use std::{collections::HashMap, sync::Mutex};
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use async_trait::async_trait;
 use relay_core::prelude::*;
 
-use crate::{MessageStore, SearchQuery, StoreStats};
+use crate::{MessageStore, SearchQuery, StoreStats, ensure_author};
 
 #[derive(Default)]
 pub struct MemoryStore {
@@ -26,16 +26,6 @@ impl MemoryStore {
     fn inner(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().expect("memory store")
     }
-}
-
-fn ensure_author(target: MessageId, actor: ServiceId, action: &str) -> anyhow::Result<()> {
-    if actor != target.author {
-        bail!(
-            "{actor} tried to {action} a message written by {}",
-            target.author
-        );
-    }
-    Ok(())
 }
 
 fn find(messages: &mut [Message], target: MessageId) -> anyhow::Result<&mut Message> {
@@ -180,111 +170,5 @@ impl MessageStore for MemoryStore {
             oldest_ms: times.clone().min(),
             newest_ms: times.max(),
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use uuid::Uuid;
-
-    fn msg(sent_at_ms: u64, body: &str) -> Message {
-        let sender = ServiceId::new(Uuid::from_u128(9));
-        Message {
-            id: MessageId {
-                author: sender,
-                sent_at_ms,
-            },
-            conversation: Recipient::Contact(sender),
-            sender,
-            from_me: false,
-            received_at_ms: sent_at_ms,
-            body: Some(body.to_owned()),
-            attachments: vec![],
-            quote: None,
-            edited: false,
-            deleted: false,
-        }
-    }
-
-    /// A resent or forged message reusing an existing id must neither duplicate
-    /// the row nor replace its body or clear its deleted state.
-    #[tokio::test]
-    async fn inserting_an_existing_id_changes_nothing() {
-        let store = MemoryStore::default();
-        let original = msg(1, "hi");
-        assert!(
-            store.insert(&original).await.expect("insert"),
-            "first insert not new"
-        );
-        store
-            .mark_deleted(original.id, original.id.author)
-            .await
-            .expect("delete");
-        let replay = msg(1, "rewritten");
-        assert!(
-            !store.insert(&replay).await.expect("insert"),
-            "replay reported as new"
-        );
-        let stats = store.stats().await.expect("stats");
-        assert_eq!(stats.messages, 1, "duplicate rows: {stats:?}");
-        let kept = store
-            .history(original.conversation, None, 1)
-            .await
-            .expect("history");
-        let kept = kept.first().expect("row kept");
-        assert_eq!(kept.body.as_deref(), Some("hi"), "body replaced by replay");
-        assert!(kept.deleted, "replay cleared deleted state");
-    }
-
-    /// A deleted-for-everyone message must stop matching searches.
-    #[tokio::test]
-    async fn deleted_messages_drop_out_of_search() {
-        let store = MemoryStore::default();
-        store.insert(&msg(1, "secret plan")).await.expect("insert");
-        let id = msg(1, "").id;
-        store.mark_deleted(id, id.author).await.expect("delete");
-        let hits = store
-            .search(&SearchQuery {
-                text: "plan".into(),
-                limit: 10,
-                ..Default::default()
-            })
-            .await
-            .expect("search");
-        assert!(hits.is_empty(), "deleted message still found: {hits:?}");
-    }
-
-    /// Someone else in the chat must not be able to rewrite or erase a message
-    /// they didn't write; Signal only lets the author edit or delete.
-    #[tokio::test]
-    async fn edits_and_deletes_from_non_authors_are_refused() {
-        let store = MemoryStore::default();
-        let original = msg(1, "original");
-        store.insert(&original).await.expect("insert");
-        let stranger = ServiceId::new(Uuid::from_u128(666));
-        assert!(
-            store
-                .apply_edit(original.id, stranger, "forged")
-                .await
-                .is_err(),
-            "stranger edit accepted"
-        );
-        assert!(
-            store.mark_deleted(original.id, stranger).await.is_err(),
-            "stranger delete accepted"
-        );
-        let kept = store
-            .history(original.conversation, None, 1)
-            .await
-            .expect("history");
-        assert_eq!(
-            kept.first().and_then(|m| m.body.as_deref()),
-            Some("original")
-        );
-        assert!(
-            kept.first().is_some_and(|m| !m.deleted),
-            "message was deleted: {kept:?}"
-        );
     }
 }
