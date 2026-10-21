@@ -35,6 +35,9 @@ sqlx = { version = "0.9.0", default-features = false, features = ["sqlite", "run
 uuid.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+# NOTE: at the pinned whisperfish rev, SQLCipher's Windows build still needs
+# OpenSSL even with custom crypto (docs/slices.md).
+libsqlite3-sys = { version = "0.36.0", features = ["bundled-sqlcipher-vendored-openssl"] }
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
 
 [dev-dependencies]

@@ -10,7 +10,7 @@ use futures::TryStreamExt as _;
 use relay_core::prelude::*;
 use relay_store::MessageStore;
 use serde_json::Value;
-use sqlx::{ConnectOptions as _, sqlite::SqliteConnectOptions};
+use sqlx::{ConnectOptions as _, Connection as _, sqlite::SqliteConnectOptions};
 
 use crate::{ImportProgress, ImportSummary, desktop_key, full_name};
 
@@ -106,6 +106,9 @@ pub async fn import_signal_desktop(
         });
     }
     drop(rows);
+    conn.close()
+        .await
+        .context("closing Signal Desktop's database")?;
     store
         .mark_read(&read)
         .await
@@ -201,7 +204,7 @@ mod tests {
     use super::*;
     use relay_store::MemoryStore;
     use serde_json::json;
-    use sqlx::{Connection as _, Executor as _};
+    use sqlx::Executor as _;
 
     const DB_KEY: &str = "3a0aaac03a0aaac03a0aaac03a0aaac03a0aaac03a0aaac03a0aaac03a0aaac0";
     const OUR_ACI: &str = "00000000-0000-0000-0000-0000000000aa";
