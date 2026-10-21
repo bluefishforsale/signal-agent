@@ -763,4 +763,25 @@ mod tests {
             prop_assert_eq!(got, Some(expected));
         }
     }
+
+    /// Typing in a group names the group by its public id; group members' apps
+    /// match on that, and the master key must never go out bare.
+    #[test]
+    fn group_typing_names_the_public_group_id() {
+        let master_key = [5u8; 32];
+        let group = GroupContextV2 {
+            master_key: Some(master_key.to_vec()),
+            revision: Some(1),
+            group_change: None,
+        };
+        let ContentBody::TypingMessage(typing) =
+            content_body(&Outgoing::Typing { started: true }, 9, Some(&group))
+        else {
+            panic!("typing is not a typing message");
+        };
+        assert_eq!(
+            typing.group_id,
+            Some(group_id(master_key).as_bytes().to_vec())
+        );
+    }
 }
