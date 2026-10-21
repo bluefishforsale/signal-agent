@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+dirs.workspace = true
 relay-core.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, features = ["preserve_order"] }

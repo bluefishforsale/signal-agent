@@ -116,6 +116,40 @@ impl Clients {
         }
     }
 
+    /// This machine's clients, reached by spawning real processes.
+    pub fn system() -> Self {
+        let platform = Platform::current();
+        let home = dirs::home_dir();
+        let mut search: Vec<PathBuf> = std::env::var_os("PATH")
+            .map(|p| std::env::split_paths(&p).collect())
+            .unwrap_or_default();
+        // NOTE: an app opened from Finder gets launchd's bare PATH, not the
+        // shell's, so the CLI's usual install locations are searched too.
+        // Without them a double-clicked app would never find Claude Code.
+        if let Some(home) = &home {
+            search.extend([
+                home.join(".local").join("bin"),
+                home.join(".claude").join("local"),
+            ]);
+        }
+        match platform {
+            Platform::Windows => search.extend(dirs::config_dir().map(|d| d.join("npm"))),
+            Platform::MacOs | Platform::Linux => {
+                search.extend(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from))
+            }
+        }
+        let desktop_dir = match platform {
+            Platform::MacOs | Platform::Windows => dirs::config_dir().map(|d| d.join("Claude")),
+            Platform::Linux => None,
+        };
+        Self::new(
+            platform,
+            Box::new(SystemRunner),
+            find_claude(platform, &search),
+            desktop_dir,
+        )
+    }
+
     /// The Claude clients installed for this user.
     pub fn detect(&self) -> Vec<ClaudeClient> {
         let code = self.claude_cli.is_some().then_some(ClaudeClient::Code);
@@ -273,6 +307,42 @@ impl Clients {
     fn desktop_config(&self) -> Option<PathBuf> {
         let dir = self.desktop_dir.as_ref().filter(|d| d.is_dir())?;
         Some(dir.join("claude_desktop_config.json"))
+    }
+}
+
+/// The first `claude` executable in `dirs`, under this platform's file names.
+fn find_claude(platform: Platform, dirs: &[PathBuf]) -> Option<PathBuf> {
+    let names: &[&str] = match platform {
+        Platform::Windows => &["claude.exe", "claude.cmd"],
+        Platform::MacOs | Platform::Linux => &["claude"],
+    };
+    dirs.iter()
+        .flat_map(|dir| names.iter().map(move |name| dir.join(name)))
+        .find(|path| path.is_file())
+}
+
+struct SystemRunner;
+
+impl Runner for SystemRunner {
+    fn run(&self, program: &Path, args: &[String]) -> anyhow::Result<RunOutput> {
+        let mut command = std::process::Command::new(program);
+        command.args(args).stdin(std::process::Stdio::null());
+        // NOTE: without CREATE_NO_WINDOW every call from the setup window would
+        // flash a console window on screen.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        let out = command
+            .output()
+            .with_context(|| format!("unable to run \"{}\"", program.display()))?;
+        Ok(RunOutput {
+            success: out.status.success(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        })
     }
 }
 
@@ -883,5 +953,30 @@ mod tests {
             "restart script does not parse: {}",
             String::from_utf8_lossy(&out.stdout)
         );
+    }
+
+    /// The CLI is found in the first directory that has it, in search order,
+    /// and on Windows under its `.exe` or npm's `.cmd` name.
+    #[test]
+    fn the_claude_cli_is_found_in_search_order_under_platform_names() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let [empty, npm, native] = ["empty", "npm", "native"].map(|d| {
+            let dir = root.path().join(d);
+            std::fs::create_dir(&dir).expect("create dir");
+            dir
+        });
+        std::fs::write(npm.join("claude.cmd"), "").expect("write cmd");
+        std::fs::write(native.join("claude"), "").expect("write cli");
+        let dirs = vec![empty.clone(), npm.clone(), native.clone()];
+
+        assert_eq!(
+            find_claude(Platform::MacOs, &dirs),
+            Some(native.join("claude"))
+        );
+        assert_eq!(
+            find_claude(Platform::Windows, &dirs),
+            Some(npm.join("claude.cmd"))
+        );
+        assert_eq!(find_claude(Platform::Linux, &[empty]), None);
     }
 }
