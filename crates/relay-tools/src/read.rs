@@ -56,6 +56,30 @@ impl Tool for GetOwnNumber {
     }
 }
 
+pub struct StoreStats;
+
+#[async_trait]
+impl Tool for StoreStats {
+    fn name(&self) -> &'static str {
+        "store_stats"
+    }
+    fn description(&self) -> &'static str {
+        "Report what the local message store holds: message, conversation and unread counts, \
+         and the oldest and newest message times in epoch milliseconds (null when empty). \
+         Takes no parameters; local only."
+    }
+    fn input_schema(&self) -> Value {
+        json!({"type": "object", "properties": {}, "additionalProperties": false})
+    }
+    fn writes(&self) -> bool {
+        false
+    }
+    async fn call(&self, ctx: &ToolContext, _input: Value) -> Result<Value, ToolError> {
+        let stats = ctx.store.stats().await?;
+        Ok(serde_json::to_value(stats).map_err(anyhow::Error::from)?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -95,6 +119,23 @@ mod tests {
         assert_eq!(
             out,
             json!({"number": "+15550000001", "service_id": sid(ME).to_string()})
+        );
+    }
+
+    /// Stats must reflect what's stored, including the date bounds clients use
+    /// to tell whether history was imported.
+    #[tokio::test]
+    async fn store_stats_counts_messages_and_reports_date_bounds() {
+        let (ctx, _) = ctx(AccessMode::ReadOnly, ProfileKind::Linked);
+        ctx.store.upsert(&incoming(2, 100, "a")).await.unwrap();
+        ctx.store.upsert(&incoming(3, 300, "b")).await.unwrap();
+        let out = Registry::standard()
+            .call(&ctx, "store_stats", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            json!({"messages": 2, "conversations": 2, "unread": 2, "oldest_ms": 100, "newest_ms": 300})
         );
     }
 }
