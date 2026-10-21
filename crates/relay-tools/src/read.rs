@@ -1,9 +1,13 @@
 //! Tools that answer from the local store and the account, and never send.
 
 use async_trait::async_trait;
+use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{Tool, ToolContext, ToolError};
+use crate::{
+    Tool, ToolContext, ToolError,
+    input::{Limit, parse},
+};
 
 pub struct ListConversations;
 
@@ -80,9 +84,51 @@ impl Tool for StoreStats {
     }
 }
 
+pub struct GetUnread;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GetUnreadInput {
+    #[serde(default)]
+    limit: Limit,
+}
+
+#[async_trait]
+impl Tool for GetUnread {
+    fn name(&self) -> &'static str {
+        "get_unread"
+    }
+    fn description(&self) -> &'static str {
+        "Return unread incoming messages across all conversations, oldest first: the default \
+         way to check for new messages. limit keeps the newest N; if has_more is true, call \
+         again for the rest. Returned messages are marked read in the local store only; no \
+         read receipt is sent."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {"limit": Limit::schema()},
+            "additionalProperties": false,
+        })
+    }
+    fn writes(&self) -> bool {
+        false
+    }
+    async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
+        let GetUnreadInput { limit } = parse(input)?;
+        let mut unread = ctx.store.unread().await?;
+        unread.sort_by_key(|m| m.id.sent_at_ms);
+        let has_more = unread.len() > limit.get() as usize;
+        let messages = unread.split_off(unread.len().saturating_sub(limit.get() as usize));
+        let ids: Vec<_> = messages.iter().map(|m| m.id).collect();
+        ctx.store.mark_read(&ids).await?;
+        Ok(json!({ "messages": messages, "has_more": has_more }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use crate::{Registry, testing::*};
     use relay_core::prelude::*;
@@ -137,5 +183,35 @@ mod tests {
             out,
             json!({"messages": 2, "conversations": 2, "unread": 2, "oldest_ms": 100, "newest_ms": 300})
         );
+    }
+
+    fn bodies(messages: &Value) -> Vec<String> {
+        messages
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["body"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// get_unread is how a client checks for new mail, so a message must come
+    /// back once and only once, oldest first; with a limit the newest are kept
+    /// and the rest stay unread for the next call.
+    #[tokio::test]
+    async fn get_unread_returns_each_message_once_keeping_the_newest_under_a_limit() {
+        let (ctx, _) = ctx(AccessMode::ReadOnly, ProfileKind::Linked);
+        for (t, body) in [(100, "a"), (200, "b"), (300, "c")] {
+            ctx.store.upsert(&incoming(2, t, body)).await.unwrap();
+        }
+        let registry = Registry::standard();
+        let first = registry
+            .call(&ctx, "get_unread", json!({"limit": 2}))
+            .await
+            .unwrap();
+        assert_eq!(bodies(&first["messages"]), ["b", "c"], "{first}");
+        assert_eq!(first["has_more"], json!(true), "{first}");
+        let second = registry.call(&ctx, "get_unread", json!({})).await.unwrap();
+        assert_eq!(bodies(&second["messages"]), ["a"], "{second}");
+        assert_eq!(second["has_more"], json!(false), "{second}");
     }
 }
