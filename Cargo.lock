@@ -4419,6 +4419,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "futures",
+ "getrandom 0.4.3",
  "libsqlite3-sys",
  "presage",
  "presage-store-sqlite",
