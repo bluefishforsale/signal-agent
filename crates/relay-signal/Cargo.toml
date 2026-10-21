@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+base64 = "0.22.1"
 futures.workspace = true
 relay-core.workspace = true
 serde.workspace = true
@@ -20,3 +21,4 @@ presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "
 
 [dev-dependencies]
 chrono = "0.4.45"
+proptest.workspace = true

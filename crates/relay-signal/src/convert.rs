@@ -1,6 +1,9 @@
 //! The only place presage and libsignal types meet relay-core types, so the
 //! protocol's shape changes in one file when presage moves.
 
+use anyhow::Context;
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use presage::libsignal_service::prelude::ProtobufMessage;
 use presage::{
     libsignal_service::{
         content::{Content, ContentBody},
@@ -8,7 +11,7 @@ use presage::{
         zkgroup::groups::{GroupMasterKey, GroupSecretParams},
     },
     proto::{
-        SyncMessage, receipt_message,
+        AttachmentPointer, SyncMessage, receipt_message,
         sync_message::{self, Content as SyncContent},
     },
     store::Thread,
@@ -137,6 +140,30 @@ pub(crate) fn incoming(content: &Content, me: ServiceId) -> Option<Incoming> {
     }))
 }
 
+/// An attachment's metadata, with an id that carries everything needed to
+/// download and decrypt it later.
+// NOTE: the id embeds the attachment's decryption key. That's what lets the
+// agent fetch bytes after a restart without presage's message store, and it
+// grants nothing the message text doesn't already, but it must never be logged
+// as if it were an opaque handle.
+pub(crate) fn attachment_ref(pointer: &AttachmentPointer) -> AttachmentRef {
+    AttachmentRef {
+        id: URL_SAFE_NO_PAD.encode(pointer.encode_to_vec()),
+        content_type: pointer.content_type.clone().unwrap_or_default(),
+        file_name: pointer.file_name.clone(),
+        size: pointer.size.map(u64::from).unwrap_or_default(),
+    }
+}
+
+/// The pointer an `attachment_ref` id was made from.
+pub(crate) fn attachment_pointer(attachment: &AttachmentRef) -> anyhow::Result<AttachmentPointer> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(&attachment.id)
+        .context("attachment id is not one this backend issued")?;
+    AttachmentPointer::decode(bytes.as_slice())
+        .context("attachment id is not one this backend issued")
+}
+
 fn conversation(content: &Content) -> Option<Recipient> {
     Some(match Thread::try_from(content).ok()? {
         Thread::Contact(id) => Recipient::Contact(service_id(id)),
@@ -177,9 +204,13 @@ mod tests {
     use presage::libsignal_service::{
         content::Metadata,
         prelude::Uuid,
-        proto::{DataMessage, EditMessage, GroupContextV2, ReceiptMessage, data_message},
+        proto::{
+            DataMessage, EditMessage, GroupContextV2, ReceiptMessage, attachment_pointer,
+            data_message,
+        },
         protocol::{Aci, DeviceId},
     };
+    use proptest::prelude::*;
 
     const ALICE: Uuid = Uuid::from_u128(0xa11ce);
     const ME: Uuid = Uuid::from_u128(0x3e);
@@ -517,5 +548,36 @@ mod tests {
                 sent_at_ms: 20
             })
         );
+    }
+
+    proptest! {
+        /// An attachment's id is all the agent keeps; it must bring back the
+        /// exact pointer, keys and digest included, or the download fails its
+        /// checksum.
+        #[test]
+        fn attachment_id_round_trips_to_its_pointer(
+            key in proptest::collection::vec(any::<u8>(), 64),
+            digest in proptest::collection::vec(any::<u8>(), 32),
+            cdn_key in "[A-Za-z0-9_-]{1,40}",
+            cdn_number in any::<u32>(),
+            size in any::<u32>(),
+            file_name in proptest::option::of(".{0,20}"),
+        ) {
+            let pointer = AttachmentPointer {
+                content_type: Some("image/png".into()),
+                key: Some(key),
+                digest: Some(digest),
+                size: Some(size),
+                file_name,
+                cdn_number: Some(cdn_number),
+                attachment_identifier: Some(attachment_pointer::AttachmentIdentifier::CdnKey(cdn_key)),
+                ..Default::default()
+            };
+            let reference = attachment_ref(&pointer);
+            prop_assert_eq!(reference.size, u64::from(size));
+            prop_assert_eq!(&reference.file_name, &pointer.file_name);
+            let back = attachment_pointer(&reference).expect("own id decodes");
+            prop_assert_eq!(back, pointer);
+        }
     }
 }
