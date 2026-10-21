@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "bin/signal-agent", "app/src-tauri"]
+# The Tauri app needs WebKit on Linux, and the Linux build ships without a GUI,
+# so plain `cargo build`/`cargo test` skip it; macOS and Windows CI build it explicitly.
+default-members = ["crates/*", "bin/signal-agent"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+repository = "https://github.com/bluefishforsale/signal-agent"
+
+[workspace.dependencies]
+relay-core = { path = "crates/relay-core" }
+relay-signal = { path = "crates/relay-signal" }
+relay-secrets = { path = "crates/relay-secrets" }
+relay-store = { path = "crates/relay-store" }
+relay-tools = { path = "crates/relay-tools" }
+relay-agent = { path = "crates/relay-agent" }
+relay-mcp = { path = "crates/relay-mcp" }
+relay-setup = { path = "crates/relay-setup" }
+relay-history = { path = "crates/relay-history" }
+
+anyhow = "1.0.104"
+async-trait = "0.1.92"
+clap = { version = "4.6.7", features = ["derive"] }
+dirs = "7.0.0"
+futures = "0.3.34"
+getrandom = "0.4.3"
+proptest = "1.12.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["full"] }
+tracing = "0.1.44"
+uuid = { version = "1.28.0", features = ["serde", "v4"] }
