@@ -76,13 +76,13 @@ fn decrypt_for_this_os(_signal_dir: &Path, encrypted: &[u8]) -> anyhow::Result<D
 #[cfg(all(unix, not(target_os = "macos")))]
 fn decrypt_for_this_os(_signal_dir: &Path, encrypted: &[u8]) -> anyhow::Result<DatabaseKey> {
     decrypt_linux(encrypted, || {
-        // NOTE: Chromium's libsecret store looks the password up by the
-        // "application" attribute, set from the Electron app name. That's
-        // "Signal" by Desktop's productName, but it wasn't checked against a
-        // live keyring, so the lowercase form is tried as well. KWallet
-        // (`--password-store=kwallet`) isn't supported.
+        // NOTE: Chromium's libsecret store keys the password by the
+        // "application" attribute ("Signal", from Desktop's productName); the
+        // item label "Signal Safe Storage" is the fallback, the same two
+        // lookups upstream signal-mcp 1.43.3 makes. Neither was checked against
+        // a live keyring. KWallet (`--password-store=kwallet`) isn't supported.
         command_output("secret-tool", &["lookup", "application", "Signal"])
-            .or_else(|_| command_output("secret-tool", &["lookup", "application", "signal"]))
+            .or_else(|_| command_output("secret-tool", &["lookup", "label", "Signal Safe Storage"]))
             .context("reading Signal's safe-storage password with secret-tool (libsecret-tools)")
     })
 }
