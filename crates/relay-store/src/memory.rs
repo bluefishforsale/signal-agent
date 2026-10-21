@@ -82,6 +82,11 @@ impl MessageStore for MemoryStore {
         Ok(())
     }
 
+    async fn mark_unread(&self, targets: &[MessageId]) -> anyhow::Result<()> {
+        self.inner().read.retain(|id| !targets.contains(id));
+        Ok(())
+    }
+
     async fn set_title(&self, conversation: Recipient, title: &str) -> anyhow::Result<()> {
         self.inner().titles.insert(conversation, title.to_owned());
         Ok(())
@@ -166,6 +171,30 @@ impl MessageStore for MemoryStore {
             .filter(|m| !m.from_me && !inner.read.contains(&m.id))
             .cloned()
             .collect())
+    }
+
+    async fn prune(&self, older_than_ms: u64) -> anyhow::Result<u64> {
+        let mut inner = self.inner();
+        let before = inner.messages.len();
+        inner.messages.retain(|m| m.id.sent_at_ms >= older_than_ms);
+        Ok((before - inner.messages.len()) as u64)
+    }
+
+    async fn export(
+        &self,
+        conversation: Option<Recipient>,
+        since_ms: Option<u64>,
+    ) -> anyhow::Result<Vec<Message>> {
+        let inner = self.inner();
+        let mut out: Vec<_> = inner
+            .messages
+            .iter()
+            .filter(|m| conversation.is_none_or(|c| m.conversation == c))
+            .filter(|m| since_ms.is_none_or(|s| m.id.sent_at_ms >= s))
+            .cloned()
+            .collect();
+        out.sort_by_key(|m| m.id.sent_at_ms);
+        Ok(out)
     }
 
     async fn stats(&self) -> anyhow::Result<StoreStats> {
@@ -286,5 +315,40 @@ mod tests {
             kept.first().is_some_and(|m| !m.deleted),
             "message was deleted: {kept:?}"
         );
+    }
+
+    /// Marking a read message unread must bring it back into unread counts,
+    /// or mark_as_unread would silently do nothing.
+    #[tokio::test]
+    async fn mark_unread_restores_a_read_message_to_unread() {
+        let store = MemoryStore::default();
+        let m = msg(1, "hi");
+        store.insert(&m).await.expect("insert");
+        store.mark_read(&[m.id]).await.expect("read");
+        assert!(
+            store.unread().await.expect("unread").is_empty(),
+            "still unread after mark_read"
+        );
+        store.mark_unread(&[m.id]).await.expect("unread");
+        let unread = store.unread().await.expect("unread");
+        assert_eq!(unread.len(), 1, "not unread again: {unread:?}");
+    }
+
+    /// Prune must remove exactly the messages older than the cutoff and report
+    /// the count, so a "delete older than 180 days" tool can say what it did.
+    #[tokio::test]
+    async fn prune_removes_only_messages_older_than_the_cutoff() {
+        let store = MemoryStore::default();
+        for t in [10, 20, 30] {
+            store.insert(&msg(t, "x")).await.expect("insert");
+        }
+        let removed = store.prune(20).await.expect("prune");
+        assert_eq!(
+            removed, 1,
+            "removed {removed}, expected only the t=10 message"
+        );
+        let left = store.export(None, None).await.expect("export");
+        let times: Vec<_> = left.iter().map(|m| m.id.sent_at_ms).collect();
+        assert_eq!(times, vec![20, 30], "wrong messages kept");
     }
 }

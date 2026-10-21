@@ -35,3 +35,10 @@ thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["full"] }
 tracing = "0.1.44"
 uuid = { version = "1.28.0", features = ["serde", "v4"] }
+
+# Copied from presage's workspace at the rev relay-signal pins. One SQLCipher for
+# the whole binary depends on this: every crate links whisperfish's
+# libsqlite3-sys fork. Update both together.
+[patch.crates-io]
+quickcheck_async = { git = "https://github.com/nytopop/quickcheck_async", rev = "76b13525ca93e0725e757f841fc6ccab8bae1913" }
+libsqlite3-sys = { version = "0.36.0", git = "https://github.com/whisperfish/rusqlite", rev = "2a42b3354c9194700d08aa070f70a131a470e7dc" }
