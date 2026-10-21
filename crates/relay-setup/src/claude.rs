@@ -193,7 +193,14 @@ impl Clients {
                 Ok(())
             }
             Platform::Windows => {
-                bail!("restarting Claude Desktop on Windows is not implemented yet")
+                let args = strings(&[
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    RESTART_DESKTOP_WINDOWS,
+                ]);
+                self.run_ok(Path::new("powershell"), &args)?;
+                Ok(())
             }
             Platform::Linux => bail!("Claude Desktop does not run on Linux"),
         }
@@ -364,6 +371,18 @@ const QUIT_DESKTOP_MACOS: &str = r#"if application "Claude" is running then
     end repeat
     if application "Claude" is running then error "Claude Desktop did not quit within 10 seconds"
 end if"#;
+
+// NOTE: Claude Code's native CLI is also claude.exe, so matching by process name
+// alone would kill the user's terminal sessions. Desktop is picked out by its
+// install path: Squirrel's %LOCALAPPDATA%\AnthropicClaude, or the MSIX package.
+const RESTART_DESKTOP_WINDOWS: &str = r#"$ErrorActionPreference = 'Stop'
+$desktop = @(Get-Process -Name claude -ErrorAction SilentlyContinue |
+    Where-Object { $_.Path -like '*\AnthropicClaude\*' -or $_.Path -like '*\Program Files\WindowsApps\*Claude*' })
+$exe = $desktop | Select-Object -First 1 -ExpandProperty Path
+$desktop | Stop-Process -Force -ErrorAction SilentlyContinue
+$desktop | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
+if (-not $exe) { $exe = Join-Path $env:LOCALAPPDATA 'AnthropicClaude\claude.exe' }
+Start-Process -FilePath $exe"#;
 
 /// Whether a Desktop server entry launches `binary`, directly or as an argument
 /// to a wrapper.
@@ -810,5 +829,40 @@ mod tests {
             "{script}"
         );
         assert_eq!(open, &strings(&["open", "-a", "Claude"]));
+    }
+
+    /// On Windows the Claude Code CLI is also `claude.exe`, so the restart must
+    /// pick out Desktop by its install path and never kill a terminal session.
+    #[test]
+    fn windows_desktop_restart_targets_only_the_desktop_app() {
+        let m = machine(Platform::Windows, false, true);
+        m.clients.restart_desktop().expect("restart");
+        let calls = m.fake.calls();
+        let [call] = calls.as_slice() else {
+            panic!("expected one PowerShell call, got {calls:?}");
+        };
+        assert_eq!(
+            call.first().map(String::as_str),
+            Some("powershell"),
+            "{call:?}"
+        );
+        let script = call.last().expect("script");
+        assert!(
+            script.contains("AnthropicClaude") && script.contains("Where-Object"),
+            "{script}"
+        );
+        assert!(
+            script.contains("Stop-Process") && script.contains("Start-Process"),
+            "{script}"
+        );
+    }
+
+    /// There is no Claude Desktop on Linux; a restart request is an error, not
+    /// a silent no-op that leaves the user waiting.
+    #[test]
+    fn linux_desktop_restart_is_refused() {
+        let m = machine(Platform::Linux, false, false);
+        assert!(m.clients.restart_desktop().is_err());
+        assert!(m.fake.calls().is_empty(), "{:?}", m.fake.calls());
     }
 }
