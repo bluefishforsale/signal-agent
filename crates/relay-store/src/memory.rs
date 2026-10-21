@@ -5,6 +5,7 @@
 use std::{collections::HashMap, sync::Mutex};
 
 use anyhow::{Context, bail};
+use async_trait::async_trait;
 use relay_core::prelude::*;
 
 use crate::{MessageStore, SearchQuery, StoreStats};
@@ -44,8 +45,9 @@ fn find(messages: &mut [Message], target: MessageId) -> anyhow::Result<&mut Mess
         .with_context(|| format!("no stored message {target:?}"))
 }
 
+#[async_trait]
 impl MessageStore for MemoryStore {
-    fn upsert(&self, message: &Message) -> anyhow::Result<()> {
+    async fn upsert(&self, message: &Message) -> anyhow::Result<()> {
         let mut inner = self.inner();
         match inner.messages.iter_mut().find(|m| m.id == message.id) {
             Some(existing) => *existing = message.clone(),
@@ -54,7 +56,12 @@ impl MessageStore for MemoryStore {
         Ok(())
     }
 
-    fn apply_edit(&self, target: MessageId, editor: ServiceId, body: &str) -> anyhow::Result<()> {
+    async fn apply_edit(
+        &self,
+        target: MessageId,
+        editor: ServiceId,
+        body: &str,
+    ) -> anyhow::Result<()> {
         ensure_author(target, editor, "edit")?;
         let mut inner = self.inner();
         let message = find(&mut inner.messages, target)?;
@@ -63,24 +70,24 @@ impl MessageStore for MemoryStore {
         Ok(())
     }
 
-    fn mark_deleted(&self, target: MessageId, deleter: ServiceId) -> anyhow::Result<()> {
+    async fn mark_deleted(&self, target: MessageId, deleter: ServiceId) -> anyhow::Result<()> {
         ensure_author(target, deleter, "delete")?;
         let mut inner = self.inner();
         find(&mut inner.messages, target)?.deleted = true;
         Ok(())
     }
 
-    fn mark_read(&self, targets: &[MessageId]) -> anyhow::Result<()> {
+    async fn mark_read(&self, targets: &[MessageId]) -> anyhow::Result<()> {
         self.inner().read.extend_from_slice(targets);
         Ok(())
     }
 
-    fn set_title(&self, conversation: Recipient, title: &str) -> anyhow::Result<()> {
+    async fn set_title(&self, conversation: Recipient, title: &str) -> anyhow::Result<()> {
         self.inner().titles.insert(conversation, title.to_owned());
         Ok(())
     }
 
-    fn conversations(&self) -> anyhow::Result<Vec<Conversation>> {
+    async fn conversations(&self) -> anyhow::Result<Vec<Conversation>> {
         let inner = self.inner();
         let mut by_recipient: HashMap<Recipient, Conversation> = HashMap::new();
         for m in &inner.messages {
@@ -106,7 +113,7 @@ impl MessageStore for MemoryStore {
         Ok(out)
     }
 
-    fn history(
+    async fn history(
         &self,
         conversation: Recipient,
         before_ms: Option<u64>,
@@ -125,7 +132,7 @@ impl MessageStore for MemoryStore {
         Ok(out)
     }
 
-    fn search(&self, query: &SearchQuery) -> anyhow::Result<Vec<Message>> {
+    async fn search(&self, query: &SearchQuery) -> anyhow::Result<Vec<Message>> {
         let needle = query.text.to_lowercase();
         let inner = self.inner();
         let mut out: Vec<_> = inner
@@ -151,7 +158,7 @@ impl MessageStore for MemoryStore {
             .collect())
     }
 
-    fn unread(&self) -> anyhow::Result<Vec<Message>> {
+    async fn unread(&self) -> anyhow::Result<Vec<Message>> {
         let inner = self.inner();
         Ok(inner
             .messages
@@ -161,9 +168,9 @@ impl MessageStore for MemoryStore {
             .collect())
     }
 
-    fn stats(&self) -> anyhow::Result<StoreStats> {
-        let unread = self.unread()?.len() as u64;
-        let conversations = self.conversations()?.len() as u64;
+    async fn stats(&self) -> anyhow::Result<StoreStats> {
+        let unread = self.unread().await?.len() as u64;
+        let conversations = self.conversations().await?.len() as u64;
         let inner = self.inner();
         let times = inner.messages.iter().map(|m| m.id.sent_at_ms);
         Ok(StoreStats {
@@ -201,50 +208,55 @@ mod tests {
     }
 
     /// Receiving the same message twice (a resync) must not duplicate it.
-    #[test]
-    fn upserting_the_same_id_twice_keeps_one_row() {
+    #[tokio::test]
+    async fn upserting_the_same_id_twice_keeps_one_row() {
         let store = MemoryStore::default();
-        store.upsert(&msg(1, "hi")).expect("upsert");
-        store.upsert(&msg(1, "hi again")).expect("upsert");
-        let stats = store.stats().expect("stats");
+        store.upsert(&msg(1, "hi")).await.expect("upsert");
+        store.upsert(&msg(1, "hi again")).await.expect("upsert");
+        let stats = store.stats().await.expect("stats");
         assert_eq!(stats.messages, 1, "duplicate rows: {stats:?}");
     }
 
     /// A deleted-for-everyone message must stop matching searches.
-    #[test]
-    fn deleted_messages_drop_out_of_search() {
+    #[tokio::test]
+    async fn deleted_messages_drop_out_of_search() {
         let store = MemoryStore::default();
-        store.upsert(&msg(1, "secret plan")).expect("upsert");
+        store.upsert(&msg(1, "secret plan")).await.expect("upsert");
         let id = msg(1, "").id;
-        store.mark_deleted(id, id.author).expect("delete");
+        store.mark_deleted(id, id.author).await.expect("delete");
         let hits = store
             .search(&SearchQuery {
                 text: "plan".into(),
                 limit: 10,
                 ..Default::default()
             })
+            .await
             .expect("search");
         assert!(hits.is_empty(), "deleted message still found: {hits:?}");
     }
 
     /// Someone else in the chat must not be able to rewrite or erase a message
     /// they didn't write; Signal only lets the author edit or delete.
-    #[test]
-    fn edits_and_deletes_from_non_authors_are_refused() {
+    #[tokio::test]
+    async fn edits_and_deletes_from_non_authors_are_refused() {
         let store = MemoryStore::default();
         let original = msg(1, "original");
-        store.upsert(&original).expect("upsert");
+        store.upsert(&original).await.expect("upsert");
         let stranger = ServiceId::new(Uuid::from_u128(666));
         assert!(
-            store.apply_edit(original.id, stranger, "forged").is_err(),
+            store
+                .apply_edit(original.id, stranger, "forged")
+                .await
+                .is_err(),
             "stranger edit accepted"
         );
         assert!(
-            store.mark_deleted(original.id, stranger).is_err(),
+            store.mark_deleted(original.id, stranger).await.is_err(),
             "stranger delete accepted"
         );
         let kept = store
             .history(original.conversation, None, 1)
+            .await
             .expect("history");
         assert_eq!(
             kept.first().and_then(|m| m.body.as_deref()),

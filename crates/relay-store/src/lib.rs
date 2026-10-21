@@ -3,6 +3,7 @@
 
 mod memory;
 
+use async_trait::async_trait;
 use relay_core::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -32,26 +33,35 @@ pub struct StoreStats {
 }
 
 /// One profile's message history.
+// NOTE: async because the SQLCipher store uses sqlx, which must share one
+// libsqlite3-sys with presage-store-sqlite (see docs/slices.md); a sync store
+// would need a second SQLite build and the two can't link into one binary.
+#[async_trait]
 pub trait MessageStore: Send + Sync {
     /// Inserts or replaces the message with the same id.
-    fn upsert(&self, message: &Message) -> anyhow::Result<()>;
+    async fn upsert(&self, message: &Message) -> anyhow::Result<()>;
     /// Fails unless `editor` wrote `target`.
-    fn apply_edit(&self, target: MessageId, editor: ServiceId, body: &str) -> anyhow::Result<()>;
+    async fn apply_edit(
+        &self,
+        target: MessageId,
+        editor: ServiceId,
+        body: &str,
+    ) -> anyhow::Result<()>;
     /// Fails unless `deleter` wrote `target`.
-    fn mark_deleted(&self, target: MessageId, deleter: ServiceId) -> anyhow::Result<()>;
-    fn mark_read(&self, targets: &[MessageId]) -> anyhow::Result<()>;
-    fn set_title(&self, conversation: Recipient, title: &str) -> anyhow::Result<()>;
+    async fn mark_deleted(&self, target: MessageId, deleter: ServiceId) -> anyhow::Result<()>;
+    async fn mark_read(&self, targets: &[MessageId]) -> anyhow::Result<()>;
+    async fn set_title(&self, conversation: Recipient, title: &str) -> anyhow::Result<()>;
     /// Most recent first.
-    fn conversations(&self) -> anyhow::Result<Vec<Conversation>>;
+    async fn conversations(&self) -> anyhow::Result<Vec<Conversation>>;
     /// Newest first, strictly older than `before_ms` when given.
-    fn history(
+    async fn history(
         &self,
         conversation: Recipient,
         before_ms: Option<u64>,
         limit: u32,
     ) -> anyhow::Result<Vec<Message>>;
     /// Best match first.
-    fn search(&self, query: &SearchQuery) -> anyhow::Result<Vec<Message>>;
-    fn unread(&self) -> anyhow::Result<Vec<Message>>;
-    fn stats(&self) -> anyhow::Result<StoreStats>;
+    async fn search(&self, query: &SearchQuery) -> anyhow::Result<Vec<Message>>;
+    async fn unread(&self) -> anyhow::Result<Vec<Message>>;
+    async fn stats(&self) -> anyhow::Result<StoreStats>;
 }

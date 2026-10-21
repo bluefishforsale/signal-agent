@@ -6,8 +6,10 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 relay-core.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
+tokio.workspace = true
 uuid.workspace = true
