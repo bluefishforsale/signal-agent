@@ -530,4 +530,54 @@ mod tests {
             serde_json::json!({"mcpServers": {e.name: {"command": e.command, "args": e.args}}})
         );
     }
+
+    /// Registration must keep every other key and server exactly, in the user's
+    /// order, and leave the previous file as a backup before replacing it.
+    #[test]
+    fn desktop_registration_preserves_the_config_and_backs_it_up_first() {
+        let m = machine(Platform::MacOs, false, true);
+        let path = m.desktop_dir.join("claude_desktop_config.json");
+        let original = r#"{"zeta": {"keep": [1, 2]}, "mcpServers": {"other": {"command": "npx", "args": ["x"], "env": {"K": "v"}}}, "alpha": true}"#;
+        std::fs::write(&path, original).expect("seed config");
+
+        m.clients
+            .register(ClaudeClient::Desktop, &entry())
+            .expect("register");
+
+        let backup = m
+            .desktop_dir
+            .join("claude_desktop_config.json.bak-signal-agent");
+        assert_eq!(std::fs::read_to_string(&backup).expect("backup"), original);
+        let config = read_json(&path);
+        let keys: Vec<_> = config
+            .as_object()
+            .expect("object")
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(
+            keys,
+            ["zeta", "mcpServers", "alpha"],
+            "top-level order changed"
+        );
+        assert_eq!(config["zeta"], serde_json::json!({"keep": [1, 2]}));
+        assert_eq!(config["alpha"], serde_json::json!(true));
+        assert_eq!(
+            config["mcpServers"]["other"],
+            serde_json::json!({"command": "npx", "args": ["x"], "env": {"K": "v"}})
+        );
+        assert_eq!(
+            config["mcpServers"][entry().name]["command"],
+            serde_json::json!(entry().command)
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&m.desktop_dir)
+            .expect("list dir")
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+    }
 }
