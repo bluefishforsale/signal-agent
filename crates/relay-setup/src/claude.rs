@@ -181,6 +181,39 @@ impl Clients {
         Ok(Unregistration::Removed)
     }
 
+    /// Quits Claude Desktop and opens it again, so it reloads its config.
+    pub fn restart_desktop(&self) -> anyhow::Result<()> {
+        match self.platform {
+            Platform::MacOs => {
+                self.run_ok(
+                    Path::new("osascript"),
+                    &strings(&["-e", QUIT_DESKTOP_MACOS]),
+                )?;
+                self.run_ok(Path::new("open"), &strings(&["-a", "Claude"]))?;
+                Ok(())
+            }
+            Platform::Windows => {
+                bail!("restarting Claude Desktop on Windows is not implemented yet")
+            }
+            Platform::Linux => bail!("Claude Desktop does not run on Linux"),
+        }
+    }
+
+    /// Runs `program`, failing with its output when it fails.
+    fn run_ok(&self, program: &Path, args: &[String]) -> anyhow::Result<RunOutput> {
+        let out = self.runner.run(program, args)?;
+        if !out.success {
+            bail!(
+                "`{} {}` failed: {}{}",
+                program.display(),
+                args.join(" "),
+                out.stdout.trim(),
+                out.stderr.trim()
+            );
+        }
+        Ok(out)
+    }
+
     /// Whether `client` has an entry named like `entry`, and whose it is.
     fn status(&self, client: ClaudeClient, entry: &ServerEntry) -> anyhow::Result<EntryStatus> {
         match client {
@@ -211,18 +244,8 @@ impl Clients {
         }
     }
 
-    /// Runs the `claude` CLI, failing with its output when it fails.
     fn claude(&self, args: &[String]) -> anyhow::Result<RunOutput> {
-        let out = self.runner.run(self.cli()?, args)?;
-        if !out.success {
-            bail!(
-                "`claude {}` failed: {}{}",
-                args.join(" "),
-                out.stdout.trim(),
-                out.stderr.trim()
-            );
-        }
-        Ok(out)
+        self.run_ok(self.cli()?, args)
     }
 
     fn cli(&self) -> anyhow::Result<&Path> {
@@ -330,6 +353,17 @@ impl DesktopConfig {
 }
 
 const SERVERS: &str = "mcpServers";
+
+// Asking politely lets Desktop save its state; the wait matters because
+// `open -a` on an app that is still quitting only brings it to the front.
+const QUIT_DESKTOP_MACOS: &str = r#"if application "Claude" is running then
+    tell application "Claude" to quit
+    repeat 50 times
+        if application "Claude" is not running then exit repeat
+        delay 0.2
+    end repeat
+    if application "Claude" is running then error "Claude Desktop did not quit within 10 seconds"
+end if"#;
 
 /// Whether a Desktop server entry launches `binary`, directly or as an argument
 /// to a wrapper.
@@ -752,5 +786,29 @@ mod tests {
                 _ => assert!(!path.exists(), "created a config while unregistering"),
             }
         }
+    }
+
+    /// Desktop reads its config only at launch. On macOS it must be asked to
+    /// quit (not killed), confirmed gone, and only then reopened; reopening a
+    /// quitting app would just focus it.
+    #[test]
+    fn macos_desktop_restart_quits_and_waits_before_reopening() {
+        let m = machine(Platform::MacOs, false, true);
+        m.clients.restart_desktop().expect("restart");
+        let calls = m.fake.calls();
+        let [quit, open] = calls.as_slice() else {
+            panic!("expected quit then open, got {calls:?}");
+        };
+        assert_eq!(
+            quit.get(..2),
+            Some(&strings(&["osascript", "-e"])[..]),
+            "{quit:?}"
+        );
+        let script = quit.get(2).expect("script");
+        assert!(
+            script.contains("to quit") && script.contains("is running"),
+            "{script}"
+        );
+        assert_eq!(open, &strings(&["open", "-a", "Claude"]));
     }
 }
