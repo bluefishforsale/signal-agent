@@ -26,6 +26,9 @@ presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "
 # an OpenSSL install, which neither CI nor a user's machine has. Feature
 # unification applies this to every crate linking libsqlite3-sys (the message
 # store too), which is the point: one SQLCipher, one crypto, every platform.
+# Nothing to register at startup: libsqlite3-sys itself exports the
+# rusqlite_custom_crypto_setup hook SQLCipher calls, so linking is enough.
+# store_refuses_to_open_with_the_wrong_key fails if encryption ever goes missing.
 libsqlite3-sys = { version = "0.36.0", features = ["bundled-sqlcipher-custom-crypto"] }
 
 [dev-dependencies]
