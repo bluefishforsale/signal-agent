@@ -865,4 +865,23 @@ mod tests {
         assert!(m.clients.restart_desktop().is_err());
         assert!(m.fake.calls().is_empty(), "{:?}", m.fake.calls());
     }
+
+    /// The restart script can only fail on a real Windows machine, so CI on
+    /// Windows at least proves it parses (parsing runs nothing).
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_restart_script_parses() {
+        let check = format!(
+            "$errors = $null; [void][System.Management.Automation.Language.Parser]::ParseInput(@'\n{RESTART_DESKTOP_WINDOWS}\n'@, [ref]$null, [ref]$errors); if ($errors) {{ $errors | Out-String | Write-Output; exit 1 }}"
+        );
+        let out = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &check])
+            .output()
+            .expect("run powershell");
+        assert!(
+            out.status.success(),
+            "restart script does not parse: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
 }
