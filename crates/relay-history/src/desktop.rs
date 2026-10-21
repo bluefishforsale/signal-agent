@@ -61,6 +61,7 @@ pub async fn import_signal_desktop(
     drop(rows);
 
     let mut summary = ImportSummary::default();
+    let mut read = Vec::new();
     let mut rows =
         sqlx::query_as::<_, (Option<String>, String)>("SELECT conversationId, json FROM messages")
             .fetch(&mut conn);
@@ -70,19 +71,30 @@ pub async fn import_signal_desktop(
         .context("reading Signal Desktop's messages")?
     {
         let conversation = conversation_id.and_then(|id| conversations.get(&id).copied());
-        let Some(message) = conversation.and_then(|c| message(our_aci, c, &parse(&json).ok()?))
-        else {
+        let json = parse(&json)?;
+        let Some(message) = conversation.and_then(|c| message(our_aci, c, &json)) else {
             summary.skipped += 1;
             continue;
         };
+        if json.get("readStatus").and_then(Value::as_u64) != Some(UNREAD) {
+            read.push(message.id);
+        }
         store
             .insert(&message)
             .await
             .with_context(|| format!("storing imported message {:?}", message.id))?;
         summary.imported += 1;
     }
+    drop(rows);
+    store
+        .mark_read(&read)
+        .await
+        .context("marking imported messages read")?;
     Ok(summary)
 }
+
+/// Desktop's ReadStatus.Unread; Read is 0 and Viewed 2.
+const UNREAD: u64 = 1;
 
 fn parse(json: &str) -> anyhow::Result<Value> {
     serde_json::from_str(json).context("Signal Desktop row is not JSON")
@@ -374,5 +386,35 @@ mod tests {
             conversations,
             vec![Recipient::Group(GroupId::new(identifier))]
         );
+    }
+
+    /// Only what was unread in Desktop stays unread (Desktop's readStatus:
+    /// 1 unread, 0 read, 2 viewed).
+    #[tokio::test]
+    async fn messages_read_in_desktop_import_as_read() {
+        let mut desktop = with_alice().await;
+        for (id, sent_at, status, body) in [
+            ("m1", 1_000, 0, "read"),
+            ("m2", 2_000, 1, "unread"),
+            ("m3", 3_000, 2, "viewed"),
+        ] {
+            desktop
+                .message(
+                    id,
+                    "c-alice",
+                    json!({
+                        "type": "incoming",
+                        "sent_at": sent_at,
+                        "sourceServiceId": ALICE_ACI,
+                        "readStatus": status,
+                        "body": body,
+                    }),
+                )
+                .await;
+        }
+        let (store, _) = desktop.import().await;
+        let unread = store.unread().await.expect("unread");
+        let bodies: Vec<_> = unread.iter().filter_map(|m| m.body.as_deref()).collect();
+        assert_eq!(bodies, vec!["unread"]);
     }
 }
