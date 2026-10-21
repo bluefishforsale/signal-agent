@@ -5,9 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+aes = "0.9.1"
 anyhow.workspace = true
+cbc = "0.2.1"
 relay-core.workspace = true
 relay-store.workspace = true
+sha1 = "0.11.0"
 # NOTE: same git source and tag as libsignal-service-rs (and so presage) uses.
 # Cargo treats a different tag or rev as a different source, which would link
 # two copies of libsignal-core and friends into one binary. Cargo.lock pins the
@@ -18,6 +21,7 @@ libsignal-message-backup = { git = "https://github.com/signalapp/libsignal", tag
 libsignal-account-keys = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0" }
 libsignal-core = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0" }
 futures.workspace = true
+pbkdf2 = "0.13.0"
 protobuf = "3.7.2"
 zkgroup = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0" }
 uuid.workspace = true

@@ -3,6 +3,7 @@
 //! Link-and-sync (the phone's history transfer at link time) is the primary
 //! source. Signal Desktop import is an opt-in extra, never required.
 
+mod desktop_key;
 mod link_and_sync;
 
 use std::path::Path;
