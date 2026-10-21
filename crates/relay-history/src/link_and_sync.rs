@@ -5,6 +5,7 @@
 use std::{collections::HashMap, fmt};
 
 use anyhow::Context;
+use futures::AsyncReadExt as _;
 use libsignal_account_keys::BackupKey;
 use libsignal_core::Aci;
 use libsignal_message_backup::{
@@ -56,20 +57,8 @@ pub async fn import_link_and_sync(
     store: &dyn MessageStore,
     progress: &mut (dyn FnMut(ImportProgress) + Send),
 ) -> anyhow::Result<ImportSummary> {
-    let backup_key: BackupKey = BackupKey(key.0);
-    let backup_id = backup_key.derive_backup_id(&Aci::from(our_aci.uuid()));
-    let message_key = MessageBackupKey::derive(&backup_key, &backup_id, None);
-    // NOTE: FramesReader authenticates the whole archive before yielding any
-    // plaintext, then reads it a second time to decrypt. Both passes read this
-    // one immutable buffer, so libsignal's end-of-stream HMAC re-check (which
-    // guards against a file changing between passes) has nothing to catch, and
-    // its future isn't Send, so it isn't called.
-    let frames = FramesReader::new(&message_key, CursorFactory::new(&archive))
-        .await
-        .context(
-            "link-and-sync archive failed to authenticate; wrong key or ACI, or a corrupt download",
-        )?;
-    let mut reader = VarintDelimitedReader::new(frames);
+    let plaintext = decrypt(archive, key, our_aci)?;
+    let mut reader = VarintDelimitedReader::new(futures::io::Cursor::new(plaintext.as_slice()));
     reader
         .read_next()
         .await
@@ -105,6 +94,35 @@ pub async fn import_link_and_sync(
         .await
         .context("marking imported messages read")?;
     Ok(importer.summary)
+}
+
+/// Authenticates and decrypts the archive into its varint-delimited frames.
+// NOTE: libsignal's FramesReader holds an Rc, so it can't live across an await
+// in a future the agent spawns; decrypting up front keeps the import Send. It
+// costs the gunzipped archive in memory (text only, so tens of MB for years of
+// history) and blocks the calling thread for the decrypt, which is CPU and
+// memory work with no I/O.
+// FramesReader authenticates the whole archive before yielding any plaintext,
+// then reads it a second time to decrypt. Both passes read one immutable
+// buffer, so libsignal's end-of-stream HMAC re-check, which guards against a
+// file changing between passes, has nothing to catch and isn't called.
+fn decrypt(archive: &[u8], key: &LinkAndSyncKey, our_aci: ServiceId) -> anyhow::Result<Vec<u8>> {
+    let backup_key: BackupKey = BackupKey(key.0);
+    let backup_id = backup_key.derive_backup_id(&Aci::from(our_aci.uuid()));
+    let message_key = MessageBackupKey::derive(&backup_key, &backup_id, None);
+    futures::executor::block_on(async {
+        let mut frames = FramesReader::new(&message_key, CursorFactory::new(&archive))
+            .await
+            .context(
+                "link-and-sync archive failed to authenticate; wrong key or ACI, or a corrupt download",
+            )?;
+        let mut plaintext = Vec::new();
+        frames
+            .read_to_end(&mut plaintext)
+            .await
+            .context("link-and-sync archive failed to decrypt")?;
+        Ok(plaintext)
+    })
 }
 
 /// Who a backup recipient id stands for, as far as messages are concerned.
@@ -869,5 +887,22 @@ mod tests {
             .collect();
         titles.sort();
         assert_eq!(titles, vec!["Dad", "Mom"]);
+    }
+
+    /// The agent runs the import on a multithreaded runtime alongside the
+    /// receive loop, so its future must be Send.
+    #[test]
+    fn the_import_future_is_send() {
+        fn assert_send<T: Send>(_: T) {}
+        let store = MemoryStore::default();
+        let key = synthetic_key();
+        let mut progress = |_| {};
+        assert_send(import_link_and_sync(
+            &[],
+            &key,
+            aci(OUR_ACI),
+            &store,
+            &mut progress,
+        ));
     }
 }
