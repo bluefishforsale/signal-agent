@@ -3,6 +3,8 @@
 
 #[cfg(unix)]
 mod key_file;
+#[cfg(target_os = "macos")]
+mod keychain;
 mod memory;
 
 use std::fmt;
@@ -12,6 +14,8 @@ use relay_core::ProfileName;
 
 #[cfg(unix)]
 pub use key_file::KeyFileStore;
+#[cfg(target_os = "macos")]
+pub use keychain::KeychainStore;
 pub use memory::MemorySecretStore;
 
 /// The 32-byte key both of a profile's SQLCipher databases are encrypted with.
@@ -81,6 +85,12 @@ mod tests {
             let store = KeyFileStore::under(dir.path().to_owned());
             out.push(("key file", Box::new(store), Some(dir)));
         }
+        #[cfg(target_os = "macos")]
+        out.push((
+            "keychain",
+            Box::new(KeychainStore::new("signal-agent-test")),
+            None,
+        ));
         out
     }
 
