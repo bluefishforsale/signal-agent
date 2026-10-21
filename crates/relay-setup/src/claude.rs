@@ -580,4 +580,55 @@ mod tests {
             "temp files left behind: {leftovers:?}"
         );
     }
+
+    /// An existing Desktop entry with our name is never replaced, and the file
+    /// isn't rewritten or backed up at all when there's nothing to add.
+    #[test]
+    fn desktop_registration_never_overwrites_an_existing_entry() {
+        for (command, expected) in [
+            (entry().command, Registration::Present),
+            ("/opt/other/signal".to_owned(), Registration::Foreign),
+        ] {
+            let m = machine(Platform::MacOs, false, true);
+            let path = m.desktop_dir.join("claude_desktop_config.json");
+            let original =
+                serde_json::json!({"mcpServers": {entry().name: {"command": command}}}).to_string();
+            std::fs::write(&path, &original).expect("seed config");
+
+            let result = m
+                .clients
+                .register(ClaudeClient::Desktop, &entry())
+                .expect("register");
+
+            assert_eq!(result, expected, "existing command {command}");
+            assert_eq!(std::fs::read_to_string(&path).expect("config"), original);
+            assert!(
+                !m.desktop_dir
+                    .join("claude_desktop_config.json.bak-signal-agent")
+                    .exists()
+            );
+        }
+    }
+
+    /// A config that isn't valid JSON is refused with an error naming the file,
+    /// rather than replaced by one that drops whatever the user had in it.
+    #[test]
+    fn desktop_registration_refuses_invalid_json_and_leaves_it_alone() {
+        for original in ["{\"mcpServers\": {", "[1, 2]", "{\"mcpServers\": []}"] {
+            let m = machine(Platform::MacOs, false, true);
+            let path = m.desktop_dir.join("claude_desktop_config.json");
+            std::fs::write(&path, original).expect("seed config");
+
+            let err = m
+                .clients
+                .register(ClaudeClient::Desktop, &entry())
+                .expect_err("registered into a broken config");
+
+            assert!(
+                format!("{err:#}").contains("claude_desktop_config.json"),
+                "error doesn't name the file: {err:#}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).expect("config"), original);
+        }
+    }
 }
