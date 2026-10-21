@@ -46,6 +46,12 @@ async fn apply(store: &dyn MessageStore, event: Incoming) -> anyhow::Result<()> 
         // NOTE: MessageStore has no place for reactions yet, so they are dropped
         // here. When the store grows one, apply them with `from` like edits.
         Incoming::Reaction { .. } => Ok(()),
+        // Nothing to store until the identity tools (lane L3d) exist; the log
+        // keeps a trusted safety-number change from passing silently.
+        Incoming::IdentityChanged { contact } => {
+            tracing::warn!("safety number changed for {contact}; trusted the new key");
+            Ok(())
+        }
     }
 }
 
@@ -238,6 +244,29 @@ mod tests {
             "forged message stored: {bodies:?}"
         );
         assert!(bodies.contains(&"original"), "original lost: {bodies:?}");
+    }
+
+    /// A safety-number change is an event to note, not an error: capture must
+    /// keep storing what arrives after it.
+    #[tokio::test]
+    async fn an_identity_change_does_not_interrupt_capture() {
+        let signal = fake();
+        let store = Arc::new(MemoryStore::default());
+        let capture = tokio::spawn(run(signal.clone(), store.clone()));
+        signal.push(Incoming::IdentityChanged {
+            contact: ServiceId::new(Uuid::from_u128(2)),
+        });
+        let after = msg(2, 10, "after the change");
+        signal.push(Incoming::Message(after.clone()));
+        let stored = eventually(|| async {
+            store
+                .history(after.conversation, None, 1)
+                .await
+                .expect("history")
+        })
+        .await;
+        capture.abort();
+        assert_eq!(stored.len(), 1, "capture stopped after an identity change");
     }
 
     async fn eventually<F, Fut>(mut probe: F) -> Vec<Message>
