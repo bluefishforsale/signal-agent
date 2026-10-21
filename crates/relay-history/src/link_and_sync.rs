@@ -1,0 +1,430 @@
+//! Imports the history archive a phone uploads for a newly linked device.
+//! docs/link-and-sync.md traces the protocol; this module is the half after the
+//! download: verify, decrypt, parse, and write messages to the store.
+
+use std::{collections::HashMap, fmt};
+
+use anyhow::Context;
+use libsignal_account_keys::BackupKey;
+use libsignal_core::Aci;
+use libsignal_message_backup::{
+    frame::{CursorFactory, FramesReader},
+    key::MessageBackupKey,
+    parse::VarintDelimitedReader,
+    proto::backup as pb,
+};
+use protobuf::Message as _;
+use relay_core::prelude::*;
+use relay_store::MessageStore;
+
+use crate::ImportProgress;
+
+/// The 32-byte key the phone sends in the provisioning message when it offers
+/// to transfer history. Single-use; never persist it.
+pub struct LinkAndSyncKey([u8; 32]);
+
+impl LinkAndSyncKey {
+    pub fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
+impl fmt::Debug for LinkAndSyncKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("LinkAndSyncKey(..)")
+    }
+}
+
+/// What an import wrote and what it had to leave out.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ImportSummary {
+    pub imported: u64,
+    pub skipped: u64,
+}
+
+/// Imports a downloaded link-and-sync archive into `store`.
+///
+/// `archive` is the file exactly as fetched from the CDN, `key` the provisioning
+/// message's ephemeral backup key, and `our_aci` the linked account's ACI, which
+/// the archive's encryption key is bound to. Fails without writing anything if
+/// the archive doesn't authenticate under that key and ACI.
+pub async fn import_link_and_sync(
+    archive: &[u8],
+    key: &LinkAndSyncKey,
+    our_aci: ServiceId,
+    store: &dyn MessageStore,
+    _progress: &mut (dyn FnMut(ImportProgress) + Send),
+) -> anyhow::Result<ImportSummary> {
+    let backup_key: BackupKey = BackupKey(key.0);
+    let backup_id = backup_key.derive_backup_id(&Aci::from(our_aci.uuid()));
+    let message_key = MessageBackupKey::derive(&backup_key, &backup_id, None);
+    // NOTE: FramesReader authenticates the whole archive before yielding any
+    // plaintext, then reads it a second time to decrypt. Both passes read this
+    // one immutable buffer, so libsignal's end-of-stream HMAC re-check (which
+    // guards against a file changing between passes) has nothing to catch, and
+    // its future isn't Send, so it isn't called.
+    let frames = FramesReader::new(&message_key, CursorFactory::new(&archive))
+        .await
+        .context(
+            "link-and-sync archive failed to authenticate; wrong key or ACI, or a corrupt download",
+        )?;
+    let mut reader = VarintDelimitedReader::new(frames);
+    reader
+        .read_next()
+        .await
+        .context("link-and-sync archive is not a valid backup stream")?
+        .context("link-and-sync archive is empty")?;
+    let mut importer = Importer {
+        our_aci,
+        store,
+        recipients: HashMap::new(),
+        chats: HashMap::new(),
+        summary: ImportSummary::default(),
+    };
+    while let Some(raw) = reader
+        .read_next()
+        .await
+        .context("link-and-sync archive is not a valid backup stream")?
+    {
+        let frame = pb::Frame::parse_from_bytes(&raw)
+            .context("malformed frame in link-and-sync archive")?;
+        importer.frame(frame).await?;
+    }
+    Ok(importer.summary)
+}
+
+/// Who a backup recipient id stands for, as far as messages are concerned.
+#[derive(Clone, Copy)]
+enum Peer {
+    Me,
+    Contact(ServiceId),
+}
+
+/// Frames refer to recipients and chats by ids local to the archive, defined
+/// before first use; these maps resolve them.
+struct Importer<'a> {
+    our_aci: ServiceId,
+    store: &'a dyn MessageStore,
+    recipients: HashMap<u64, Peer>,
+    chats: HashMap<u64, Recipient>,
+    summary: ImportSummary,
+}
+
+impl Importer<'_> {
+    async fn frame(&mut self, frame: pb::Frame) -> anyhow::Result<()> {
+        match frame.item {
+            Some(pb::frame::Item::Recipient(r)) => self.recipient(r),
+            Some(pb::frame::Item::Chat(c)) => self.chat(c),
+            Some(pb::frame::Item::ChatItem(item)) => self.chat_item(item).await?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn recipient(&mut self, recipient: pb::Recipient) {
+        let peer = match recipient.destination {
+            Some(pb::recipient::Destination::Self_(_)) => Peer::Me,
+            Some(pb::recipient::Destination::Contact(c)) => {
+                let Some(aci) = c.aci.as_deref().and_then(service_id) else {
+                    return;
+                };
+                Peer::Contact(aci)
+            }
+            _ => return,
+        };
+        self.recipients.insert(recipient.id, peer);
+    }
+
+    fn chat(&mut self, chat: pb::Chat) {
+        let conversation = match self.recipients.get(&chat.recipientId) {
+            Some(Peer::Me) => Recipient::Contact(self.our_aci),
+            Some(Peer::Contact(aci)) => Recipient::Contact(*aci),
+            None => return,
+        };
+        self.chats.insert(chat.id, conversation);
+    }
+
+    async fn chat_item(&mut self, item: pb::ChatItem) -> anyhow::Result<()> {
+        let author = match self.recipients.get(&item.authorId) {
+            Some(Peer::Me) => Some(self.our_aci),
+            Some(Peer::Contact(aci)) => Some(*aci),
+            None => None,
+        };
+        let (Some(author), Some(&conversation)) = (author, self.chats.get(&item.chatId)) else {
+            self.summary.skipped += 1;
+            return Ok(());
+        };
+        let received_at_ms = match &item.directionalDetails {
+            Some(pb::chat_item::DirectionalDetails::Incoming(d)) => d.dateReceived,
+            _ => item.dateSent,
+        };
+        let body = match &item.item {
+            Some(pb::chat_item::Item::StandardMessage(m)) => {
+                m.text.as_ref().map(|t| t.body.clone())
+            }
+            _ => None,
+        };
+        let message = Message {
+            id: MessageId {
+                author,
+                sent_at_ms: item.dateSent,
+            },
+            conversation,
+            sender: author,
+            from_me: author == self.our_aci,
+            received_at_ms,
+            body,
+            attachments: vec![],
+            quote: None,
+            edited: false,
+            deleted: false,
+        };
+        self.store
+            .upsert(&message)
+            .await
+            .with_context(|| format!("storing imported message {:?}", message.id))?;
+        self.summary.imported += 1;
+        Ok(())
+    }
+}
+
+fn service_id(bytes: &[u8]) -> Option<ServiceId> {
+    let bytes: [u8; 16] = bytes.try_into().ok()?;
+    Some(ServiceId::new(uuid::Uuid::from_bytes(bytes)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use libsignal_account_keys::AccountEntropyPool;
+    use libsignal_message_backup::export;
+    use relay_store::MemoryStore;
+
+    // libsignal v0.99.0 rust/message-backup/tests/res/test-cases/valid-encrypted/,
+    // with the account entropy pool and ACI its test_cases.rs encrypts it under.
+    // It's in the legacy layout link-and-sync uses: no forward-secrecy header.
+    const LIBSIGNAL_LEGACY_VECTOR: &[u8] =
+        include_bytes!("testdata/legacy-account.binproto.encrypted");
+    const LIBSIGNAL_VECTOR_POOL: &str =
+        "mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm";
+    const LIBSIGNAL_VECTOR_ACI: [u8; 16] = [0x11; 16];
+
+    fn libsignal_vector_key() -> LinkAndSyncKey {
+        let pool: AccountEntropyPool = LIBSIGNAL_VECTOR_POOL.parse().expect("valid pool");
+        LinkAndSyncKey::new(BackupKey::derive_from_account_entropy_pool(&pool).0)
+    }
+
+    fn libsignal_vector_aci() -> ServiceId {
+        ServiceId::new(uuid::Uuid::from_bytes(LIBSIGNAL_VECTOR_ACI))
+    }
+
+    /// The key from provisioning is a BackupKey used as-is with our ACI and no
+    /// forward-secrecy token; libsignal's own legacy vector must decrypt that way.
+    #[tokio::test]
+    async fn libsignals_legacy_vector_decrypts_with_the_key_used_as_a_backup_key() {
+        let store = MemoryStore::default();
+        let summary = import_link_and_sync(
+            LIBSIGNAL_LEGACY_VECTOR,
+            &libsignal_vector_key(),
+            libsignal_vector_aci(),
+            &store,
+            &mut |_| {},
+        )
+        .await
+        .expect("libsignal's vector should import");
+        assert_eq!(
+            summary,
+            ImportSummary::default(),
+            "account-only vector has no messages"
+        );
+    }
+
+    /// The archive key is bound to our ACI; an archive for another account must
+    /// be refused, not decrypted into garbage.
+    #[tokio::test]
+    async fn an_archive_for_another_aci_is_refused() {
+        let store = MemoryStore::default();
+        let result = import_link_and_sync(
+            LIBSIGNAL_LEGACY_VECTOR,
+            &libsignal_vector_key(),
+            ServiceId::new(uuid::Uuid::from_u128(1)),
+            &store,
+            &mut |_| {},
+        )
+        .await;
+        assert!(result.is_err(), "imported under the wrong ACI: {result:?}");
+    }
+
+    const OUR_ACI: u128 = 0xAA;
+    const ALICE_ACI: u128 = 0xA1;
+    const SELF_ID: u64 = 1;
+    const ALICE_ID: u64 = 2;
+    const ALICE_CHAT: u64 = 10;
+
+    fn aci(n: u128) -> ServiceId {
+        ServiceId::new(uuid::Uuid::from_u128(n))
+    }
+
+    fn synthetic_key() -> LinkAndSyncKey {
+        LinkAndSyncKey::new([7; 32])
+    }
+
+    /// Builds an archive the way the phone does: varint-delimited frames after a
+    /// BackupInfo, gzipped, AES-256-CBC under the derived key, then HMAC'd.
+    fn archive(frames: Vec<pb::Frame>) -> Vec<u8> {
+        let mut plain = pb::BackupInfo {
+            version: 1,
+            backupTimeMs: 1,
+            ..Default::default()
+        }
+        .write_length_delimited_to_bytes()
+        .expect("encode info");
+        for frame in frames {
+            plain.extend(
+                frame
+                    .write_length_delimited_to_bytes()
+                    .expect("encode frame"),
+            );
+        }
+        let backup_key: BackupKey = BackupKey(synthetic_key().0);
+        let id = backup_key.derive_backup_id(&Aci::from(aci(OUR_ACI).uuid()));
+        let key = MessageBackupKey::derive(&backup_key, &id, None);
+        let iv = [b'I'; 16];
+        let mut body = export::gzip_compress(futures::io::Cursor::new(plain));
+        export::aes_cbc_encrypt(&key.aes_key, &iv, &mut body);
+        let hmac = export::hmac_checksum(&key.hmac_key, &iv, &body);
+        [iv.as_slice(), &body, &hmac].concat()
+    }
+
+    fn self_recipient() -> pb::Frame {
+        recipient(
+            SELF_ID,
+            pb::recipient::Destination::Self_(Default::default()),
+        )
+    }
+
+    fn contact(id: u64, aci: u128) -> pb::Frame {
+        recipient(
+            id,
+            pb::recipient::Destination::Contact(pb::Contact {
+                aci: Some(uuid::Uuid::from_u128(aci).as_bytes().to_vec()),
+                ..Default::default()
+            }),
+        )
+    }
+
+    fn recipient(id: u64, destination: pb::recipient::Destination) -> pb::Frame {
+        pb::Frame {
+            item: Some(pb::frame::Item::Recipient(pb::Recipient {
+                id,
+                destination: Some(destination),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
+    fn chat(id: u64, recipient_id: u64) -> pb::Frame {
+        pb::Frame {
+            item: Some(pb::frame::Item::Chat(pb::Chat {
+                id,
+                recipientId: recipient_id,
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
+    fn incoming_text(chat_id: u64, author_id: u64, sent: u64, body: &str) -> pb::ChatItem {
+        pb::ChatItem {
+            chatId: chat_id,
+            authorId: author_id,
+            dateSent: sent,
+            directionalDetails: Some(pb::chat_item::DirectionalDetails::Incoming(
+                pb::chat_item::IncomingMessageDetails {
+                    dateReceived: sent + 5,
+                    ..Default::default()
+                },
+            )),
+            item: Some(pb::chat_item::Item::StandardMessage(pb::StandardMessage {
+                text: Some(pb::Text {
+                    body: body.to_owned(),
+                    ..Default::default()
+                })
+                .into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
+    fn item(chat_item: pb::ChatItem) -> pb::Frame {
+        pb::Frame {
+            item: Some(pb::frame::Item::ChatItem(chat_item)),
+            ..Default::default()
+        }
+    }
+
+    async fn import(frames: Vec<pb::Frame>) -> (MemoryStore, ImportSummary) {
+        let store = MemoryStore::default();
+        let summary = import_link_and_sync(
+            &archive(frames),
+            &synthetic_key(),
+            aci(OUR_ACI),
+            &store,
+            &mut |_| {},
+        )
+        .await
+        .expect("synthetic archive should import");
+        (store, summary)
+    }
+
+    async fn all_messages(store: &MemoryStore) -> Vec<Message> {
+        let mut out = vec![];
+        for c in store.conversations().await.expect("conversations") {
+            out.extend(
+                store
+                    .history(c.recipient, None, u32::MAX)
+                    .await
+                    .expect("history"),
+            );
+        }
+        out
+    }
+
+    /// The point of link-and-sync: a text a contact sent before linking must
+    /// land in the store under their conversation with its original timestamps.
+    #[tokio::test]
+    async fn an_incoming_text_lands_in_the_senders_conversation() {
+        let (store, summary) = import(vec![
+            self_recipient(),
+            contact(ALICE_ID, ALICE_ACI),
+            chat(ALICE_CHAT, ALICE_ID),
+            item(incoming_text(
+                ALICE_CHAT,
+                ALICE_ID,
+                1_000,
+                "thirty days ago",
+            )),
+        ])
+        .await;
+        assert_eq!(summary.imported, 1, "{summary:?}");
+        let stored = all_messages(&store).await;
+        let expected = Message {
+            id: MessageId {
+                author: aci(ALICE_ACI),
+                sent_at_ms: 1_000,
+            },
+            conversation: Recipient::Contact(aci(ALICE_ACI)),
+            sender: aci(ALICE_ACI),
+            from_me: false,
+            received_at_ms: 1_005,
+            body: Some("thirty days ago".to_owned()),
+            attachments: vec![],
+            quote: None,
+            edited: false,
+            deleted: false,
+        };
+        assert_eq!(stored, vec![expected]);
+    }
+}

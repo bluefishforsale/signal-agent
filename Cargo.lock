@@ -4018,11 +4018,15 @@ name = "relay-history"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures",
  "libsignal-account-keys",
  "libsignal-core",
  "libsignal-message-backup",
+ "protobuf",
  "relay-core",
  "relay-store",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

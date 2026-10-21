@@ -12,7 +12,14 @@ relay-store.workspace = true
 # Cargo treats a different tag or rev as a different source, which would link
 # two copies of libsignal-core and friends into one binary. Cargo.lock pins the
 # commit (439f035d9c for v0.99.0); bump this together with presage.
-# `test-util` is what makes the generated backup protos public; it adds no code.
+# `test-util` is what makes the generated backup protos public; it adds no code
+# to the import path.
 libsignal-message-backup = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0", features = ["test-util"] }
 libsignal-account-keys = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0" }
 libsignal-core = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0" }
+protobuf = "3.7.2"
+uuid.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+futures.workspace = true

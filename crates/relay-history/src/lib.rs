@@ -1,13 +1,16 @@
 //! Getting messages from before this device was linked into the store.
 //!
 //! Link-and-sync (the phone's history transfer at link time) is the primary
-//! source; its API is decided by the lane L7 spike and added here then.
-//! Signal Desktop import is an opt-in extra, never required.
+//! source. Signal Desktop import is an opt-in extra, never required.
+
+mod link_and_sync;
 
 use std::path::Path;
 
 use anyhow::bail;
 use relay_store::MessageStore;
+
+pub use link_and_sync::{ImportSummary, LinkAndSyncKey, import_link_and_sync};
 
 /// How far an import has got.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
