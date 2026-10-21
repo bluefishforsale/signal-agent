@@ -95,7 +95,10 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
     // device state before discovering it should exit.
     let name = endpoint::name(&config.profile, &config.paths)?;
     let listener = endpoint::Listener::bind(&name).await?;
-    startup::reregister_claude_entries(&config.profile);
+    let profile = config.profile.clone();
+    // Off the critical path: it shells out to Claude's CLIs, and the agent must
+    // start capturing whether or not that works.
+    tokio::task::spawn_blocking(move || startup::reregister_claude_entries(&profile));
     let (signal, store) = open_backend_and_store(&config).await?;
     Agent::new(signal, store, Registry::standard(), config.access)
         .serve(listener)
