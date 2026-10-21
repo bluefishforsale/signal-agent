@@ -11,6 +11,8 @@ use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::ClientOutcome;
+
 /// A Claude app that can host MCP servers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -158,6 +160,29 @@ impl Clients {
             .is_some()
             .then_some(ClaudeClient::Desktop);
         code.into_iter().chain(desktop).collect()
+    }
+
+    /// Registers `entry` with every installed client that lacks it, reporting
+    /// each client's outcome. Setup's client step and the agent's startup both
+    /// use this.
+    // NOTE: checking Claude Code launches the server through `claude mcp get`,
+    // so the agent must call this only once its socket is listening, or that
+    // probe would try to spawn a second agent.
+    pub fn reregister_missing(&self, entry: &ServerEntry) -> Vec<ClientOutcome> {
+        self.detect()
+            .into_iter()
+            .map(|client| {
+                let result = match self.register(client, entry) {
+                    Ok(Registration::Added | Registration::Present) => Ok(()),
+                    Ok(Registration::Foreign) => Err(format!(
+                        "{client:?} already has a different server named \"{}\"; it was left untouched",
+                        entry.name
+                    )),
+                    Err(e) => Err(format!("{e:#}")),
+                };
+                ClientOutcome { client, result }
+            })
+            .collect()
     }
 
     /// Adds `entry` to `client` unless an entry with that name already exists.
@@ -978,5 +1003,36 @@ mod tests {
             Some(npm.join("claude.cmd"))
         );
         assert_eq!(find_claude(Platform::Linux, &[empty]), None);
+    }
+
+    /// At startup every installed client gets its entry back if it lost it, an
+    /// entry already there is left as is, and a same-named foreign entry is
+    /// reported as a failure for that client alone.
+    #[test]
+    fn reregistration_restores_missing_entries_and_reports_each_client() {
+        let m = machine(Platform::MacOs, true, true);
+        m.fake
+            .servers
+            .lock()
+            .expect("servers lock")
+            .insert(entry().name, ("/opt/other/signal".into(), vec![]));
+
+        let outcomes = m.clients.reregister_missing(&entry());
+
+        let [code, desktop] = outcomes.as_slice() else {
+            panic!("expected one outcome per installed client, got {outcomes:?}");
+        };
+        assert_eq!(code.client, ClaudeClient::Code);
+        let Err(message) = &code.result else {
+            panic!("a foreign Code entry was reported as success: {code:?}");
+        };
+        assert!(message.contains(&entry().name), "{message}");
+        assert_eq!(desktop.client, ClaudeClient::Desktop);
+        assert_eq!(desktop.result, Ok(()));
+        let config = read_json(&m.desktop_dir.join("claude_desktop_config.json"));
+        assert_eq!(
+            config["mcpServers"][entry().name]["command"],
+            serde_json::json!(entry().command)
+        );
     }
 }
