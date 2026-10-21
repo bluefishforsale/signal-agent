@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use anyhow::bail;
 use futures::StreamExt;
 use relay_signal::{Incoming, SignalBackend};
 use relay_store::MessageStore;
@@ -25,7 +26,18 @@ pub(crate) async fn run(signal: Arc<dyn SignalBackend>, store: Arc<dyn MessageSt
 
 async fn apply(store: &dyn MessageStore, event: Incoming) -> anyhow::Result<()> {
     match event {
-        Incoming::Message(message) => store.insert(&message).await.map(|_| ()),
+        Incoming::Message(message) => {
+            // NOTE: the store's edit and delete checks trust `id.author`, so a
+            // message whose id names someone other than its sender is forged.
+            if message.id.author != message.sender {
+                bail!(
+                    "{} sent a message under {}'s id",
+                    message.sender,
+                    message.id.author
+                );
+            }
+            store.insert(&message).await.map(|_| ())
+        }
         Incoming::Edit {
             target, from, body, ..
         } => store.apply_edit(target, from, &body).await,
@@ -191,6 +203,41 @@ mod tests {
             still_unread.is_empty(),
             "read sync ignored: {still_unread:?}"
         );
+    }
+
+    /// A message claiming another author's id is dropped and the stored
+    /// original is unchanged: otherwise anyone could plant text under someone
+    /// else's id and pass the author checks that guard edits and deletes.
+    #[tokio::test]
+    async fn a_message_claiming_another_authors_id_is_dropped_and_the_original_is_unchanged() {
+        let signal = fake();
+        let store = Arc::new(MemoryStore::default());
+        let capture = tokio::spawn(run(signal.clone(), store.clone()));
+        let original = msg(2, 10, "original");
+        signal.push(Incoming::Message(original.clone()));
+        let mut forged = msg(2, 11, "forged");
+        forged.sender = ServiceId::new(Uuid::from_u128(666));
+        signal.push(Incoming::Message(forged));
+        signal.push(Incoming::Message(msg(2, 12, "marker")));
+        let stored = eventually(|| async {
+            let all = store
+                .history(original.conversation, None, 10)
+                .await
+                .expect("history");
+            if all.iter().any(|m| m.id.sent_at_ms == 12) {
+                all
+            } else {
+                vec![]
+            }
+        })
+        .await;
+        capture.abort();
+        let bodies: Vec<_> = stored.iter().filter_map(|m| m.body.as_deref()).collect();
+        assert!(
+            !bodies.contains(&"forged"),
+            "forged message stored: {bodies:?}"
+        );
+        assert!(bodies.contains(&"original"), "original lost: {bodies:?}");
     }
 
     async fn eventually<F, Fut>(mut probe: F) -> Vec<Message>
