@@ -6,10 +6,13 @@ license.workspace = true
 
 [dependencies]
 aes = "0.9.1"
+aes-gcm = "0.11.1"
 anyhow.workspace = true
+base64 = "0.22.1"
 cbc = "0.2.1"
 relay-core.workspace = true
 relay-store.workspace = true
+serde_json.workspace = true
 sha1 = "0.11.0"
 # NOTE: same git source and tag as libsignal-service-rs (and so presage) uses.
 # Cargo treats a different tag or rev as a different source, which would link

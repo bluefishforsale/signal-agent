@@ -3,7 +3,9 @@
 //! the only place that knows those schemes.
 
 use aes::cipher::{BlockModeDecrypt as _, KeyIvInit as _, block_padding::Pkcs7};
+use aes_gcm::{Aes256Gcm, KeyInit as _, aead::Aead as _};
 use anyhow::{Context, bail};
+use base64::Engine as _;
 
 /// Signal Desktop's database key: 64 ASCII hex characters, used as a raw
 /// SQLCipher key (`PRAGMA key = "x'<key>'"`).
@@ -54,6 +56,52 @@ pub(crate) fn decrypt_linux(
     decrypt_cbc(encrypted, &password, 1)
 }
 
+/// Decrypts Windows safeStorage's value. Current Electron wraps it in
+/// AES-256-GCM under a key kept DPAPI-protected in `Local State`; older builds
+/// DPAPI-protected the value itself. `unprotect` is DPAPI's CryptUnprotectData
+/// for the current user.
+pub(crate) fn decrypt_windows(
+    encrypted: &[u8],
+    local_state: Option<&str>,
+    unprotect: impl Fn(&[u8]) -> anyhow::Result<Vec<u8>>,
+) -> anyhow::Result<DatabaseKey> {
+    let wrapped_key = local_state.map(local_state_key).transpose()?.flatten();
+    let (Some(wrapped_key), Some(sealed)) = (wrapped_key, encrypted.strip_prefix(b"v10")) else {
+        return DatabaseKey::new(&unprotect(encrypted)?);
+    };
+    let Some(wrapped_key) = wrapped_key.strip_prefix(b"DPAPI") else {
+        bail!("Local State's os_crypt.encrypted_key lacks the DPAPI prefix");
+    };
+    let aes_key = unprotect(wrapped_key)?;
+    let cipher = Aes256Gcm::new_from_slice(&aes_key)
+        .ok()
+        .context("Local State's os_crypt key is not 32 bytes")?;
+    let Some((nonce, ciphertext)) = sealed.split_first_chunk::<12>() else {
+        bail!("Signal Desktop's encryptedKey is too short for AES-GCM");
+    };
+    let plaintext = cipher
+        .decrypt(&(*nonce).into(), ciphertext)
+        .ok()
+        .context("Signal Desktop's encryptedKey didn't decrypt under Local State's key")?;
+    DatabaseKey::new(&plaintext)
+}
+
+/// The DPAPI-wrapped key in Local State's `os_crypt.encrypted_key`, if any.
+fn local_state_key(local_state: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    let json: serde_json::Value =
+        serde_json::from_str(local_state).context("Signal Desktop's Local State is not JSON")?;
+    let Some(b64) = json
+        .pointer("/os_crypt/encrypted_key")
+        .and_then(|v| v.as_str())
+    else {
+        return Ok(None);
+    };
+    let wrapped = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .context("Local State's os_crypt.encrypted_key is not base64")?;
+    Ok(Some(wrapped))
+}
+
 /// Decrypts a Chromium "v10"/"v11" AES-128-CBC value, as macOS and Linux
 /// safeStorage write it.
 fn decrypt_cbc(encrypted: &[u8], password: &[u8], iterations: u32) -> anyhow::Result<DatabaseKey> {
@@ -89,6 +137,21 @@ mod tests {
     const LINUX_V10_VECTOR: &str = "43fb2f60f0307fa4a0844f86e33b7bc5af3b95cb4cfa8e9e37626472ec7216d1070a2368c3860e13d417f10883ede0130409987ea65ec44d6f4f9692d9539f4400b66e2d72ed03895d74d44f172cd71c";
 
     const LINUX_V11_VECTOR: &str = "118e9e7f9956e1c17ea731c68b9a8e50717935067f960e9485be36c2dc3a88c4ba811cbd375f8fe4fff9b62574811473a798bb790d452592ca76a5cf0bbbab028cb06a5ec5c6df042f9413bd223d4898";
+
+    // Python's cryptography AESGCM under key 00..1f, nonce 42 x 12, prefixed "v10".
+    const WINDOWS_GCM_KEY: &str =
+        "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    const WINDOWS_GCM_VECTOR: &str = "76313042424242424242424242424229fd49a7ece4c6dc2b131e521cfd6c6d012bd2a787fd424c780ce943f7ef88a0d9287a1bd9dc9f89c2fcbcd9a11954a804fd85b0b028809dfdba124a25d35a6f4a70c845bd7b84ddb99796d1212862be";
+
+    /// Stands in for DPAPI in tests: "protected" data is the plaintext.
+    fn no_dpapi(blob: &[u8]) -> anyhow::Result<Vec<u8>> {
+        Ok(blob.to_vec())
+    }
+
+    fn local_state_with(wrapped_key: &[u8]) -> String {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(wrapped_key);
+        format!(r#"{{"os_crypt":{{"encrypted_key":"{b64}"}}}}"#)
+    }
 
     fn hex(s: &str) -> Vec<u8> {
         (0..s.len())
@@ -137,5 +200,15 @@ mod tests {
         let double: String = DB_KEY.bytes().map(|b| format!("{b:02x}")).collect();
         let err = DatabaseKey::new(double.as_bytes()).expect_err("accepted a 128-char key");
         assert!(err.to_string().contains("64 hex"), "unhelpful error: {err}");
+    }
+
+    /// Windows: Local State's DPAPI-wrapped AES key opens the "v10" AES-256-GCM
+    /// value (nonce, then ciphertext and tag).
+    #[test]
+    fn windows_value_decrypts_with_the_local_state_gcm_key() {
+        let local_state = local_state_with(&[b"DPAPI".as_slice(), &hex(WINDOWS_GCM_KEY)].concat());
+        let key = decrypt_windows(&hex(WINDOWS_GCM_VECTOR), Some(&local_state), no_dpapi)
+            .expect("decrypt");
+        assert_eq!(key.0, DB_KEY);
     }
 }
