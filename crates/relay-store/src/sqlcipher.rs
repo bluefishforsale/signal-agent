@@ -50,6 +50,20 @@ impl SqlCipherStore {
         Ok(Self { pool })
     }
 
+    async fn set_read(&self, targets: &[MessageId], read: bool) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        for target in targets {
+            sqlx::query("UPDATE messages SET read = ? WHERE author = ? AND sent_at_ms = ?")
+                .bind(read)
+                .bind(target.author.to_string())
+                .bind(to_i64(target.sent_at_ms)?)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Closes every connection. Call before the process exits.
     // NOTE: dropping the store without this leaves sqlx worker threads closing
     // connections while the process tears down SQLCipher's crypto state, which
@@ -223,16 +237,11 @@ impl MessageStore for SqlCipherStore {
     }
 
     async fn mark_read(&self, targets: &[MessageId]) -> anyhow::Result<()> {
-        let mut tx = self.pool.begin().await?;
-        for target in targets {
-            sqlx::query("UPDATE messages SET read = 1 WHERE author = ? AND sent_at_ms = ?")
-                .bind(target.author.to_string())
-                .bind(to_i64(target.sent_at_ms)?)
-                .execute(&mut *tx)
-                .await?;
-        }
-        tx.commit().await?;
-        Ok(())
+        self.set_read(targets, true).await
+    }
+
+    async fn mark_unread(&self, targets: &[MessageId]) -> anyhow::Result<()> {
+        self.set_read(targets, false).await
     }
 
     async fn set_title(&self, conversation: Recipient, title: &str) -> anyhow::Result<()> {

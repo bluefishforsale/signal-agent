@@ -72,6 +72,11 @@ impl MessageStore for MemoryStore {
         Ok(())
     }
 
+    async fn mark_unread(&self, targets: &[MessageId]) -> anyhow::Result<()> {
+        self.inner().read.retain(|id| !targets.contains(id));
+        Ok(())
+    }
+
     async fn set_title(&self, conversation: Recipient, title: &str) -> anyhow::Result<()> {
         self.inner().titles.insert(conversation, title.to_owned());
         Ok(())

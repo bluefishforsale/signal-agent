@@ -403,3 +403,22 @@ fn search_accepts_any_text() {
     }
     rt.block_on(stores.close());
 }
+
+/// Marking a read message unread must bring it back into unread counts,
+/// or mark_as_unread would silently do nothing.
+#[tokio::test]
+async fn mark_unread_restores_a_read_message_to_unread() {
+    let alice = Recipient::Contact(sid(1));
+    let m = msg(1, 1, alice, "hi");
+    let stores = Stores::open().await;
+    for (name, store) in stores.each() {
+        store.insert(&m).await.expect("insert");
+        store.mark_read(&[m.id]).await.expect("read");
+        let unread = store.unread().await.expect("unread");
+        assert!(unread.is_empty(), "{name}: still unread after mark_read");
+        store.mark_unread(&[m.id]).await.expect("unread");
+        let unread = store.unread().await.expect("unread");
+        assert_eq!(unread, vec![m.clone()], "{name}: not unread again");
+    }
+    stores.close().await;
+}
