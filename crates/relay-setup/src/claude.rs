@@ -583,11 +583,14 @@ mod tests {
 
     use super::*;
 
+    /// A Code server's command and arguments.
+    type Launch = (String, Vec<String>);
+
     /// A stand-in for every external program: the `claude` CLI keeps its servers
     /// in memory, and every call is recorded.
     #[derive(Clone, Default)]
     struct Fake {
-        servers: Arc<Mutex<BTreeMap<String, (String, Vec<String>)>>>,
+        servers: Arc<Mutex<BTreeMap<String, Launch>>>,
         calls: Arc<Mutex<Vec<Vec<String>>>>,
     }
 
