@@ -1,0 +1,16 @@
+[package]
+name = "relay-signal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+relay-core.workspace = true
+serde.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true

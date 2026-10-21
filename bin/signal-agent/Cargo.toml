@@ -1,0 +1,13 @@
+[package]
+name = "signal-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+relay-agent.workspace = true
+relay-core.workspace = true
+relay-mcp.workspace = true
+tokio.workspace = true
