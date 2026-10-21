@@ -216,3 +216,28 @@ fn days_since_epoch(y: u32, m: u32, d: u32) -> u64 {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146_097 + doe - 719_468
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Date math must match the calendar across leap days and the century
+    /// rules, or every since/until window drifts by a day. Expected values are
+    /// from Python's datetime.
+    #[test]
+    fn instants_land_on_the_right_epoch_ms_across_leap_rules() {
+        for (s, ms) in [
+            ("1970-01-01", 0),
+            ("2000-02-29", 951_782_400_000),
+            ("2000-03-01", 951_868_800_000),
+            ("2024-02-29", 1_709_164_800_000),
+            ("2100-03-01", 4_107_542_400_000),
+            ("2099-12-31T23:59:59Z", 4_102_444_799_000),
+        ] {
+            assert_eq!(epoch_ms(s), Some(ms), "{s}");
+        }
+        for s in ["2100-02-29", "1900-01-01", "2023-02-29", "2024-01-01T24:00"] {
+            assert_eq!(epoch_ms(s), None, "accepted {s}");
+        }
+    }
+}
