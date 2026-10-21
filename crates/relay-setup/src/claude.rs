@@ -2,10 +2,14 @@
 //! and disappear again on uninstall, without ever disturbing an entry the user
 //! made themselves.
 
-use std::path::{Path, PathBuf};
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+};
 
-use anyhow::bail;
+use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// A Claude app that can host MCP servers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -130,7 +134,14 @@ impl Clients {
                 args.extend(entry.args.iter().cloned());
                 self.claude(&args)?;
             }
-            ClaudeClient::Desktop => bail!("Desktop registration is not implemented yet"),
+            ClaudeClient::Desktop => {
+                let mut config = DesktopConfig::load(self.desktop_path()?)?;
+                config.servers_mut()?.insert(
+                    entry.name.clone(),
+                    serde_json::json!({"command": entry.command, "args": entry.args}),
+                );
+                config.save()?;
+            }
         }
         Ok(Registration::Added)
     }
@@ -154,7 +165,14 @@ impl Clients {
                     EntryStatus::Foreign
                 })
             }
-            ClaudeClient::Desktop => Ok(EntryStatus::Missing),
+            ClaudeClient::Desktop => {
+                let config = DesktopConfig::load(self.desktop_path()?)?;
+                Ok(match config.servers()?.and_then(|s| s.get(&entry.name)) {
+                    None => EntryStatus::Missing,
+                    Some(server) if points_at(server, &entry.command) => EntryStatus::Ours,
+                    Some(_) => EntryStatus::Foreign,
+                })
+            }
         }
     }
 
@@ -179,11 +197,125 @@ impl Clients {
         Ok(cli)
     }
 
+    fn desktop_path(&self) -> anyhow::Result<PathBuf> {
+        let Some(path) = self.desktop_config() else {
+            bail!("Claude Desktop is not installed");
+        };
+        Ok(path)
+    }
+
     /// Desktop's config file, when Desktop is installed.
     fn desktop_config(&self) -> Option<PathBuf> {
         let dir = self.desktop_dir.as_ref().filter(|d| d.is_dir())?;
         Some(dir.join("claude_desktop_config.json"))
     }
+}
+
+/// Claude Desktop's config file, edited without disturbing anything else in it.
+struct DesktopConfig {
+    path: PathBuf,
+    original: Option<String>,
+    root: serde_json::Map<String, Value>,
+}
+
+impl DesktopConfig {
+    fn load(path: PathBuf) -> anyhow::Result<Self> {
+        let original = match fs::read_to_string(&path) {
+            Ok(text) => Some(text),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(e).with_context(|| format!("unable to read \"{}\"", path.display()));
+            }
+        };
+        let root = match original.as_deref().map(str::trim) {
+            None | Some("") => serde_json::Map::new(),
+            Some(text) => {
+                let value: Value = serde_json::from_str(text).with_context(|| {
+                    format!(
+                        "\"{}\" is not valid JSON; fix or remove it, then try again",
+                        path.display()
+                    )
+                })?;
+                let Value::Object(root) = value else {
+                    bail!(
+                        "\"{}\" is not a JSON object; fix or remove it, then try again",
+                        path.display()
+                    );
+                };
+                root
+            }
+        };
+        Ok(Self {
+            path,
+            original,
+            root,
+        })
+    }
+
+    fn servers(&self) -> anyhow::Result<Option<&serde_json::Map<String, Value>>> {
+        match self.root.get(SERVERS) {
+            None => Ok(None),
+            Some(Value::Object(servers)) => Ok(Some(servers)),
+            Some(_) => bail!(
+                "\"{}\" has a \"{SERVERS}\" that is not an object",
+                self.path.display()
+            ),
+        }
+    }
+
+    fn servers_mut(&mut self) -> anyhow::Result<&mut serde_json::Map<String, Value>> {
+        let servers = self
+            .root
+            .entry(SERVERS)
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        let Value::Object(servers) = servers else {
+            bail!(
+                "\"{}\" has a \"{SERVERS}\" that is not an object",
+                self.path.display()
+            );
+        };
+        Ok(servers)
+    }
+
+    /// Backs up the file as it was, then replaces it in one rename so Desktop
+    /// never reads a half-written config.
+    fn save(&self) -> anyhow::Result<()> {
+        if let Some(original) = &self.original {
+            let backup = sibling(&self.path, ".bak-signal-agent");
+            fs::write(&backup, original)
+                .with_context(|| format!("unable to back up to \"{}\"", backup.display()))?;
+        }
+        let mut text = serde_json::to_string_pretty(&self.root)?;
+        text.push('\n');
+        let tmp = sibling(&self.path, ".tmp-signal-agent");
+        fs::write(&tmp, text).with_context(|| format!("unable to write \"{}\"", tmp.display()))?;
+        fs::rename(&tmp, &self.path)
+            .with_context(|| format!("unable to replace \"{}\"", self.path.display()))
+    }
+}
+
+const SERVERS: &str = "mcpServers";
+
+/// Whether a Desktop server entry launches `binary`, directly or as an argument
+/// to a wrapper.
+fn points_at(server: &Value, binary: &str) -> bool {
+    let command = server.get("command").and_then(Value::as_str);
+    let args = server
+        .get("args")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten();
+    command
+        .into_iter()
+        .chain(args.filter_map(Value::as_str))
+        .any(|s| s.contains(binary))
+}
+
+/// `path` with `suffix` appended to its file name.
+fn sibling(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
 }
 
 fn strings(args: &[&str]) -> Vec<String> {
@@ -333,6 +465,69 @@ mod tests {
             m.fake.calls().iter().any(|c| *c == add),
             "no user-scope add in {:?}",
             m.fake.calls()
+        );
+    }
+
+    /// An existing Code entry with our name is never replaced, whether it points
+    /// at this install or at something the user set up by hand.
+    #[test]
+    fn code_registration_never_overwrites_an_existing_entry() {
+        for (command, expected) in [
+            (entry().command, Registration::Present),
+            (
+                "/usr/local/bin/someone-elses-signal".to_owned(),
+                Registration::Foreign,
+            ),
+        ] {
+            let m = machine(Platform::MacOs, true, false);
+            m.fake
+                .servers
+                .lock()
+                .expect("servers lock")
+                .insert(entry().name, (command.clone(), vec![]));
+            let result = m
+                .clients
+                .register(ClaudeClient::Code, &entry())
+                .expect("register");
+            assert_eq!(result, expected, "existing command {command}");
+            let adds: Vec<_> = m
+                .fake
+                .calls()
+                .into_iter()
+                .filter(|c| c.get(2).is_some_and(|a| a == "add"))
+                .collect();
+            assert!(adds.is_empty(), "overwrote {command}: {adds:?}");
+            assert_eq!(
+                m.fake
+                    .servers
+                    .lock()
+                    .expect("servers lock")
+                    .get(&entry().name)
+                    .map(|s| &s.0),
+                Some(&command)
+            );
+        }
+    }
+
+    fn read_json(path: &Path) -> serde_json::Value {
+        let text = std::fs::read_to_string(path).expect("read config");
+        serde_json::from_str(&text).expect("config is JSON")
+    }
+
+    /// Desktop launches the server from its config file, creating it if Desktop
+    /// never wrote one.
+    #[test]
+    fn desktop_registration_creates_a_missing_config() {
+        let m = machine(Platform::MacOs, false, true);
+        let result = m
+            .clients
+            .register(ClaudeClient::Desktop, &entry())
+            .expect("register");
+        assert_eq!(result, Registration::Added);
+        let e = entry();
+        assert_eq!(
+            read_json(&m.desktop_dir.join("claude_desktop_config.json")),
+            serde_json::json!({"mcpServers": {e.name: {"command": e.command, "args": e.args}}})
         );
     }
 }
