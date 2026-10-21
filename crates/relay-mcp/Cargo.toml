@@ -6,4 +6,17 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+relay-agent.workspace = true
 relay-core.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+futures.workspace = true
+relay-signal.workspace = true
+relay-store.workspace = true
+relay-tools.workspace = true
+rmcp = { version = "3.6.0", default-features = false, features = ["client"] }
+serde_json.workspace = true
+tempfile = "3"
+uuid.workspace = true

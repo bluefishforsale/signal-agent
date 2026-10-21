@@ -2776,7 +2776,18 @@ name = "relay-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "futures",
+ "relay-agent",
  "relay-core",
+ "relay-signal",
+ "relay-store",
+ "relay-tools",
+ "rmcp",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

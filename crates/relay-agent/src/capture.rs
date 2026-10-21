@@ -25,7 +25,7 @@ pub(crate) async fn run(signal: Arc<dyn SignalBackend>, store: Arc<dyn MessageSt
 
 async fn apply(store: &dyn MessageStore, event: Incoming) -> anyhow::Result<()> {
     match event {
-        Incoming::Message(message) => store.upsert(&message).await,
+        Incoming::Message(message) => store.insert(&message).await.map(|_| ()),
         Incoming::Edit {
             target, from, body, ..
         } => store.apply_edit(target, from, &body).await,
