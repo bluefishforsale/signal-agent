@@ -16,14 +16,21 @@ use anyhow::{Context, anyhow, bail};
 use async_trait::async_trait;
 use futures::{StreamExt, stream::BoxStream};
 use presage::{
-    Manager, manager::Registered, model::messages::Received, proto::GroupContextV2,
-    store::ContentsStore,
+    Manager,
+    libsignal_service::{configuration::SignalServers, provisioning::ProvisioningError},
+    manager::Registered,
+    model::messages::Received,
+    proto::GroupContextV2,
+    store::{ContentsStore, StateStore},
 };
 use presage_store_sqlite::{OnNewIdentity, SqliteConnectOptions, SqliteStore};
 use relay_core::prelude::*;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{Account, Contact, Group, Incoming, Outgoing, SignalBackend, convert};
+use crate::{
+    Account, Contact, Group, Incoming, LinkEvent, Outgoing, Provisioner, RegistrationStep,
+    SignalBackend, convert,
+};
 
 type Job = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()>>> + Send>;
 
@@ -203,6 +210,119 @@ impl SignalBackend for PresageSignal {
     }
 }
 
+/// Which Signal service an account lives on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Servers {
+    Production,
+    /// Signal's staging service, for the nightly two-account test.
+    Staging,
+}
+
+/// Creates the account in one profile's presage store.
+pub struct PresageProvisioner {
+    worker: Worker,
+    store: SqliteStore,
+    servers: SignalServers,
+}
+
+impl PresageProvisioner {
+    /// Opens (creating if needed) the store at `path`, encrypted with `key`,
+    /// for an account on `servers`.
+    pub async fn open(path: &Path, key: &[u8; 32], servers: Servers) -> anyhow::Result<Self> {
+        let worker = Worker::spawn()?;
+        let (path, key) = (path.to_owned(), *key);
+        let store = worker
+            .run(move || async move { open_store(&path, &key).await })
+            .await??;
+        Ok(Self {
+            worker,
+            store,
+            servers: match servers {
+                Servers::Production => SignalServers::Production,
+                Servers::Staging => SignalServers::Staging,
+            },
+        })
+    }
+}
+
+#[async_trait]
+impl Provisioner for PresageProvisioner {
+    fn link(&self, device_name: String) -> BoxStream<'static, anyhow::Result<LinkEvent>> {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (worker, store, servers) = (self.worker.clone(), self.store.clone(), self.servers);
+        let start = async move {
+            let started = worker
+                .run(move || async move {
+                    tokio::task::spawn_local(link(store, servers, device_name, tx));
+                })
+                .await;
+            match started {
+                Ok(()) => futures::stream::poll_fn(move |cx| rx.poll_recv(cx)).boxed(),
+                Err(e) => futures::stream::once(async { Err(e) }).boxed(),
+            }
+        };
+        futures::stream::once(start).flatten().boxed()
+    }
+
+    async fn request_code(
+        &self,
+        phone_number: &str,
+        captcha: Option<&str>,
+        voice: bool,
+    ) -> anyhow::Result<RegistrationStep> {
+        bail!("not yet")
+    }
+
+    async fn verify_code(&self, code: &str) -> anyhow::Result<RegistrationStep> {
+        bail!("not yet")
+    }
+}
+
+/// Links as a secondary device, offering a fresh URI each time an unscanned
+/// one expires, until the phone accepts or the consumer goes away.
+async fn link(
+    store: SqliteStore,
+    servers: SignalServers,
+    device_name: String,
+    tx: mpsc::UnboundedSender<anyhow::Result<LinkEvent>>,
+) {
+    if store.is_registered().await {
+        // The consumer may already be gone; nothing else to tell.
+        let _ = tx.send(Err(anyhow!(
+            "this profile already has a Signal account; linking would erase it"
+        )));
+        return;
+    }
+    while !tx.is_closed() {
+        let (uri_tx, uri_rx) = futures::channel::oneshot::channel::<url::Url>();
+        let show_uri = {
+            let tx = tx.clone();
+            async move {
+                if let Ok(uri) = uri_rx.await {
+                    let _ = tx.send(Ok(LinkEvent::Uri {
+                        uri: uri.to_string(),
+                    }));
+                }
+            }
+        };
+        let (linked, ()) = futures::future::join(
+            Manager::link_secondary_device(store.clone(), servers, device_name.clone(), uri_tx),
+            show_uri,
+        )
+        .await;
+        let event = match linked {
+            Ok(manager) => Ok(LinkEvent::Linked {
+                account: convert::account(manager.registration_data(), manager.registration_type()),
+            }),
+            // The provisioning socket closed with no scan: the URI expired.
+            Err(presage::Error::ProvisioningError(ProvisioningError::MissingMessage)) => continue,
+            Err(e) => Err(anyhow!(e).context("linking failed")),
+        };
+        let _ = tx.send(event);
+        return;
+    }
+}
+
 async fn send(
     mut manager: Manager<SqliteStore, Registered>,
     to: Recipient,
@@ -328,7 +448,7 @@ async fn open_store(path: &Path, key: &[u8; 32]) -> anyhow::Result<SqliteStore> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use presage::{manager::RegistrationData, store::StateStore};
+    use presage::manager::RegistrationData;
 
     fn temp_store() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -575,6 +695,24 @@ mod tests {
             err.to_string().contains("not a member"),
             "unclear error: {err:#}"
         );
+    }
+
+    /// Linking wipes presage's store before it starts. Pointed at a profile
+    /// that already has an account it must refuse, not silently unlink it.
+    #[tokio::test]
+    async fn linking_refuses_a_store_that_already_has_an_account() {
+        let (_dir, path) = temp_store();
+        register_linked(&path).await;
+        let provisioner = PresageProvisioner::open(&path, &KEY, Servers::Staging)
+            .await
+            .expect("opens");
+        let events: Vec<_> = provisioner.link("Claude (test)".into()).collect().await;
+        assert!(
+            matches!(events.as_slice(), [Err(_)]),
+            "linking over an account produced {events:?}"
+        );
+        let still = PresageSignal::open(&path, &KEY).await;
+        assert!(still.is_ok(), "the existing account was erased");
     }
 
     /// The store must be unreadable without its key. If the SQLCipher build

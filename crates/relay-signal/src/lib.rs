@@ -12,7 +12,7 @@ pub use backend::{
     SignalBackend,
 };
 pub use fake::FakeSignal;
-pub use presage_backend::PresageSignal;
+pub use presage_backend::{PresageProvisioner, PresageSignal, Servers};
 
 pub mod prelude {
     pub use crate::{
