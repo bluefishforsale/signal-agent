@@ -4,6 +4,7 @@
 
 mod capture;
 pub mod login;
+mod mcp;
 
 use anyhow::bail;
 use relay_core::prelude::*;

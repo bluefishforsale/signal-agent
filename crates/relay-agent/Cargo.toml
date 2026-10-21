@@ -11,8 +11,12 @@ relay-core.workspace = true
 relay-signal.workspace = true
 relay-store.workspace = true
 relay-tools.workspace = true
+rmcp = { version = "3.6.0", default-features = false, features = ["server"] }
+serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
+rmcp = { version = "3.6.0", default-features = false, features = ["client", "server"] }
 uuid.workspace = true
