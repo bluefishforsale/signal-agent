@@ -23,7 +23,7 @@ signal-agent/
                     profile) + FakeSignal; the presage implementation lives here behind the trait
     relay-secrets   trait SecretStore (get/set/delete a profile's store key) with Keychain, DPAPI,
                     Secret Service and 0600-file implementations
-    relay-store     SQLCipher message store with FTS5: open(path, key), upsert, conversations, history,
+    relay-store     SQLCipher message store with FTS5: open(path, key), insert (never overwrites), conversations, history,
                     search, unread, stats, prune, export
     relay-tools     trait Tool {name, description, input_schema, writes, needs_primary, call}, Registry,
                     ToolContext {store, signal, access, kind}; every MCP tool lives here

@@ -38,8 +38,12 @@ pub struct StoreStats {
 // would need a second SQLite build and the two can't link into one binary.
 #[async_trait]
 pub trait MessageStore: Send + Sync {
-    /// Inserts or replaces the message with the same id.
-    async fn upsert(&self, message: &Message) -> anyhow::Result<()>;
+    /// Stores `message` if its id is new and returns true; an existing row is
+    /// left untouched and false is returned.
+    // NOTE: never overwrite here. A resent or forged message with an existing
+    // id would otherwise replace the body or clear edited/deleted state, which
+    // bypasses the author checks in apply_edit and mark_deleted.
+    async fn insert(&self, message: &Message) -> anyhow::Result<bool>;
     /// Fails unless `editor` wrote `target`.
     async fn apply_edit(
         &self,

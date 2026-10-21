@@ -47,13 +47,13 @@ fn find(messages: &mut [Message], target: MessageId) -> anyhow::Result<&mut Mess
 
 #[async_trait]
 impl MessageStore for MemoryStore {
-    async fn upsert(&self, message: &Message) -> anyhow::Result<()> {
+    async fn insert(&self, message: &Message) -> anyhow::Result<bool> {
         let mut inner = self.inner();
-        match inner.messages.iter_mut().find(|m| m.id == message.id) {
-            Some(existing) => *existing = message.clone(),
-            None => inner.messages.push(message.clone()),
+        if inner.messages.iter().any(|m| m.id == message.id) {
+            return Ok(false);
         }
-        Ok(())
+        inner.messages.push(message.clone());
+        Ok(true)
     }
 
     async fn apply_edit(
@@ -207,21 +207,41 @@ mod tests {
         }
     }
 
-    /// Receiving the same message twice (a resync) must not duplicate it.
+    /// A resent or forged message reusing an existing id must neither duplicate
+    /// the row nor replace its body or clear its deleted state.
     #[tokio::test]
-    async fn upserting_the_same_id_twice_keeps_one_row() {
+    async fn inserting_an_existing_id_changes_nothing() {
         let store = MemoryStore::default();
-        store.upsert(&msg(1, "hi")).await.expect("upsert");
-        store.upsert(&msg(1, "hi again")).await.expect("upsert");
+        let original = msg(1, "hi");
+        assert!(
+            store.insert(&original).await.expect("insert"),
+            "first insert not new"
+        );
+        store
+            .mark_deleted(original.id, original.id.author)
+            .await
+            .expect("delete");
+        let replay = msg(1, "rewritten");
+        assert!(
+            !store.insert(&replay).await.expect("insert"),
+            "replay reported as new"
+        );
         let stats = store.stats().await.expect("stats");
         assert_eq!(stats.messages, 1, "duplicate rows: {stats:?}");
+        let kept = store
+            .history(original.conversation, None, 1)
+            .await
+            .expect("history");
+        let kept = kept.first().expect("row kept");
+        assert_eq!(kept.body.as_deref(), Some("hi"), "body replaced by replay");
+        assert!(kept.deleted, "replay cleared deleted state");
     }
 
     /// A deleted-for-everyone message must stop matching searches.
     #[tokio::test]
     async fn deleted_messages_drop_out_of_search() {
         let store = MemoryStore::default();
-        store.upsert(&msg(1, "secret plan")).await.expect("upsert");
+        store.insert(&msg(1, "secret plan")).await.expect("insert");
         let id = msg(1, "").id;
         store.mark_deleted(id, id.author).await.expect("delete");
         let hits = store
@@ -241,7 +261,7 @@ mod tests {
     async fn edits_and_deletes_from_non_authors_are_refused() {
         let store = MemoryStore::default();
         let original = msg(1, "original");
-        store.upsert(&original).await.expect("upsert");
+        store.insert(&original).await.expect("insert");
         let stranger = ServiceId::new(Uuid::from_u128(666));
         assert!(
             store
