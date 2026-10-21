@@ -5,7 +5,7 @@ use relay_core::prelude::*;
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
-use crate::ToolError;
+use crate::{ToolContext, ToolError};
 
 /// Deserializes a tool's input, turning every shape or type mismatch into
 /// InvalidInput rather than letting it surface as an internal failure.
@@ -89,13 +89,27 @@ pub fn recipient_schema() -> Value {
     json!({
         "type": "string",
         "format": "signal-recipient",
-        "description": "A contact's service id (UUID) or a group id (64 hex characters), \
-                        as list_conversations returns them",
+        "description": "A contact's phone number (E.164, e.g. +15551234567) or service id \
+                        (UUID), or a group id (64 hex characters), as list_conversations \
+                        returns them",
     })
 }
 
-/// A conversation named the way list_conversations names it.
-pub fn recipient(s: &str) -> Result<Recipient, ToolError> {
+/// A conversation named the way list_conversations names it, or by a
+/// contact's phone number.
+pub async fn recipient(ctx: &ToolContext, s: &str) -> Result<Recipient, ToolError> {
+    if is_e164(s) {
+        let contacts = ctx.signal.contacts().await?;
+        let Some(contact) = contacts
+            .iter()
+            .find(|c| c.phone_number.as_deref() == Some(s))
+        else {
+            return Err(ToolError::InvalidInput(format!(
+                "no contact has the number \"{s}\""
+            )));
+        };
+        return Ok(Recipient::Contact(contact.service_id));
+    }
     if let Ok(id) = ServiceId::parse(s) {
         return Ok(Recipient::Contact(id));
     }
@@ -103,6 +117,14 @@ pub fn recipient(s: &str) -> Result<Recipient, ToolError> {
         return Ok(Recipient::Group(id));
     }
     Err(ToolError::InvalidInput(format!(
-        "\"{s}\" is neither a contact's service id nor a group id"
+        "\"{s}\" is not a phone number, a contact's service id or a group id"
     )))
+}
+
+/// A plus sign then 8 to 15 digits, the E.164 range Signal accepts.
+fn is_e164(s: &str) -> bool {
+    let Some(digits) = s.strip_prefix('+') else {
+        return false;
+    };
+    (8..=15).contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_digit())
 }

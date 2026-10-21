@@ -165,7 +165,7 @@ impl Tool for GetConversation {
     }
     async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
         let input: GetConversationInput = parse(input)?;
-        let conversation = recipient(&input.recipient)?;
+        let conversation = recipient(ctx, &input.recipient).await?;
         let (limit, offset) = (input.limit.get(), input.offset.get());
         let newest_first = ctx
             .store
@@ -186,7 +186,9 @@ impl Tool for GetConversation {
 mod tests {
     use serde_json::{Value, json};
 
-    use crate::{Registry, testing::*};
+    use relay_signal::Contact;
+
+    use crate::{Registry, ToolError, testing::*};
     use relay_core::prelude::*;
 
     /// The inbox must come back newest conversation first, so "who wrote last"
@@ -293,5 +295,40 @@ mod tests {
             .unwrap();
         assert_eq!(bodies(&out["messages"]), ["b", "c"], "{out}");
         assert_eq!(out["has_more"], json!(true), "{out}");
+    }
+
+    /// Upstream tools address people by phone number, so a number must reach
+    /// the same conversation as the contact's service id; a number that isn't a
+    /// contact is a caller mistake, not an empty chat.
+    #[tokio::test]
+    async fn get_conversation_resolves_a_contacts_phone_number_and_refuses_strangers() {
+        let contact = Contact {
+            service_id: sid(2),
+            name: Some("Ada".into()),
+            phone_number: Some("+15550000002".into()),
+        };
+        let (ctx, _) = ctx_with(AccessMode::ReadOnly, ProfileKind::Linked, vec![contact]);
+        ctx.store.upsert(&incoming(2, 100, "hi")).await.unwrap();
+        let registry = Registry::standard();
+        let out = registry
+            .call(
+                &ctx,
+                "get_conversation",
+                json!({"recipient": "+15550000002"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bodies(&out["messages"]), ["hi"], "{out}");
+        let stranger = registry
+            .call(
+                &ctx,
+                "get_conversation",
+                json!({"recipient": "+15550000009"}),
+            )
+            .await;
+        assert!(
+            matches!(stranger, Err(ToolError::InvalidInput(_))),
+            "unknown number gave {stranger:?}"
+        );
     }
 }
