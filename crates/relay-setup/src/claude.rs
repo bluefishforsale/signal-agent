@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, bail};
+use relay_core::ProfileName;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -38,6 +39,21 @@ pub struct ServerEntry {
     /// An absolute path: Claude Desktop launches servers without a shell PATH.
     pub command: String,
     pub args: Vec<String>,
+}
+
+impl ServerEntry {
+    /// The entry that launches `command args` as `profile`'s server.
+    pub fn for_profile(
+        profile: &ProfileName,
+        command: impl Into<String>,
+        args: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            name: profile.mcp_server_name(),
+            command: command.into(),
+            args: args.into_iter().map(Into::into).collect(),
+        }
+    }
 }
 
 /// The operating system whose conventions apply.
@@ -1130,5 +1146,16 @@ mod tests {
             panic!("broken config not reported as unreadable");
         };
         assert!(error.contains("claude_desktop_config.json"), "{error}");
+    }
+
+    /// The client-side name comes from the profile, so setup, the agent's
+    /// startup check and uninstall always look for the same entry.
+    #[test]
+    fn a_profile_entry_is_named_after_its_mcp_server_name() {
+        let profile = ProfileName::new("work").expect("valid profile");
+        let entry = ServerEntry::for_profile(&profile, "/bin/signal-agent", ["mcp"]);
+        assert_eq!(entry.name, profile.mcp_server_name());
+        assert_eq!(entry.command, "/bin/signal-agent");
+        assert_eq!(entry.args, ["mcp"]);
     }
 }

@@ -11,8 +11,8 @@ pub use uninstall::{Step, StepOutcome, run_steps, uninstall_steps};
 
 pub mod prelude {
     pub use crate::{
-        AccountChoice, ClientOutcome, Command, SetupEvent, SetupState,
-        claude::{ClaudeClient, ServerEntry},
-        transition,
+        AccountChoice, ClientOutcome, Command, SetupEvent, SetupState, Step, StepOutcome,
+        claude::{ClaudeClient, ClientReport, ClientStatus, Clients, ServerEntry},
+        run_steps, transition, uninstall_steps,
     };
 }
