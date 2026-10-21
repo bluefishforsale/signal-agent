@@ -1,0 +1,8 @@
+#!/bin/sh
+# Formats staged Rust before every commit so formatting never reaches review.
+# Enable once per clone: git config core.hooksPath .githooks
+set -e
+staged=$(git diff --cached --name-only --diff-filter=ACM -- '*.rs')
+[ -z "$staged" ] && exit 0
+cargo fmt --all
+echo "$staged" | xargs git add

@@ -35,17 +35,28 @@ impl ProfilePaths {
         }
     }
 
-    /// The agent's local endpoint: a Unix socket in the profile directory, or a
-    /// per-user named pipe on Windows.
+    /// The agent's local endpoint: a Unix socket in the profile directory, or on
+    /// Windows a named pipe keyed by the user's SID (`user_sid`, required there).
     // NOTE: macOS limits Unix socket paths to 104 bytes. The profile directory
     // under Application Support stays well inside that for 32-character names,
     // but relocating `base` somewhere deep will break binding.
-    pub fn agent_endpoint(&self, profile: &ProfileName) -> String {
-        if cfg!(windows) {
-            let user = std::env::var("USERNAME").unwrap_or_default();
-            format!(r"\\.\pipe\signal-agent-{user}-{profile}")
-        } else {
-            self.root.join("agent.sock").display().to_string()
+    // NOTE: on Windows the pipe namespace is shared by every user on the machine,
+    // so a guessable name lets another user squat it and impersonate the agent.
+    // The name uses the SID from the process token, never USERNAME and never an
+    // empty fallback; the server creates it with FILE_FLAG_FIRST_PIPE_INSTANCE and
+    // a DACL for that SID only, and the client checks the server process's SID
+    // matches its own before sending anything (lane L4).
+    pub fn agent_endpoint(
+        &self,
+        profile: &ProfileName,
+        user_sid: Option<&str>,
+    ) -> anyhow::Result<String> {
+        if !cfg!(windows) {
+            return Ok(self.root.join("agent.sock").display().to_string());
         }
+        let Some(sid) = user_sid.filter(|s| s.starts_with("S-1-")) else {
+            anyhow::bail!("a Windows pipe name needs the current user's SID, got {user_sid:?}");
+        };
+        Ok(format!(r"\\.\pipe\signal-agent-{sid}-{profile}"))
     }
 }

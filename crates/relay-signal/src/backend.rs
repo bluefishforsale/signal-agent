@@ -73,12 +73,19 @@ pub enum Incoming {
         emoji: String,
         remove: bool,
     },
+    // NOTE: `from` is who sent the edit or delete. The store must refuse it
+    // unless `from` is the target's author, or anyone in a chat could rewrite or
+    // erase someone else's messages in the local history.
     Edit {
+        conversation: Recipient,
         target: MessageId,
+        from: ServiceId,
         body: String,
     },
     Delete {
+        conversation: Recipient,
         target: MessageId,
+        from: ServiceId,
     },
     Read {
         targets: Vec<MessageId>,

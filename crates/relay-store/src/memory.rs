@@ -4,7 +4,7 @@
 
 use std::{collections::HashMap, sync::Mutex};
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use relay_core::prelude::*;
 
 use crate::{MessageStore, SearchQuery, StoreStats};
@@ -27,6 +27,16 @@ impl MemoryStore {
     }
 }
 
+fn ensure_author(target: MessageId, actor: ServiceId, action: &str) -> anyhow::Result<()> {
+    if actor != target.author {
+        bail!(
+            "{actor} tried to {action} a message written by {}",
+            target.author
+        );
+    }
+    Ok(())
+}
+
 fn find(messages: &mut [Message], target: MessageId) -> anyhow::Result<&mut Message> {
     messages
         .iter_mut()
@@ -44,7 +54,8 @@ impl MessageStore for MemoryStore {
         Ok(())
     }
 
-    fn apply_edit(&self, target: MessageId, body: &str) -> anyhow::Result<()> {
+    fn apply_edit(&self, target: MessageId, editor: ServiceId, body: &str) -> anyhow::Result<()> {
+        ensure_author(target, editor, "edit")?;
         let mut inner = self.inner();
         let message = find(&mut inner.messages, target)?;
         message.body = Some(body.to_owned());
@@ -52,7 +63,8 @@ impl MessageStore for MemoryStore {
         Ok(())
     }
 
-    fn mark_deleted(&self, target: MessageId) -> anyhow::Result<()> {
+    fn mark_deleted(&self, target: MessageId, deleter: ServiceId) -> anyhow::Result<()> {
+        ensure_author(target, deleter, "delete")?;
         let mut inner = self.inner();
         find(&mut inner.messages, target)?.deleted = true;
         Ok(())
@@ -203,7 +215,8 @@ mod tests {
     fn deleted_messages_drop_out_of_search() {
         let store = MemoryStore::default();
         store.upsert(&msg(1, "secret plan")).expect("upsert");
-        store.mark_deleted(msg(1, "").id).expect("delete");
+        let id = msg(1, "").id;
+        store.mark_deleted(id, id.author).expect("delete");
         let hits = store
             .search(&SearchQuery {
                 text: "plan".into(),
@@ -212,5 +225,34 @@ mod tests {
             })
             .expect("search");
         assert!(hits.is_empty(), "deleted message still found: {hits:?}");
+    }
+
+    /// Someone else in the chat must not be able to rewrite or erase a message
+    /// they didn't write; Signal only lets the author edit or delete.
+    #[test]
+    fn edits_and_deletes_from_non_authors_are_refused() {
+        let store = MemoryStore::default();
+        let original = msg(1, "original");
+        store.upsert(&original).expect("upsert");
+        let stranger = ServiceId::new(Uuid::from_u128(666));
+        assert!(
+            store.apply_edit(original.id, stranger, "forged").is_err(),
+            "stranger edit accepted"
+        );
+        assert!(
+            store.mark_deleted(original.id, stranger).is_err(),
+            "stranger delete accepted"
+        );
+        let kept = store
+            .history(original.conversation, None, 1)
+            .expect("history");
+        assert_eq!(
+            kept.first().and_then(|m| m.body.as_deref()),
+            Some("original")
+        );
+        assert!(
+            kept.first().is_some_and(|m| !m.deleted),
+            "message was deleted: {kept:?}"
+        );
     }
 }

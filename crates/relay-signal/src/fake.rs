@@ -174,13 +174,18 @@ mod tests {
             author: ServiceId::new(Uuid::from_u128(2)),
             sent_at_ms: 5,
         };
-        signal.push(Incoming::Delete { target });
+        let delete = Incoming::Delete {
+            conversation: Recipient::Contact(target.author),
+            target,
+            from: target.author,
+        };
+        signal.push(delete.clone());
         signal.push(Incoming::Read {
             targets: vec![target],
         });
         let first = stream.next().await.expect("stream open").expect("ok");
         let second = stream.next().await.expect("stream open").expect("ok");
-        assert_eq!(first, Incoming::Delete { target });
+        assert_eq!(first, delete);
         assert!(
             matches!(second, Incoming::Read { .. }),
             "out of order: {second:?}"

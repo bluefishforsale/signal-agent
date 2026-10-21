@@ -35,8 +35,10 @@ pub struct StoreStats {
 pub trait MessageStore: Send + Sync {
     /// Inserts or replaces the message with the same id.
     fn upsert(&self, message: &Message) -> anyhow::Result<()>;
-    fn apply_edit(&self, target: MessageId, body: &str) -> anyhow::Result<()>;
-    fn mark_deleted(&self, target: MessageId) -> anyhow::Result<()>;
+    /// Fails unless `editor` wrote `target`.
+    fn apply_edit(&self, target: MessageId, editor: ServiceId, body: &str) -> anyhow::Result<()>;
+    /// Fails unless `deleter` wrote `target`.
+    fn mark_deleted(&self, target: MessageId, deleter: ServiceId) -> anyhow::Result<()>;
     fn mark_read(&self, targets: &[MessageId]) -> anyhow::Result<()>;
     fn set_title(&self, conversation: Recipient, title: &str) -> anyhow::Result<()>;
     /// Most recent first.
