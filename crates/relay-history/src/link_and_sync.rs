@@ -54,7 +54,7 @@ pub async fn import_link_and_sync(
     key: &LinkAndSyncKey,
     our_aci: ServiceId,
     store: &dyn MessageStore,
-    _progress: &mut (dyn FnMut(ImportProgress) + Send),
+    progress: &mut (dyn FnMut(ImportProgress) + Send),
 ) -> anyhow::Result<ImportSummary> {
     let backup_key: BackupKey = BackupKey(key.0);
     let backup_id = backup_key.derive_backup_id(&Aci::from(our_aci.uuid()));
@@ -90,7 +90,14 @@ pub async fn import_link_and_sync(
     {
         let frame = pb::Frame::parse_from_bytes(&raw)
             .context("malformed frame in link-and-sync archive")?;
+        let before = importer.summary.imported;
         importer.frame(frame).await?;
+        if importer.summary.imported != before {
+            progress(ImportProgress {
+                imported: importer.summary.imported,
+                total: None,
+            });
+        }
     }
     store
         .mark_read(&importer.read)
@@ -712,5 +719,30 @@ mod tests {
                 skipped: 1
             }
         );
+    }
+
+    /// Setup shows import progress; it must advance with every message and end
+    /// at the summary's count.
+    #[tokio::test]
+    async fn progress_counts_every_imported_message() {
+        let store = MemoryStore::default();
+        let mut seen = vec![];
+        let summary = import_link_and_sync(
+            &archive(vec![
+                self_recipient(),
+                contact(ALICE_ID, ALICE_ACI),
+                chat(ALICE_CHAT, ALICE_ID),
+                item(incoming_text(ALICE_CHAT, ALICE_ID, 1_000, "one")),
+                item(incoming_text(ALICE_CHAT, ALICE_ID, 2_000, "two")),
+            ]),
+            &synthetic_key(),
+            aci(OUR_ACI),
+            &store,
+            &mut |p| seen.push(p.imported),
+        )
+        .await
+        .expect("import");
+        assert_eq!(seen, vec![1, 2], "progress: {seen:?}");
+        assert_eq!(seen.last().copied(), Some(summary.imported));
     }
 }
