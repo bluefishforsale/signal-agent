@@ -305,7 +305,7 @@ mod tests {
             AccessMode::Full,
         );
         let listener = endpoint::Listener::bind(&name).await.expect("bind");
-        let served = tokio::spawn(agent.serve(listener));
+        let served = tokio::spawn(agent.serve(listener, std::future::pending()));
 
         let code = shim(&name).await;
         let desktop = shim(&name).await;
