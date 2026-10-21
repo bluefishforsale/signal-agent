@@ -1,8 +1,9 @@
 name: release
 
 # A v* tag builds, signs and notarizes every installer into a draft GitHub
-# release (PRD goal 2). Manual runs never sign or publish: `dry-run` proves the
-# whole pipeline unsigned, `check-secrets` runs only the signing-input gate.
+# release (PRD goal 2). Everything else never signs or publishes: a pull request
+# that touches the release path, or a manual `dry-run`, proves the whole pipeline
+# unsigned; a manual `check-secrets` runs only the signing-input gate.
 #
 # NOTE: "signed" means `github.event_name == 'push'`, which the trigger limits to
 # v* tags. Signing secrets are referenced only in jobs bound to the `release`
@@ -11,6 +12,11 @@ name: release
 on:
   push:
     tags: ['v*']
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - scripts/**
+      - app/src-tauri/tauri.conf.json
   workflow_dispatch:
     inputs:
       mode:
