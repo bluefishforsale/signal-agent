@@ -11,14 +11,16 @@ use presage::{
         zkgroup::groups::{GroupMasterKey, GroupSecretParams},
     },
     proto::{
-        AttachmentPointer, SyncMessage, receipt_message,
+        AttachmentPointer, DataMessage, EditMessage, GroupContextV2, ReceiptMessage, SyncMessage,
+        TypingMessage, data_message, receipt_message,
         sync_message::{self, Content as SyncContent},
+        typing_message,
     },
     store::Thread,
 };
 use relay_core::prelude::*;
 
-use crate::Incoming;
+use crate::{Incoming, Outgoing};
 
 /// What `content` means to the agent, or `None` when it carries nothing the
 /// agent keeps (delivery receipts, calls, stories, key syncs). `me` is the
@@ -164,6 +166,82 @@ pub(crate) fn attachment_pointer(attachment: &AttachmentRef) -> anyhow::Result<A
         .context("attachment id is not one this backend issued")
 }
 
+/// What to put on the wire for `message`, sent at `sent_at_ms`, carrying
+/// `group` when it goes to a group.
+pub(crate) fn content_body(
+    message: &Outgoing,
+    sent_at_ms: u64,
+    group: Option<&GroupContextV2>,
+) -> ContentBody {
+    let data = |message: DataMessage| DataMessage {
+        timestamp: Some(sent_at_ms),
+        group_v2: group.cloned(),
+        ..message
+    };
+    match message {
+        Outgoing::Text { body, quote } => ContentBody::DataMessage(data(DataMessage {
+            body: Some(body.clone()),
+            quote: quote.map(|quote| data_message::Quote {
+                id: Some(quote.sent_at_ms),
+                author_aci: Some(aci(quote.author).service_id_string()),
+                author_aci_binary: Some(aci(quote.author).service_id_binary()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })),
+        Outgoing::Reaction {
+            target,
+            emoji,
+            remove,
+        } => ContentBody::DataMessage(data(DataMessage {
+            reaction: Some(data_message::Reaction {
+                emoji: Some(emoji.clone()),
+                remove: Some(*remove),
+                target_author_aci: Some(aci(target.author).service_id_string()),
+                target_author_aci_binary: Some(aci(target.author).service_id_binary()),
+                target_sent_timestamp: Some(target.sent_at_ms),
+            }),
+            ..Default::default()
+        })),
+        Outgoing::Edit { target, body } => ContentBody::EditMessage(EditMessage {
+            target_sent_timestamp: Some(target.sent_at_ms),
+            data_message: Some(data(DataMessage {
+                body: Some(body.clone()),
+                ..Default::default()
+            })),
+        }),
+        Outgoing::Delete { target } => ContentBody::DataMessage(data(DataMessage {
+            delete: Some(data_message::Delete {
+                target_sent_timestamp: Some(target.sent_at_ms),
+            }),
+            ..Default::default()
+        })),
+        Outgoing::Typing { started } => ContentBody::TypingMessage(TypingMessage {
+            timestamp: Some(sent_at_ms),
+            action: Some(
+                if *started {
+                    typing_message::Action::Started
+                } else {
+                    typing_message::Action::Stopped
+                }
+                .into(),
+            ),
+            group_id: group
+                .and_then(|g| g.master_key.as_deref())
+                .and_then(|key| <[u8; 32]>::try_from(key).ok())
+                .map(|key| group_id(key).as_bytes().to_vec()),
+        }),
+        Outgoing::ReadReceipt { targets } => ContentBody::ReceiptMessage(ReceiptMessage {
+            r#type: Some(receipt_message::Type::Read.into()),
+            timestamp: targets.iter().map(|t| t.sent_at_ms).collect(),
+        }),
+    }
+}
+
+fn aci(id: ServiceId) -> protocol::Aci {
+    protocol::Aci::from_uuid_bytes(id.uuid().into_bytes())
+}
+
 fn conversation(content: &Content) -> Option<Recipient> {
     Some(match Thread::try_from(content).ok()? {
         Thread::Contact(id) => Recipient::Contact(service_id(id)),
@@ -204,10 +282,7 @@ mod tests {
     use presage::libsignal_service::{
         content::Metadata,
         prelude::Uuid,
-        proto::{
-            DataMessage, EditMessage, GroupContextV2, ReceiptMessage, attachment_pointer,
-            data_message,
-        },
+        proto::attachment_pointer,
         protocol::{Aci, DeviceId},
     };
     use proptest::prelude::*;
@@ -618,6 +693,74 @@ mod tests {
                 file_name: None,
                 size: 0,
             });
+        }
+    }
+
+    fn message_id_by(author: Uuid) -> impl Strategy<Value = MessageId> {
+        (1u64..u64::MAX / 2).prop_map(move |sent_at_ms| MessageId {
+            author: ServiceId::new(author),
+            sent_at_ms,
+        })
+    }
+
+    fn sendable() -> impl Strategy<Value = Outgoing> {
+        prop_oneof![
+            (".{0,40}", proptest::option::of(message_id_by(ME)))
+                .prop_map(|(body, quote)| Outgoing::Text { body, quote }),
+            (message_id_by(ME), ".{1,4}", any::<bool>()).prop_map(|(target, emoji, remove)| {
+                Outgoing::Reaction {
+                    target,
+                    emoji,
+                    remove,
+                }
+            }),
+            (message_id_by(ALICE), ".{0,40}")
+                .prop_map(|(target, body)| Outgoing::Edit { target, body }),
+            message_id_by(ALICE).prop_map(|target| Outgoing::Delete { target }),
+        ]
+    }
+
+    proptest! {
+        /// What this backend sends must read back as the same thing when it
+        /// arrives, in a direct chat or a group; otherwise the phone and the
+        /// agent's history disagree about what was said.
+        #[test]
+        fn sent_content_reads_back_as_the_same_event(
+            message in sendable(),
+            in_group in any::<bool>(),
+            sent_at_ms in 1u64..u64::MAX / 2,
+        ) {
+            let master_key = [3u8; 32];
+            let group = in_group.then(|| GroupContextV2 {
+                master_key: Some(master_key.to_vec()),
+                revision: Some(4),
+                group_change: None,
+            });
+            let body = content_body(&message, sent_at_ms, group.as_ref());
+            let alice = ServiceId::new(ALICE);
+            let conversation = if in_group {
+                Recipient::Group(group_id(master_key))
+            } else {
+                Recipient::Contact(alice)
+            };
+            let got = incoming(&content_from(ALICE, body), ServiceId::new(ME));
+            let expected = match message {
+                Outgoing::Text { body, quote } => {
+                    let Some(Incoming::Message(got)) = got else {
+                        return Err(TestCaseError::fail(format!("text read back as {got:?}")));
+                    };
+                    prop_assert_eq!(got.id, MessageId { author: alice, sent_at_ms });
+                    prop_assert_eq!(got.conversation, conversation);
+                    prop_assert_eq!(got.body, Some(body));
+                    prop_assert_eq!(got.quote, quote);
+                    return Ok(());
+                }
+                Outgoing::Reaction { target, emoji, remove } => Incoming::Reaction { conversation, target, from: alice, emoji, remove },
+                Outgoing::Edit { target, body } => Incoming::Edit { conversation, target, from: alice, body },
+                Outgoing::Delete { target } => Incoming::Delete { conversation, target, from: alice },
+                Outgoing::Typing { .. } | Outgoing::ReadReceipt { .. } => unreachable!("not generated"),
+            };
+            prop_assert_eq!(got, Some(expected));
         }
     }
 }
