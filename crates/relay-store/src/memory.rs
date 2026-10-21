@@ -82,6 +82,11 @@ impl MessageStore for MemoryStore {
         Ok(())
     }
 
+    async fn mark_unread(&self, targets: &[MessageId]) -> anyhow::Result<()> {
+        self.inner().read.retain(|id| !targets.contains(id));
+        Ok(())
+    }
+
     async fn set_title(&self, conversation: Recipient, title: &str) -> anyhow::Result<()> {
         self.inner().titles.insert(conversation, title.to_owned());
         Ok(())
@@ -286,5 +291,22 @@ mod tests {
             kept.first().is_some_and(|m| !m.deleted),
             "message was deleted: {kept:?}"
         );
+    }
+
+    /// Marking a read message unread must bring it back into unread counts,
+    /// or mark_as_unread would silently do nothing.
+    #[tokio::test]
+    async fn mark_unread_restores_a_read_message_to_unread() {
+        let store = MemoryStore::default();
+        let m = msg(1, "hi");
+        store.insert(&m).await.expect("insert");
+        store.mark_read(&[m.id]).await.expect("read");
+        assert!(
+            store.unread().await.expect("unread").is_empty(),
+            "still unread after mark_read"
+        );
+        store.mark_unread(&[m.id]).await.expect("unread");
+        let unread = store.unread().await.expect("unread");
+        assert_eq!(unread.len(), 1, "not unread again: {unread:?}");
     }
 }
