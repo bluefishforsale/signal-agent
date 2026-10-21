@@ -8,7 +8,7 @@ use std::{
     path::Path,
     pin::Pin,
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
@@ -47,32 +47,83 @@ use crate::{
 
 type Job = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()>>> + Send>;
 
-/// The thread presage runs on. Dropping every handle stops it, and with it
-/// every task still running there.
+/// The thread presage runs on, with the store it owns. Dropping the last
+/// handle stops the thread's tasks, closes the store and waits for both.
 #[derive(Clone)]
 struct Worker {
-    jobs: mpsc::UnboundedSender<Job>,
+    inner: Arc<WorkerInner>,
+}
+
+struct WorkerInner {
+    jobs: Option<mpsc::UnboundedSender<Job>>,
+    thread: Option<thread::JoinHandle<()>>,
+    store: SqliteStore,
+}
+
+// NOTE: a SQLCipher pool dropped without close() can crash at process exit in
+// SQLCipher's codec cleanup, so the drop blocks until the worker has closed the
+// store. Never drop the last handle on the worker thread itself.
+impl Drop for WorkerInner {
+    fn drop(&mut self) {
+        self.jobs.take();
+        if let Some(handle) = self.thread.take()
+            && handle.thread().id() != thread::current().id()
+        {
+            // A panicked worker has nothing left to close.
+            let _ = handle.join();
+        }
+    }
 }
 
 impl Worker {
-    fn spawn() -> anyhow::Result<Self> {
+    /// Starts the worker on the store at `path`, encrypted with `key`.
+    async fn open(path: &Path, key: &[u8; 32]) -> anyhow::Result<Self> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .context("unable to start the Signal worker runtime")?;
         let (jobs, mut rx) = mpsc::unbounded_channel::<Job>();
-        thread::Builder::new()
+        let (opened_tx, opened_rx) = oneshot::channel();
+        let (path, key) = (path.to_owned(), *key);
+        let thread = thread::Builder::new()
             .name("signal".into())
             .spawn(move || {
                 let local = tokio::task::LocalSet::new();
-                local.block_on(&runtime, async move {
+                let store = local.block_on(&runtime, async move {
+                    let store = match open_store(&path, &key).await {
+                        Ok(store) => store,
+                        Err(e) => {
+                            let _ = opened_tx.send(Err(e));
+                            return None;
+                        }
+                    };
+                    let _ = opened_tx.send(Ok(store.clone()));
                     while let Some(job) = rx.recv().await {
                         tokio::task::spawn_local(job());
                     }
+                    Some(store)
                 });
+                // Stop every task still holding the store before closing it.
+                drop(local);
+                if let Some(store) = store {
+                    runtime.block_on(store.close());
+                }
             })
             .context("unable to start the Signal worker thread")?;
-        Ok(Self { jobs })
+        let store = opened_rx
+            .await
+            .context("the Signal worker stopped while opening the store")??;
+        Ok(Self {
+            inner: Arc::new(WorkerInner {
+                jobs: Some(jobs),
+                thread: Some(thread),
+                store,
+            }),
+        })
+    }
+
+    fn store(&self) -> SqliteStore {
+        self.inner.store.clone()
     }
 
     /// Runs `job` on the worker and waits for its result.
@@ -83,7 +134,10 @@ impl Worker {
         T: Send + 'static,
     {
         let (tx, rx) = oneshot::channel();
-        self.jobs
+        self.inner
+            .jobs
+            .as_ref()
+            .context("the Signal worker has stopped")?
             .send(Box::new(move || {
                 Box::pin(async move {
                     // The caller gave up waiting; nobody wants the result.
@@ -109,11 +163,10 @@ impl PresageSignal {
     /// Opens the account in the store at `path`, encrypted with `key`. Nothing
     /// reaches Signal until something is sent or `incoming` is consumed.
     pub async fn open(path: &Path, key: &[u8; 32]) -> anyhow::Result<Self> {
-        let worker = Worker::spawn()?;
-        let (path, key) = (path.to_owned(), *key);
+        let worker = Worker::open(path, key).await?;
+        let (path, store) = (path.to_owned(), worker.store());
         let manager = worker
             .run(move || async move {
-                let store = open_store(&path, &key).await?;
                 Manager::load_registered(store).await.with_context(|| {
                     format!(
                         "no Signal account in \"{}\"; link or register first",
@@ -245,14 +298,10 @@ impl PresageProvisioner {
     /// Opens (creating if needed) the store at `path`, encrypted with `key`,
     /// for an account on `servers`.
     pub async fn open(path: &Path, key: &[u8; 32], servers: Servers) -> anyhow::Result<Self> {
-        let worker = Worker::spawn()?;
-        let (path, key) = (path.to_owned(), *key);
-        let store = worker
-            .run(move || async move { open_store(&path, &key).await })
-            .await??;
+        let worker = Worker::open(path, key).await?;
         Ok(Self {
+            store: worker.store(),
             worker,
-            store,
             servers: match servers {
                 Servers::Production => SignalServers::Production,
                 Servers::Staging => SignalServers::Staging,
@@ -678,16 +727,9 @@ mod tests {
         F: FnOnce(SqliteStore) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + 'static,
     {
-        let path = path.to_owned();
-        Worker::spawn()
-            .expect("worker")
-            .run(move || async move {
-                let store = open_store(&path, &KEY).await.expect("store");
-                f(store.clone()).await;
-                store.close().await;
-            })
-            .await
-            .expect("worker ran");
+        let worker = Worker::open(path, &KEY).await.expect("worker");
+        let store = worker.store();
+        worker.run(move || f(store)).await.expect("worker ran");
     }
 
     /// Contacts synced from the phone land in presage's store; the backend
@@ -1085,24 +1127,31 @@ mod tests {
     #[tokio::test]
     async fn store_refuses_to_open_with_the_wrong_key() {
         let (_dir, path) = temp_store();
-        let worker = Worker::spawn().expect("worker");
-        let open_path = path.clone();
-        let store = worker
-            .run(move || async move { open_store(&open_path, &[1; 32]).await })
+        let first = Worker::open(&path, &[1; 32])
             .await
-            .expect("worker ran")
             .expect("first open creates the store");
-        worker
-            .run(move || async move { store.close().await })
-            .await
-            .expect("worker ran");
-        let wrong = worker
-            .run(move || async move { open_store(&path, &[2; 32]).await })
-            .await
-            .expect("worker ran");
+        drop(first);
+        let wrong = Worker::open(&path, &[2; 32]).await;
         assert!(
             wrong.is_err(),
             "opened an encrypted store with the wrong key"
+        );
+    }
+
+    /// A SQLCipher pool dropped without close() can crash at process exit in
+    /// SQLCipher's codec cleanup. Dropping the backend must close its store
+    /// before the drop returns.
+    #[tokio::test]
+    async fn dropping_the_backend_closes_its_store() {
+        let (_dir, path) = temp_store();
+        register_linked(&path).await;
+        let signal = PresageSignal::open(&path, &KEY).await.expect("opens");
+        let store = signal.manager.store().clone();
+        drop(signal);
+        let after = store.contacts().await;
+        assert!(
+            after.is_err(),
+            "store still usable after the backend was dropped"
         );
     }
 }
