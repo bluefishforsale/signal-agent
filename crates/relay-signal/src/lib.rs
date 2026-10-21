@@ -3,6 +3,7 @@
 //! in for it in every test so no lane needs a real account.
 
 mod backend;
+mod convert;
 mod fake;
 
 pub use backend::{
