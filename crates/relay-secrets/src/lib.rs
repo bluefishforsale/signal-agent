@@ -1,17 +1,21 @@
 //! Where each profile's database key lives, so the encrypted stores are
 //! useless to anything that copies the files without the user's OS login.
 
+#[cfg(windows)]
+mod dpapi;
 #[cfg(unix)]
 mod key_file;
 #[cfg(target_os = "macos")]
 mod keychain;
 mod memory;
 
-use std::fmt;
+use std::{fmt, path::PathBuf};
 
 use anyhow::bail;
-use relay_core::ProfileName;
+use relay_core::{ProfileName, ProfilePaths};
 
+#[cfg(windows)]
+pub use dpapi::DpapiFileStore;
 #[cfg(unix)]
 pub use key_file::KeyFileStore;
 #[cfg(target_os = "macos")]
@@ -64,6 +68,20 @@ pub fn platform_store() -> anyhow::Result<Box<dyn SecretStore>> {
     bail!("platform secret stores are not implemented yet (lane L2)")
 }
 
+/// Where a file-backed store keeps `profile`'s key: its platform data
+/// directory, or under `base` when one is given.
+fn key_path(
+    base: Option<&PathBuf>,
+    profile: &ProfileName,
+    file_name: &str,
+) -> anyhow::Result<PathBuf> {
+    let paths = match base {
+        Some(base) => ProfilePaths::under(base.clone(), profile),
+        None => ProfilePaths::for_profile(profile)?,
+    };
+    Ok(paths.root.join(file_name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,6 +102,12 @@ mod tests {
             let dir = tempfile::tempdir().expect("tempdir");
             let store = KeyFileStore::under(dir.path().to_owned());
             out.push(("key file", Box::new(store), Some(dir)));
+        }
+        #[cfg(windows)]
+        {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let store = DpapiFileStore::under(dir.path().to_owned());
+            out.push(("dpapi file", Box::new(store), Some(dir)));
         }
         #[cfg(target_os = "macos")]
         out.push((

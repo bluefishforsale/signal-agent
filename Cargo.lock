@@ -3010,6 +3010,7 @@ dependencies = [
  "relay-core",
  "security-framework",
  "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

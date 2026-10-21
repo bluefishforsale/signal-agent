@@ -9,9 +9,9 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use relay_core::{ProfileName, ProfilePaths};
+use relay_core::ProfileName;
 
-use crate::{SecretStore, StoreKey};
+use crate::{SecretStore, StoreKey, key_path};
 
 /// Each profile's key in `store.key`, mode 0600, in its profile directory.
 /// The default keeps keys in each profile's platform data directory.
@@ -27,11 +27,7 @@ impl KeyFileStore {
     }
 
     fn path(&self, profile: &ProfileName) -> anyhow::Result<PathBuf> {
-        let paths = match &self.base {
-            Some(base) => ProfilePaths::under(base.clone(), profile),
-            None => ProfilePaths::for_profile(profile)?,
-        };
-        Ok(paths.root.join("store.key"))
+        key_path(self.base.as_ref(), profile, "store.key")
     }
 }
 
