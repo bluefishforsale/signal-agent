@@ -11,6 +11,11 @@ futures.workspace = true
 relay-core.workspace = true
 serde.workspace = true
 tokio.workspace = true
+# NOTE: pinned to an exact rev (PRD anti-goal 7: no fork, pin a revision). presage's
+# sqlite store brings the bundled SQLCipher the whole binary shares; see the root
+# [patch.crates-io], which must move with this rev.
+presage = { git = "https://github.com/whisperfish/presage", rev = "6f630791b2c7bf3d5b00c75f5a6c94131bf79c8c" }
+presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "6f630791b2c7bf3d5b00c75f5a6c94131bf79c8c" }
 
 [dev-dependencies]
 uuid.workspace = true
