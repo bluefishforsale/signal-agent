@@ -73,6 +73,16 @@ pub enum Registration {
     Foreign,
 }
 
+/// What unregistering did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Unregistration {
+    Removed,
+    Absent,
+    /// An entry with the same name points elsewhere; it was left untouched.
+    Foreign,
+}
+
 /// Whose entry, if any, a client has under a server's name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EntryStatus {
@@ -144,6 +154,27 @@ impl Clients {
             }
         }
         Ok(Registration::Added)
+    }
+
+    /// Removes `entry` from `client`, only if that client's entry under the same
+    /// name launches `entry.command`.
+    pub fn unregister(
+        &self,
+        client: ClaudeClient,
+        entry: &ServerEntry,
+    ) -> anyhow::Result<Unregistration> {
+        match self.status(client, entry)? {
+            EntryStatus::Missing => return Ok(Unregistration::Absent),
+            EntryStatus::Foreign => return Ok(Unregistration::Foreign),
+            EntryStatus::Ours => {}
+        }
+        match client {
+            ClaudeClient::Code => {
+                self.claude(&strings(&["mcp", "remove", "-s", "user", &entry.name]))?;
+            }
+            ClaudeClient::Desktop => bail!("Desktop unregistration is not implemented yet"),
+        }
+        Ok(Unregistration::Removed)
     }
 
     /// Whether `client` has an entry named like `entry`, and whose it is.
@@ -629,6 +660,45 @@ mod tests {
                 "error doesn't name the file: {err:#}"
             );
             assert_eq!(std::fs::read_to_string(&path).expect("config"), original);
+        }
+    }
+
+    /// Uninstall removes only a Code entry that launches this install; a
+    /// same-named server the user added by hand survives.
+    #[test]
+    fn code_unregistration_removes_only_our_entry() {
+        for (existing, expected) in [
+            (Some(entry().command), Unregistration::Removed),
+            (
+                Some("/usr/local/bin/hand-made".to_owned()),
+                Unregistration::Foreign,
+            ),
+            (None, Unregistration::Absent),
+        ] {
+            let m = machine(Platform::MacOs, true, false);
+            if let Some(command) = &existing {
+                m.fake
+                    .servers
+                    .lock()
+                    .expect("servers lock")
+                    .insert(entry().name, (command.clone(), vec![]));
+            }
+            let result = m
+                .clients
+                .unregister(ClaudeClient::Code, &entry())
+                .expect("unregister");
+            assert_eq!(result, expected, "existing {existing:?}");
+            let left = m
+                .fake
+                .servers
+                .lock()
+                .expect("servers lock")
+                .get(&entry().name)
+                .cloned();
+            match expected {
+                Unregistration::Foreign => assert!(left.is_some(), "removed a foreign entry"),
+                _ => assert!(left.is_none(), "our entry survived"),
+            }
         }
     }
 }
