@@ -172,7 +172,11 @@ impl Clients {
             ClaudeClient::Code => {
                 self.claude(&strings(&["mcp", "remove", "-s", "user", &entry.name]))?;
             }
-            ClaudeClient::Desktop => bail!("Desktop unregistration is not implemented yet"),
+            ClaudeClient::Desktop => {
+                let mut config = DesktopConfig::load(self.desktop_path()?)?;
+                config.servers_mut()?.shift_remove(&entry.name);
+                config.save()?;
+            }
         }
         Ok(Unregistration::Removed)
     }
@@ -698,6 +702,54 @@ mod tests {
             match expected {
                 Unregistration::Foreign => assert!(left.is_some(), "removed a foreign entry"),
                 _ => assert!(left.is_none(), "our entry survived"),
+            }
+        }
+    }
+
+    /// Uninstall removes only a Desktop entry that launches this install, keeps
+    /// everything else, and backs the file up first; a foreign entry or a
+    /// missing file is left exactly as it was.
+    #[test]
+    fn desktop_unregistration_removes_only_our_entry() {
+        let ours = serde_json::json!({"command": "wsl.exe", "args": ["-e", entry().command]});
+        let theirs = serde_json::json!({"command": "/opt/other/signal"});
+        for (existing, expected) in [
+            (Some(ours), Unregistration::Removed),
+            (Some(theirs), Unregistration::Foreign),
+            (None, Unregistration::Absent),
+        ] {
+            let m = machine(Platform::MacOs, false, true);
+            let path = m.desktop_dir.join("claude_desktop_config.json");
+            let original = existing.as_ref().map(|server| {
+                serde_json::json!({"theme": "dark", "mcpServers": {"other": {"command": "npx"}, entry().name: server}})
+                    .to_string()
+            });
+            if let Some(original) = &original {
+                std::fs::write(&path, original).expect("seed config");
+            }
+
+            let result = m
+                .clients
+                .unregister(ClaudeClient::Desktop, &entry())
+                .expect("unregister");
+
+            assert_eq!(result, expected, "existing {existing:?}");
+            let backup = m
+                .desktop_dir
+                .join("claude_desktop_config.json.bak-signal-agent");
+            match (expected, &original) {
+                (Unregistration::Removed, Some(original)) => {
+                    assert_eq!(&std::fs::read_to_string(&backup).expect("backup"), original);
+                    assert_eq!(
+                        read_json(&path),
+                        serde_json::json!({"theme": "dark", "mcpServers": {"other": {"command": "npx"}}})
+                    );
+                }
+                (Unregistration::Foreign, Some(original)) => {
+                    assert_eq!(&std::fs::read_to_string(&path).expect("config"), original);
+                    assert!(!backup.exists(), "backed up without changing anything");
+                }
+                _ => assert!(!path.exists(), "created a config while unregistering"),
             }
         }
     }
