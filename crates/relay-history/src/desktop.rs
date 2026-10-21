@@ -124,6 +124,7 @@ fn message(our_aci: ServiceId, conversation: Recipient, json: &Value) -> Option<
         "outgoing" => our_aci,
         _ => return None,
     };
+    let deleted = json.get("deletedForEveryone").and_then(Value::as_bool) == Some(true);
     Some(Message {
         id: MessageId {
             author: sender,
@@ -136,11 +137,15 @@ fn message(our_aci: ServiceId, conversation: Recipient, json: &Value) -> Option<
             .get("received_at_ms")
             .and_then(Value::as_u64)
             .unwrap_or(sent_at_ms),
-        body: json.get("body").and_then(Value::as_str).map(str::to_owned),
+        body: json
+            .get("body")
+            .and_then(Value::as_str)
+            .filter(|_| !deleted)
+            .map(str::to_owned),
         attachments: vec![],
         quote: None,
         edited: false,
-        deleted: false,
+        deleted,
     })
 }
 
@@ -416,5 +421,36 @@ mod tests {
         let unread = store.unread().await.expect("unread");
         let bodies: Vec<_> = unread.iter().filter_map(|m| m.body.as_deref()).collect();
         assert_eq!(bodies, vec!["unread"]);
+    }
+
+    async fn only_message(desktop: Desktop) -> Message {
+        let (store, _) = desktop.import().await;
+        let stored = all_messages(&store).await;
+        let [m] = stored.as_slice() else {
+            panic!("expected one message, got {stored:?}");
+        };
+        m.clone()
+    }
+
+    /// Deleted for everyone in Desktop means deleted here, with no body left
+    /// to search.
+    #[tokio::test]
+    async fn a_message_deleted_for_everyone_imports_as_deleted() {
+        let mut desktop = with_alice().await;
+        desktop
+            .message(
+                "m1",
+                "c-alice",
+                json!({
+                    "type": "incoming",
+                    "sent_at": 1_000,
+                    "sourceServiceId": ALICE_ACI,
+                    "deletedForEveryone": true,
+                    "body": "",
+                }),
+            )
+            .await;
+        let m = only_message(desktop).await;
+        assert!(m.deleted && m.body.is_none(), "{m:?}");
     }
 }
