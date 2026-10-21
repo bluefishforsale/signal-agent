@@ -3,7 +3,7 @@
 //! dedicated thread and the trait methods only pass work to it.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     future::Future,
     path::Path,
     pin::Pin,
@@ -24,11 +24,16 @@ use presage::{
         configuration::SignalServers, prelude::phonenumber::PhoneNumber,
         provisioning::ProvisioningError,
     },
-    libsignal_service::{content::Content, protocol::ServiceId as SignalServiceId},
+    libsignal_service::{
+        content::Content,
+        protocol::{
+            DeviceId, IdentityKey, IdentityKeyStore, ProtocolAddress, ServiceId as SignalServiceId,
+        },
+    },
     manager::{Confirmation, Registered, RegistrationOptions},
     model::messages::Received,
     proto::GroupContextV2,
-    store::{ContentsStore, StateStore, Thread},
+    store::{ContentsStore, StateStore, Store, Thread},
 };
 use presage_store_sqlite::{OnNewIdentity, SqliteConnectOptions, SqliteStore};
 use relay_core::prelude::*;
@@ -497,6 +502,65 @@ async fn admitted(store: &SqliteStore, content: &Content) -> bool {
     is_member
 }
 
+/// The last identity key seen for each contact. The store trusts a changed key
+/// without saying so; comparing against this is how the change still surfaces.
+// NOTE: primed from contacts and group members when receiving starts, so a key
+// that changed while the agent was down is caught on that contact's next
+// message. A stranger's first key is new, not changed, and isn't reported.
+struct IdentityWatch {
+    known: HashMap<String, IdentityKey>,
+}
+
+impl IdentityWatch {
+    async fn primed(store: &SqliteStore) -> Self {
+        let mut people: Vec<SignalServiceId> = Vec::new();
+        match store.contacts().await {
+            Ok(contacts) => people.extend(
+                contacts
+                    .flatten()
+                    .map(|c| SignalServiceId::from(convert::aci(ServiceId::new(c.uuid)))),
+            ),
+            Err(error) => warn!(%error, "identity watch starts without contacts"),
+        }
+        match store.groups().await {
+            Ok(groups) => {
+                for (_, group) in groups.flatten() {
+                    people.extend(group.members.iter().map(|m| SignalServiceId::from(m.aci)));
+                }
+            }
+            Err(error) => warn!(%error, "identity watch starts without group members"),
+        }
+        let mut watch = Self {
+            known: HashMap::new(),
+        };
+        for who in people {
+            watch.changed(store, who).await;
+        }
+        watch
+    }
+
+    /// Whether `who`'s identity key differs from the last one seen.
+    async fn changed(&mut self, store: &SqliteStore, who: SignalServiceId) -> bool {
+        let name = who.service_id_string();
+        // Identity keys are per account; the device id is ignored by the lookup.
+        let Ok(device) = DeviceId::new(1) else {
+            return false;
+        };
+        let address = ProtocolAddress::new(name.clone(), device);
+        let current = match store.aci_protocol_store().get_identity(&address).await {
+            Ok(Some(current)) => current,
+            Ok(None) => return false,
+            Err(error) => {
+                warn!(%error, contact = %name, "unable to read an identity key");
+                return false;
+            }
+        };
+        self.known
+            .insert(name, current)
+            .is_some_and(|previous| previous != current)
+    }
+}
+
 /// Receives from Signal for as long as anyone holds the other end of `tx`,
 /// reconnecting with backoff whenever the connection drops.
 async fn receive(
@@ -504,6 +568,7 @@ async fn receive(
     me: ServiceId,
     tx: mpsc::UnboundedSender<anyhow::Result<Incoming>>,
 ) {
+    let mut identities = IdentityWatch::primed(manager.store()).await;
     let mut delay = MIN_RECONNECT_DELAY;
     while !tx.is_closed() {
         match manager.receive_messages().await {
@@ -514,6 +579,13 @@ async fn receive(
                     let Received::Content(content) = received else {
                         continue;
                     };
+                    let sender = content.metadata.sender;
+                    if identities.changed(manager.store(), sender).await {
+                        let contact = ServiceId::new(sender.raw_uuid());
+                        if tx.send(Ok(Incoming::IdentityChanged { contact })).is_err() {
+                            return;
+                        }
+                    }
                     if !admitted(manager.store(), &content).await {
                         continue;
                     }
@@ -560,7 +632,7 @@ async fn open_store(path: &Path, key: &[u8; 32]) -> anyhow::Result<SqliteStore> 
 mod tests {
     use super::*;
     use presage::{
-        libsignal_service::content::{Content, ContentBody, Metadata},
+        libsignal_service::content::{ContentBody, Metadata},
         manager::RegistrationData,
     };
 
@@ -945,6 +1017,66 @@ mod tests {
             !from_outsider,
             "a non-member's message was admitted as group traffic"
         );
+    }
+
+    fn identity_key(seed: u8) -> IdentityKey {
+        let mut bytes = [seed; 33];
+        bytes[0] = 0x05;
+        IdentityKey::decode(&bytes).expect("a curve25519 public key")
+    }
+
+    /// The store trusts a contact's new identity key silently, as Signal's
+    /// apps do; the watch must still report that change exactly once, and not
+    /// mistake a contact's first key or an unchanged key for one.
+    #[tokio::test]
+    async fn changed_identity_key_is_reported_once() {
+        let (_dir, path) = temp_store();
+        register_linked(&path).await;
+        let alice = uuid::Uuid::from_u128(0xa11ce);
+        seed(&path, move |mut store| async move {
+            let alice_id = SignalServiceId::from(convert::aci(ServiceId::new(alice)));
+            let address = ProtocolAddress::new(
+                alice_id.service_id_string(),
+                DeviceId::new(1).expect("device 1"),
+            );
+            store
+                .save_contact(&presage::model::contacts::Contact {
+                    uuid: alice,
+                    phone_number: None,
+                    name: "Alice".into(),
+                    verified: Default::default(),
+                    profile_key: Vec::new(),
+                    expire_timer: 0,
+                    expire_timer_version: 2,
+                    inbox_position: 0,
+                    avatar: None,
+                })
+                .await
+                .expect("contact");
+            let mut identities = store.aci_protocol_store();
+            identities
+                .save_identity(&address, &identity_key(1))
+                .await
+                .expect("first key");
+            let mut watch = IdentityWatch::primed(&store).await;
+            assert!(
+                !watch.changed(&store, alice_id).await,
+                "an unchanged key was reported"
+            );
+            identities
+                .save_identity(&address, &identity_key(2))
+                .await
+                .expect("new key");
+            assert!(
+                watch.changed(&store, alice_id).await,
+                "a new identity key went unreported"
+            );
+            assert!(
+                !watch.changed(&store, alice_id).await,
+                "one change was reported twice"
+            );
+        })
+        .await;
     }
 
     /// The store must be unreadable without its key. If the SQLCipher build
