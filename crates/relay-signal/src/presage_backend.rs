@@ -557,6 +557,26 @@ mod tests {
         }
     }
 
+    /// Sending to a group the account isn't in must fail with a reason, before
+    /// anything reaches Signal, as it does on FakeSignal.
+    #[tokio::test]
+    async fn sending_to_an_unknown_group_fails_without_the_network() {
+        let (_dir, path) = temp_store();
+        register_linked(&path).await;
+        let signal = PresageSignal::open(&path, &KEY).await.expect("opens");
+        let err = signal
+            .send(
+                Recipient::Group(GroupId::new([7; 32])),
+                Outgoing::Typing { started: true },
+            )
+            .await
+            .expect_err("sent to a group we aren't in");
+        assert!(
+            err.to_string().contains("not a member"),
+            "unclear error: {err:#}"
+        );
+    }
+
     /// The store must be unreadable without its key. If the SQLCipher build
     /// ever falls back to plain SQLite the key pragma is silently ignored, and
     /// this is the test that notices.
