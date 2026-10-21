@@ -42,17 +42,24 @@ pub struct ServerEntry {
 }
 
 impl ServerEntry {
-    /// The entry that launches `command args` as `profile`'s server.
+    /// The entry that launches `command args` as `profile`'s server. `command`
+    /// must be absolute.
     pub fn for_profile(
         profile: &ProfileName,
-        command: impl Into<String>,
+        command: &Path,
         args: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
-        Self {
-            name: profile.mcp_server_name(),
-            command: command.into(),
-            args: args.into_iter().map(Into::into).collect(),
+    ) -> anyhow::Result<Self> {
+        if !command.is_absolute() {
+            bail!(
+                "server command \"{}\" must be an absolute path",
+                command.display()
+            );
         }
+        Ok(Self {
+            name: profile.mcp_server_name(),
+            command: command.display().to_string(),
+            args: args.into_iter().map(Into::into).collect(),
+        })
     }
 }
 
@@ -237,17 +244,19 @@ impl Clients {
         [ClaudeClient::Code, ClaudeClient::Desktop]
             .into_iter()
             .map(|client| {
-                let status = if !installed.contains(&client) {
-                    ClientStatus::NotInstalled
-                } else {
-                    match self.status(client, entry) {
-                        Ok(EntryStatus::Ours) => ClientStatus::Registered,
-                        Ok(EntryStatus::Missing) => ClientStatus::Missing,
-                        Ok(EntryStatus::Foreign) => ClientStatus::Foreign,
-                        Err(e) => ClientStatus::Unreadable {
-                            error: format!("{e:#}"),
-                        },
-                    }
+                if !installed.contains(&client) {
+                    return ClientReport {
+                        client,
+                        status: ClientStatus::NotInstalled,
+                    };
+                }
+                let status = match self.status(client, entry) {
+                    Ok(EntryStatus::Ours) => ClientStatus::Registered,
+                    Ok(EntryStatus::Missing) => ClientStatus::Missing,
+                    Ok(EntryStatus::Foreign) => ClientStatus::Foreign,
+                    Err(e) => ClientStatus::Unreadable {
+                        error: format!("{e:#}"),
+                    },
                 };
                 ClientReport { client, status }
             })
@@ -1156,9 +1165,19 @@ mod tests {
     #[test]
     fn a_profile_entry_is_named_after_its_mcp_server_name() {
         let profile = ProfileName::new("work").expect("valid profile");
-        let entry = ServerEntry::for_profile(&profile, "/bin/signal-agent", ["mcp"]);
+        let binary = std::env::temp_dir().join("signal-agent");
+        let entry = ServerEntry::for_profile(&profile, &binary, ["mcp"]).expect("absolute path");
         assert_eq!(entry.name, profile.mcp_server_name());
-        assert_eq!(entry.command, "/bin/signal-agent");
+        assert_eq!(entry.command, binary.display().to_string());
         assert_eq!(entry.args, ["mcp"]);
+    }
+
+    /// Claude Desktop launches servers without a shell or PATH, so a relative
+    /// command would register fine and then never start.
+    #[test]
+    fn a_relative_command_is_refused() {
+        let profile = ProfileName::default_profile();
+        let err = ServerEntry::for_profile(&profile, Path::new("signal-agent"), ["mcp"]);
+        assert!(err.is_err(), "accepted a relative command: {err:?}");
     }
 }
