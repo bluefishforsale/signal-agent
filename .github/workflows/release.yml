@@ -12,6 +12,7 @@ name: release
 on:
   push:
     tags: ['v*']
+    branches: [lane/l6-failclosed-proof]
   pull_request:
     paths:
       - .github/workflows/release.yml
