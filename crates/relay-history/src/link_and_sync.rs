@@ -192,7 +192,10 @@ impl Importer<'_> {
             attachments: vec![],
             quote: None,
             edited: false,
-            deleted: false,
+            deleted: matches!(
+                item.item,
+                Some(pb::chat_item::Item::RemoteDeletedMessage(_))
+            ),
         };
         self.store
             .upsert(&message)
@@ -571,5 +574,27 @@ mod tests {
         let unread = store.unread().await.expect("unread");
         let bodies: Vec<_> = unread.iter().filter_map(|m| m.body.as_deref()).collect();
         assert_eq!(bodies, vec!["not yet seen"]);
+    }
+
+    /// A message deleted for everyone before linking must import as deleted, so
+    /// it stays out of search like a live delete does.
+    #[tokio::test]
+    async fn a_remotely_deleted_message_imports_as_deleted() {
+        let deleted = pb::ChatItem {
+            item: Some(pb::chat_item::Item::RemoteDeletedMessage(Default::default())),
+            ..incoming_text(ALICE_CHAT, ALICE_ID, 1_000, "")
+        };
+        let (store, _) = import(vec![
+            self_recipient(),
+            contact(ALICE_ID, ALICE_ACI),
+            chat(ALICE_CHAT, ALICE_ID),
+            item(deleted),
+        ])
+        .await;
+        let stored = all_messages(&store).await;
+        let [m] = stored.as_slice() else {
+            panic!("expected one message, got {stored:?}");
+        };
+        assert!(m.deleted && m.body.is_none(), "{m:?}");
     }
 }
