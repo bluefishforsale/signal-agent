@@ -271,8 +271,8 @@ mod tests {
     #[tokio::test]
     async fn list_conversations_puts_the_most_recent_first() {
         let (ctx, _) = ctx(AccessMode::Full, ProfileKind::Linked);
-        ctx.store.upsert(&incoming(2, 100, "old")).await.unwrap();
-        ctx.store.upsert(&incoming(3, 200, "new")).await.unwrap();
+        ctx.store.insert(&incoming(2, 100, "old")).await.unwrap();
+        ctx.store.insert(&incoming(3, 200, "new")).await.unwrap();
         let out = Registry::standard()
             .call(&ctx, "list_conversations", json!({}))
             .await
@@ -306,8 +306,8 @@ mod tests {
     #[tokio::test]
     async fn store_stats_counts_messages_and_reports_date_bounds() {
         let (ctx, _) = ctx(AccessMode::ReadOnly, ProfileKind::Linked);
-        ctx.store.upsert(&incoming(2, 100, "a")).await.unwrap();
-        ctx.store.upsert(&incoming(3, 300, "b")).await.unwrap();
+        ctx.store.insert(&incoming(2, 100, "a")).await.unwrap();
+        ctx.store.insert(&incoming(3, 300, "b")).await.unwrap();
         let out = Registry::standard()
             .call(&ctx, "store_stats", json!({}))
             .await
@@ -334,7 +334,7 @@ mod tests {
     async fn get_unread_returns_each_message_once_keeping_the_newest_under_a_limit() {
         let (ctx, _) = ctx(AccessMode::ReadOnly, ProfileKind::Linked);
         for (t, body) in [(100, "a"), (200, "b"), (300, "c")] {
-            ctx.store.upsert(&incoming(2, t, body)).await.unwrap();
+            ctx.store.insert(&incoming(2, t, body)).await.unwrap();
         }
         let registry = Registry::standard();
         let first = registry
@@ -354,10 +354,10 @@ mod tests {
     async fn get_conversation_pages_back_from_the_newest_and_reads_oldest_first() {
         let (ctx, _) = ctx(AccessMode::ReadOnly, ProfileKind::Linked);
         for (t, body) in [(100, "a"), (200, "b"), (300, "c"), (400, "d")] {
-            ctx.store.upsert(&incoming(2, t, body)).await.unwrap();
+            ctx.store.insert(&incoming(2, t, body)).await.unwrap();
         }
         ctx.store
-            .upsert(&incoming(3, 250, "other chat"))
+            .insert(&incoming(3, 250, "other chat"))
             .await
             .unwrap();
         let out = Registry::standard()
@@ -383,7 +383,7 @@ mod tests {
             phone_number: Some("+15550000002".into()),
         };
         let (ctx, _) = ctx_with(AccessMode::ReadOnly, ProfileKind::Linked, vec![contact]);
-        ctx.store.upsert(&incoming(2, 100, "hi")).await.unwrap();
+        ctx.store.insert(&incoming(2, 100, "hi")).await.unwrap();
         let registry = Registry::standard();
         let out = registry
             .call(
@@ -420,7 +420,7 @@ mod tests {
             (JAN_1_2024_MS, "midnight"),
             (JAN_1_2024_MS + DAY_MS + 3_600_000, "jan 2 1am"),
         ] {
-            ctx.store.upsert(&incoming(2, t, body)).await.unwrap();
+            ctx.store.insert(&incoming(2, t, body)).await.unwrap();
         }
         let registry = Registry::standard();
         let call = |since: &'static str| {
@@ -455,7 +455,7 @@ mod tests {
             (2, JAN_1_2024_MS + 3000, "dinner jan 1"),
             (2, JAN_1_2024_MS + DAY_MS, "lunch jan 2"),
         ] {
-            ctx.store.upsert(&incoming(who, t, body)).await.unwrap();
+            ctx.store.insert(&incoming(who, t, body)).await.unwrap();
         }
         let out = Registry::standard()
             .call(
