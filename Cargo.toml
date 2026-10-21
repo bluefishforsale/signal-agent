@@ -35,3 +35,9 @@ thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["full"] }
 tracing = "0.1.44"
 uuid = { version = "1.28.0", features = ["serde", "v4"] }
+
+# NOTE: identical to the entry lane L1 adds with presage (whisperfish's
+# libsqlite3-sys fork, which provides bundled-sqlcipher-custom-crypto); it must
+# move with presage's pinned rev.
+[patch.crates-io]
+libsqlite3-sys = { version = "0.36.0", git = "https://github.com/whisperfish/rusqlite", rev = "2a42b3354c9194700d08aa070f70a131a470e7dc" }

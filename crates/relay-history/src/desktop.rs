@@ -693,4 +693,52 @@ mod tests {
         let mut progress = |_| {};
         assert_send(import_signal_desktop(Path::new("."), &store, &mut progress));
     }
+
+    /// Copies the fixture made by the stock `sqlcipher` CLI (SQLCipher 4.19,
+    /// `PRAGMA key = "x'<DB_KEY>'"`, Desktop's raw-key form) into a temp dir.
+    fn stock_sqlcipher_fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/testdata/desktop");
+        std::fs::create_dir(dir.path().join("sql")).expect("sql dir");
+        for file in ["config.json", "sql/db.sqlite"] {
+            std::fs::copy(src.join(file), dir.path().join(file)).expect("copy fixture");
+        }
+        dir
+    }
+
+    /// Our own fixtures are written by the same SQLCipher build that reads
+    /// them, so a mismatch in key form or cipher settings would cancel out. A
+    /// database written by an independent SQLCipher 4 with Desktop's raw key
+    /// form must open too.
+    #[tokio::test]
+    async fn a_database_written_by_stock_sqlcipher_opens() {
+        let dir = stock_sqlcipher_fixture();
+        let store = MemoryStore::default();
+        let summary = import_signal_desktop(dir.path(), &store, &mut |_| {})
+            .await
+            .expect("import");
+        assert_eq!(summary.imported, 1, "{summary:?}");
+        let bodies: Vec<_> = all_messages(&store)
+            .await
+            .into_iter()
+            .filter_map(|m| m.body)
+            .collect();
+        assert_eq!(bodies, vec!["written by stock sqlcipher"]);
+    }
+
+    /// If encryption silently went missing (a SQLCipher build without crypto
+    /// treats the key pragma as a no-op), any key would "work". A wrong key
+    /// must fail.
+    #[tokio::test]
+    async fn the_wrong_key_does_not_open_the_database() {
+        let dir = stock_sqlcipher_fixture();
+        std::fs::write(
+            dir.path().join("config.json"),
+            json!({ "key": "0".repeat(64) }).to_string(),
+        )
+        .expect("config");
+        let store = MemoryStore::default();
+        let result = import_signal_desktop(dir.path(), &store, &mut |_| {}).await;
+        assert!(result.is_err(), "opened with the wrong key: {result:?}");
+    }
 }

@@ -23,8 +23,8 @@ libsignal-core = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.
 libsignal-message-backup = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0", features = ["test-util"] }
 zkgroup = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0" }
 # NOTE: the one-SQLite rule (docs/slices.md): the same sqlx and libsqlite3-sys
-# as presage-store-sqlite, so the binary links one SQLCipher.
-libsqlite3-sys = { version = "0.36.0", features = ["bundled-sqlcipher"] }
+# as presage-store-sqlite, with the one crypto backend every crate declares.
+libsqlite3-sys = { version = "0.36.0", features = ["bundled-sqlcipher-custom-crypto"] }
 pbkdf2 = "0.13.0"
 protobuf = "3.7.2"
 relay-core.workspace = true
@@ -33,12 +33,6 @@ serde_json.workspace = true
 sha1 = "0.11.0"
 sqlx = { version = "0.9.0", default-features = false, features = ["sqlite", "runtime-tokio"] }
 uuid.workspace = true
-
-# SQLCipher's crypto: CommonCrypto on Apple; elsewhere OpenSSL, built in
-# statically so neither Windows (no system OpenSSL) nor Linux (libssl 1.1 vs 3
-# across the supported distros) needs one at run time.
-[target.'cfg(not(target_vendor = "apple"))'.dependencies]
-libsqlite3-sys = { version = "0.36.0", features = ["bundled-sqlcipher-vendored-openssl"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
