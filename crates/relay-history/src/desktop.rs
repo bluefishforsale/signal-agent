@@ -22,7 +22,7 @@ use crate::{ImportProgress, ImportSummary, desktop_key, full_name};
 pub async fn import_signal_desktop(
     signal_dir: &Path,
     store: &dyn MessageStore,
-    _progress: &mut (dyn FnMut(ImportProgress) + Send),
+    progress: &mut (dyn FnMut(ImportProgress) + Send),
 ) -> anyhow::Result<ImportSummary> {
     let key = desktop_key::database_key(signal_dir)?;
     let db_path = signal_dir.join("sql").join("db.sqlite");
@@ -96,6 +96,10 @@ pub async fn import_signal_desktop(
             .await
             .with_context(|| format!("storing imported message {:?}", message.id))?;
         summary.imported += 1;
+        progress(ImportProgress {
+            imported: summary.imported,
+            total: None,
+        });
     }
     drop(rows);
     store
@@ -602,5 +606,45 @@ mod tests {
             .collect();
         titles.sort();
         assert_eq!(titles, vec!["Alice Liddell", "Book club", "Dad", "Mom"]);
+    }
+
+    /// Desktop's messages table also holds events (group changes, safety number
+    /// changes, calls); those aren't messages and must not be stored as them.
+    #[tokio::test]
+    async fn desktop_events_are_not_stored_as_messages() {
+        let mut desktop = with_alice().await;
+        desktop
+            .message(
+                "m1",
+                "c-alice",
+                json!({ "type": "keychange", "sent_at": 1_000, "sourceServiceId": ALICE_ACI }),
+            )
+            .await;
+        let (store, summary) = desktop.import().await;
+        let stored = all_messages(&store).await;
+        assert!(stored.is_empty(), "stored an event: {stored:?}");
+        assert_eq!(summary.skipped, 1, "{summary:?}");
+    }
+
+    /// Setup shows progress; it must advance with every imported message.
+    #[tokio::test]
+    async fn progress_counts_every_imported_message() {
+        let mut desktop = with_alice().await;
+        for (id, sent_at) in [("m1", 1_000), ("m2", 2_000)] {
+            desktop
+                .message(
+                    id,
+                    "c-alice",
+                    json!({ "type": "incoming", "sent_at": sent_at, "sourceServiceId": ALICE_ACI, "body": "x" }),
+                )
+                .await;
+        }
+        desktop.conn.close().await.expect("close");
+        let store = MemoryStore::default();
+        let mut seen = vec![];
+        import_signal_desktop(desktop.dir.path(), &store, &mut |p| seen.push(p.imported))
+            .await
+            .expect("import");
+        assert_eq!(seen, vec![1, 2]);
     }
 }
