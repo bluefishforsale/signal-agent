@@ -249,6 +249,21 @@ pub(crate) fn contact_from(contact: &presage::model::contacts::Contact) -> crate
     }
 }
 
+pub(crate) fn group_from(
+    master_key: [u8; 32],
+    group: &presage::model::groups::Group,
+) -> crate::Group {
+    crate::Group {
+        id: group_id(master_key),
+        title: group.title.clone(),
+        members: group
+            .members
+            .iter()
+            .map(|member| ServiceId::new(member.aci.into()))
+            .collect(),
+    }
+}
+
 pub(crate) fn e164(number: &PhoneNumber) -> String {
     number.format().mode(phonenumber::Mode::E164).to_string()
 }
@@ -821,6 +836,41 @@ mod tests {
                 service_id: ServiceId::new(ALICE),
                 name: None,
                 phone_number: Some("+15550001111".into()),
+            }
+        );
+    }
+
+    /// A group lists its members by ACI under its public id, so tools can
+    /// address it without ever seeing the master key.
+    #[test]
+    fn group_lists_members_under_its_public_id() {
+        let master_key = [8u8; 32];
+        let member = |uuid: Uuid| presage::model::groups::Member {
+            aci: aci(uuid),
+            role: presage::libsignal_service::groups_v2::Role::Default,
+            profile_key: presage::libsignal_service::prelude::ProfileKey::create([0; 32]),
+            joined_at_revision: 0,
+            label: None,
+            label_emoji: None,
+        };
+        let group = presage::model::groups::Group {
+            title: "cats".into(),
+            avatar: String::new(),
+            disappearing_messages_timer: None,
+            access_control: None,
+            revision: 3,
+            members: vec![member(ALICE), member(ME)],
+            pending_members: Vec::new(),
+            requesting_members: Vec::new(),
+            invite_link_password: Vec::new(),
+            description: None,
+        };
+        assert_eq!(
+            group_from(master_key, &group),
+            crate::Group {
+                id: group_id(master_key),
+                title: "cats".into(),
+                members: vec![ServiceId::new(ALICE), ServiceId::new(ME)],
             }
         );
     }
