@@ -121,6 +121,34 @@ pub async fn recipient(ctx: &ToolContext, s: &str) -> Result<Recipient, ToolErro
     )))
 }
 
+pub fn contact_schema(description: &str) -> Value {
+    json!({
+        "type": "string",
+        "format": "signal-service-id",
+        "description": format!("{description}: a contact's phone number (E.164) or service id (UUID)"),
+    })
+}
+
+/// A person, by phone number or service id; a group id is refused.
+pub async fn contact(ctx: &ToolContext, s: &str) -> Result<ServiceId, ToolError> {
+    match recipient(ctx, s).await? {
+        Recipient::Contact(id) => Ok(id),
+        Recipient::Group(_) => Err(ToolError::InvalidInput(format!(
+            "\"{s}\" is a group id; this needs a person"
+        ))),
+    }
+}
+
+/// Text that must say something: refused when empty or only whitespace.
+pub fn non_blank(field: &str, s: String) -> Result<String, ToolError> {
+    if s.trim().is_empty() {
+        return Err(ToolError::InvalidInput(format!(
+            "{field} must not be empty"
+        )));
+    }
+    Ok(s)
+}
+
 /// A plus sign then 8 to 15 digits, the E.164 range Signal accepts.
 fn is_e164(s: &str) -> bool {
     let Some(digits) = s.strip_prefix('+') else {

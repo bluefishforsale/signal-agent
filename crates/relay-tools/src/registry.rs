@@ -23,6 +23,7 @@ impl Registry {
             .with(read::StoreStats)
             .with(read::GetUnread)
             .with(read::GetConversation)
+            .with(read::SearchMessages)
     }
 
     pub fn with(mut self, tool: impl Tool + 'static) -> Self {
@@ -213,6 +214,12 @@ mod tests {
                         json!(format!("{}-", sid(2))),
                         json!("é".repeat(32)),
                     ]),
+                    _ => {}
+                }
+                if prop["format"] == "signal-service-id" {
+                    bad.push(json!("ab".repeat(32)));
+                }
+                match prop["format"].as_str() {
                     Some("iso-datetime") => bad.extend([
                         json!("yesterday"),
                         json!("2024-13-01"),

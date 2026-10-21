@@ -1,12 +1,16 @@
 //! Tools that answer from the local store and the account, and never send.
 
 use async_trait::async_trait;
+use relay_store::SearchQuery;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
     Tool, ToolContext, ToolError,
-    input::{Instant, Limit, Offset, parse, recipient, recipient_schema},
+    input::{
+        Instant, Limit, Offset, contact, contact_schema, non_blank, parse, recipient,
+        recipient_schema,
+    },
 };
 
 pub struct ListConversations;
@@ -189,6 +193,70 @@ impl Tool for GetConversation {
     }
 }
 
+pub struct SearchMessages;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SearchMessagesInput {
+    query: String,
+    sender: Option<String>,
+    since: Option<Instant>,
+    until: Option<Instant>,
+    #[serde(default)]
+    limit: Limit,
+    #[serde(default)]
+    offset: Offset,
+}
+
+#[async_trait]
+impl Tool for SearchMessages {
+    fn name(&self) -> &'static str {
+        "search_messages"
+    }
+    fn description(&self) -> &'static str {
+        "Full-text search of message bodies across every conversation in the local store, \
+         newest first. query is the words to find. sender keeps one person's messages; since \
+         (inclusive) and until (exclusive) bound the time; limit and offset page through \
+         results. Local only, nothing marked read."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "minLength": 1, "description": "Words to find"},
+                "sender": contact_schema("Only messages from this person"),
+                "since": Instant::schema("Only messages at or after this time"),
+                "until": Instant::schema("Only messages before this time"),
+                "limit": Limit::schema(),
+                "offset": Offset::schema(),
+            },
+            "required": ["query"],
+            "additionalProperties": false,
+        })
+    }
+    fn writes(&self) -> bool {
+        false
+    }
+    async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
+        let input: SearchMessagesInput = parse(input)?;
+        let sender = match input.sender {
+            Some(s) => Some(contact(ctx, &s).await?),
+            None => None,
+        };
+        let query = SearchQuery {
+            text: non_blank("query", input.query)?,
+            sender,
+            conversation: None,
+            since_ms: input.since.map(Instant::ms),
+            until_ms: input.until.map(Instant::ms),
+            limit: input.limit.get(),
+            offset: input.offset.get(),
+        };
+        let messages = ctx.store.search(&query).await?;
+        Ok(json!({ "messages": messages }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
@@ -367,5 +435,43 @@ mod tests {
         assert_eq!(out["has_more"], json!(false), "{out}");
         let out = call("2024-01-02T01:00:00Z").await.unwrap();
         assert_eq!(bodies(&out["messages"]), ["jan 2 1am"], "{out}");
+    }
+
+    /// Every filter must reach the store: text, sender (by number or id),
+    /// since inclusive, until exclusive, and offset paging over newest first.
+    #[tokio::test]
+    async fn search_messages_applies_text_sender_window_and_paging() {
+        let contact = Contact {
+            service_id: sid(2),
+            name: None,
+            phone_number: Some("+15550000002".into()),
+        };
+        let (ctx, _) = ctx_with(AccessMode::ReadOnly, ProfileKind::Linked, vec![contact]);
+        for (who, t, body) in [
+            (2, JAN_1_2024_MS - 1, "lunch dec 31"),
+            (2, JAN_1_2024_MS, "lunch jan 1"),
+            (2, JAN_1_2024_MS + 1000, "lunch jan 1 again"),
+            (3, JAN_1_2024_MS + 2000, "lunch from someone else"),
+            (2, JAN_1_2024_MS + 3000, "dinner jan 1"),
+            (2, JAN_1_2024_MS + DAY_MS, "lunch jan 2"),
+        ] {
+            ctx.store.upsert(&incoming(who, t, body)).await.unwrap();
+        }
+        let out = Registry::standard()
+            .call(
+                &ctx,
+                "search_messages",
+                json!({
+                    "query": "LUNCH",
+                    "sender": "+15550000002",
+                    "since": "2024-01-01",
+                    "until": "2024-01-02",
+                    "limit": 1,
+                    "offset": 1,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bodies(&out["messages"]), ["lunch jan 1"], "{out}");
     }
 }
