@@ -204,22 +204,22 @@ mod tests {
         match prop["type"].as_str() {
             Some("string") => {
                 bad.extend([json!(1), json!(true), json!(""), json!(" ")]);
+                let malformed_ids = [
+                    json!("not-an-id"),
+                    json!("+"),
+                    json!("+1"),
+                    json!("+15559999999"),
+                    json!("g".repeat(64)),
+                    json!(format!("{}-", sid(2))),
+                    json!("é".repeat(32)),
+                ];
                 match prop["format"].as_str() {
-                    Some("signal-recipient" | "signal-service-id") => bad.extend([
-                        json!("not-an-id"),
-                        json!("+"),
-                        json!("+1"),
-                        json!("+15559999999"),
-                        json!("g".repeat(64)),
-                        json!(format!("{}-", sid(2))),
-                        json!("é".repeat(32)),
-                    ]),
-                    _ => {}
-                }
-                if prop["format"] == "signal-service-id" {
-                    bad.push(json!("ab".repeat(32)));
-                }
-                match prop["format"].as_str() {
+                    Some("signal-recipient") => bad.extend(malformed_ids),
+                    // A person-only field must also refuse a well-formed group id.
+                    Some("signal-service-id") => {
+                        bad.extend(malformed_ids);
+                        bad.push(json!("ab".repeat(32)));
+                    }
                     Some("iso-datetime") => bad.extend([
                         json!("yesterday"),
                         json!("2024-13-01"),

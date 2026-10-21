@@ -225,7 +225,7 @@ fn digits(s: &str, len: usize) -> Option<u32> {
 }
 
 fn days_in(y: u32, m: u32) -> u32 {
-    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let leap = y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400));
     match m {
         2 if leap => 29,
         2 => 28,
