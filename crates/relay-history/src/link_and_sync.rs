@@ -79,6 +79,7 @@ pub async fn import_link_and_sync(
         our_aci,
         store,
         recipients: HashMap::new(),
+        titles: HashMap::new(),
         chats: HashMap::new(),
         read: Vec::new(),
         summary: ImportSummary::default(),
@@ -120,6 +121,7 @@ struct Importer<'a> {
     our_aci: ServiceId,
     store: &'a dyn MessageStore,
     recipients: HashMap<u64, Peer>,
+    titles: HashMap<u64, String>,
     chats: HashMap<u64, Recipient>,
     read: Vec<MessageId>,
     summary: ImportSummary,
@@ -129,7 +131,7 @@ impl Importer<'_> {
     async fn frame(&mut self, frame: pb::Frame) -> anyhow::Result<()> {
         match frame.item {
             Some(pb::frame::Item::Recipient(r)) => self.recipient(r),
-            Some(pb::frame::Item::Chat(c)) => self.chat(c),
+            Some(pb::frame::Item::Chat(c)) => self.chat(c).await?,
             Some(pb::frame::Item::ChatItem(item)) => self.chat_item(item).await?,
             _ => {}
         }
@@ -143,12 +145,18 @@ impl Importer<'_> {
                 let Some(aci) = c.aci.as_deref().and_then(service_id) else {
                     return;
                 };
+                self.title(recipient.id, [c.profileGivenName, c.profileFamilyName]);
                 Peer::Contact(aci)
             }
             Some(pb::recipient::Destination::Group(g)) => {
                 let Ok(master_key) = <[u8; 32]>::try_from(g.masterKey.as_slice()) else {
                     return;
                 };
+                let title = g.snapshot.title.as_ref().and_then(|t| match &t.content {
+                    Some(pb::group::group_attribute_blob::Content::Title(t)) => Some(t.clone()),
+                    _ => None,
+                });
+                self.title(recipient.id, [title]);
                 Peer::Group(group_id(master_key))
             }
             _ => return,
@@ -156,14 +164,33 @@ impl Importer<'_> {
         self.recipients.insert(recipient.id, peer);
     }
 
-    fn chat(&mut self, chat: pb::Chat) {
+    /// Joins the non-empty name parts, if any, as the recipient's title.
+    fn title<const N: usize>(&mut self, recipient_id: u64, parts: [Option<String>; N]) {
+        let parts: Vec<_> = parts
+            .into_iter()
+            .flatten()
+            .filter(|p| !p.is_empty())
+            .collect();
+        if !parts.is_empty() {
+            self.titles.insert(recipient_id, parts.join(" "));
+        }
+    }
+
+    async fn chat(&mut self, chat: pb::Chat) -> anyhow::Result<()> {
         let conversation = match self.recipients.get(&chat.recipientId) {
             Some(Peer::Me) => Recipient::Contact(self.our_aci),
             Some(Peer::Contact(aci)) => Recipient::Contact(*aci),
             Some(Peer::Group(id)) => Recipient::Group(*id),
-            None => return,
+            None => return Ok(()),
         };
         self.chats.insert(chat.id, conversation);
+        if let Some(title) = self.titles.get(&chat.recipientId) {
+            self.store
+                .set_title(conversation, title)
+                .await
+                .with_context(|| format!("titling imported conversation {conversation:?}"))?;
+        }
+        Ok(())
     }
 
     /// The ACI behind a recipient id, if it's a person we can attribute to.
@@ -744,5 +771,50 @@ mod tests {
         .expect("import");
         assert_eq!(seen, vec![1, 2], "progress: {seen:?}");
         assert_eq!(seen.last().copied(), Some(summary.imported));
+    }
+
+    /// Conversation lists need names; imported chats take the contact's profile
+    /// name and the group's title from the archive.
+    #[tokio::test]
+    async fn conversations_are_titled_from_profile_names_and_group_titles() {
+        let alice = recipient(
+            ALICE_ID,
+            pb::recipient::Destination::Contact(pb::Contact {
+                aci: Some(uuid::Uuid::from_u128(ALICE_ACI).as_bytes().to_vec()),
+                profileGivenName: Some("Alice".to_owned()),
+                profileFamilyName: Some("Liddell".to_owned()),
+                ..Default::default()
+            }),
+        );
+        let mut book_club = pb::Group {
+            masterKey: vec![9; 32],
+            ..Default::default()
+        };
+        book_club.snapshot.mut_or_insert_default().title = Some(pb::group::GroupAttributeBlob {
+            content: Some(pb::group::group_attribute_blob::Content::Title(
+                "Book club".to_owned(),
+            )),
+            ..Default::default()
+        })
+        .into();
+        let (store, _) = import(vec![
+            self_recipient(),
+            alice,
+            recipient(3, pb::recipient::Destination::Group(book_club)),
+            chat(ALICE_CHAT, ALICE_ID),
+            chat(11, 3),
+            item(incoming_text(ALICE_CHAT, ALICE_ID, 1_000, "hi")),
+            item(incoming_text(11, ALICE_ID, 2_000, "chapter 3?")),
+        ])
+        .await;
+        let mut titles: Vec<_> = store
+            .conversations()
+            .await
+            .expect("conversations")
+            .into_iter()
+            .map(|c| c.title)
+            .collect();
+        titles.sort();
+        assert_eq!(titles, vec!["Alice Liddell", "Book club"]);
     }
 }
