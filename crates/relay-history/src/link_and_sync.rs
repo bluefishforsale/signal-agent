@@ -42,6 +42,7 @@ impl fmt::Debug for LinkAndSyncKey {
 pub struct ImportSummary {
     pub imported: u64,
     pub skipped: u64,
+    pub already_stored: u64,
 }
 
 /// Imports a downloaded link-and-sync archive into `store`.
@@ -271,14 +272,19 @@ impl Importer<'_> {
                 Some(pb::chat_item::Item::RemoteDeletedMessage(_))
             ),
         };
-        self.store
+        let new = self
+            .store
             .insert(&message)
             .await
             .with_context(|| format!("storing imported message {:?}", message.id))?;
         if read {
             self.read.push(message.id);
         }
-        self.summary.imported += 1;
+        if new {
+            self.summary.imported += 1;
+        } else {
+            self.summary.already_stored += 1;
+        }
         Ok(())
     }
 }
@@ -633,7 +639,8 @@ mod tests {
             summary,
             ImportSummary {
                 imported: 0,
-                skipped: 1
+                skipped: 1,
+                already_stored: 0
             }
         );
         let stored = all_messages(&store).await;
@@ -771,7 +778,8 @@ mod tests {
             summary,
             ImportSummary {
                 imported: 0,
-                skipped: 1
+                skipped: 1,
+                already_stored: 0
             }
         );
     }
@@ -904,5 +912,42 @@ mod tests {
             &store,
             &mut progress,
         ));
+    }
+
+    /// A retried import (the first one was interrupted) must not count or
+    /// rewrite what's already stored.
+    #[tokio::test]
+    async fn importing_the_same_archive_twice_adds_nothing_the_second_time() {
+        let frames = || {
+            vec![
+                self_recipient(),
+                contact(ALICE_ID, ALICE_ACI),
+                chat(ALICE_CHAT, ALICE_ID),
+                item(incoming_text(ALICE_CHAT, ALICE_ID, 1_000, "once")),
+            ]
+        };
+        let store = MemoryStore::default();
+        let mut summaries = vec![];
+        for _ in 0..2 {
+            let summary = import_link_and_sync(
+                &archive(frames()),
+                &synthetic_key(),
+                aci(OUR_ACI),
+                &store,
+                &mut |_| {},
+            )
+            .await
+            .expect("import");
+            summaries.push(summary);
+        }
+        assert_eq!(
+            summaries[1],
+            ImportSummary {
+                imported: 0,
+                skipped: 0,
+                already_stored: 1
+            }
+        );
+        assert_eq!(store.stats().await.expect("stats").messages, 1);
     }
 }
