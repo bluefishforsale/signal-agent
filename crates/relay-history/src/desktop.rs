@@ -144,7 +144,10 @@ fn message(our_aci: ServiceId, conversation: Recipient, json: &Value) -> Option<
             .map(str::to_owned),
         attachments: vec![],
         quote: None,
-        edited: false,
+        edited: json
+            .get("editHistory")
+            .and_then(Value::as_array)
+            .is_some_and(|history| !history.is_empty()),
         deleted,
     })
 }
@@ -452,5 +455,35 @@ mod tests {
             .await;
         let m = only_message(desktop).await;
         assert!(m.deleted && m.body.is_none(), "{m:?}");
+    }
+
+    /// Desktop keeps an edited message's original sent_at and latest body, with
+    /// every version in editHistory; it imports flagged as edited.
+    #[tokio::test]
+    async fn an_edited_message_imports_flagged_as_edited() {
+        let mut desktop = with_alice().await;
+        desktop
+            .message(
+                "m1",
+                "c-alice",
+                json!({
+                    "type": "incoming",
+                    "sent_at": 1_000,
+                    "sourceServiceId": ALICE_ACI,
+                    "body": "first",
+                    "editMessageTimestamp": 1_500,
+                    "editHistory": [
+                        { "body": "first", "timestamp": 1_500 },
+                        { "body": "frist", "timestamp": 1_000 },
+                    ],
+                }),
+            )
+            .await;
+        let m = only_message(desktop).await;
+        assert_eq!(
+            (m.id.sent_at_ms, m.body.as_deref(), m.edited),
+            (1_000, Some("first"), true),
+            "{m:?}"
+        );
     }
 }
