@@ -310,7 +310,28 @@ impl Provisioner for PresageProvisioner {
     }
 
     async fn verify_code(&self, code: &str) -> anyhow::Result<RegistrationStep> {
-        bail!("not yet")
+        // Cloned, not taken: a mistyped code can be retried on the same session.
+        let Some(confirmation) = self
+            .pending
+            .lock()
+            .expect("pending registration lock")
+            .clone()
+        else {
+            bail!("no verification code is pending; request a code first");
+        };
+        let code = code.trim().to_owned();
+        let manager = self
+            .worker
+            .run(move || async move { confirmation.confirm_verification_code(code).await })
+            .await?
+            .context("Signal did not accept the verification code")?;
+        self.pending
+            .lock()
+            .expect("pending registration lock")
+            .take();
+        Ok(RegistrationStep::Registered {
+            account: convert::account(manager.registration_data(), manager.registration_type()),
+        })
     }
 }
 
@@ -770,6 +791,24 @@ mod tests {
         );
         let still = PresageSignal::open(&path, &KEY).await;
         assert!(still.is_ok(), "the existing account was erased");
+    }
+
+    /// A code typed before one was requested has no session to verify against;
+    /// it must say so instead of reaching Signal with nothing.
+    #[tokio::test]
+    async fn verifying_before_requesting_a_code_fails_clearly() {
+        let (_dir, path) = temp_store();
+        let provisioner = PresageProvisioner::open(&path, &KEY, Servers::Staging)
+            .await
+            .expect("opens");
+        let err = provisioner
+            .verify_code("123456")
+            .await
+            .expect_err("verified with no code requested");
+        assert!(
+            err.to_string().contains("request a code first"),
+            "unclear error: {err:#}"
+        );
     }
 
     /// The store must be unreadable without its key. If the SQLCipher build
