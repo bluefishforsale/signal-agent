@@ -147,7 +147,12 @@ impl SignalBackend for PresageSignal {
     }
 
     async fn attachment(&self, attachment: &AttachmentRef) -> anyhow::Result<Vec<u8>> {
-        bail!("not yet")
+        let pointer = convert::attachment_pointer(attachment)?;
+        let manager = self.manager.clone();
+        self.worker
+            .run(move || async move { manager.get_attachment(&pointer).await })
+            .await?
+            .context("unable to download attachment")
     }
 
     fn incoming(&self) -> BoxStream<'static, anyhow::Result<Incoming>> {
@@ -413,6 +418,28 @@ mod tests {
         assert!(
             matches!(second.as_slice(), [Err(_)]),
             "second consumer got {second:?}"
+        );
+    }
+
+    /// An attachment id this backend never issued must fail with a clear error
+    /// before anything reaches Signal.
+    #[tokio::test]
+    async fn unknown_attachment_id_fails_without_the_network() {
+        let (_dir, path) = temp_store();
+        register_linked(&path).await;
+        let signal = PresageSignal::open(&path, &KEY).await.expect("opens");
+        let err = signal
+            .attachment(&AttachmentRef {
+                id: "not an id!".into(),
+                content_type: String::new(),
+                file_name: None,
+                size: 0,
+            })
+            .await
+            .expect_err("fetched a bogus attachment");
+        assert!(
+            err.to_string().contains("attachment id"),
+            "unclear error: {err:#}"
         );
     }
 
