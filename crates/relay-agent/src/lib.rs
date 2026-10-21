@@ -3,6 +3,7 @@
 //! because two processes driving one Signal device corrupt its sessions.
 
 mod capture;
+pub mod endpoint;
 pub mod login;
 mod mcp;
 
