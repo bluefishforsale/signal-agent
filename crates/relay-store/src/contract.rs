@@ -37,7 +37,12 @@ impl Stores {
     }
 
     async fn close(self) {
-        self.sqlcipher.close().await;
+        for (name, store) in self.each() {
+            store
+                .close()
+                .await
+                .unwrap_or_else(|e| panic!("{name}: close: {e:#}"));
+        }
     }
 }
 
@@ -419,6 +424,48 @@ async fn mark_unread_restores_a_read_message_to_unread() {
         store.mark_unread(&[m.id]).await.expect("unread");
         let unread = store.unread().await.expect("unread");
         assert_eq!(unread, vec![m.clone()], "{name}: not unread again");
+    }
+    stores.close().await;
+}
+
+/// Pruning deletes exactly the messages sent before the cutoff, never the
+/// message at it, and they leave search with them.
+#[tokio::test]
+async fn prune_removes_only_messages_older_than_the_cutoff() {
+    let alice = Recipient::Contact(sid(1));
+    let stores = Stores::open().await;
+    for (name, store) in stores.each() {
+        for t in [10, 20, 30] {
+            store.insert(&msg(1, t, alice, "x")).await.expect("insert");
+        }
+        let removed = store.prune(20).await.expect("prune");
+        assert_eq!(removed, 1, "{name}: expected only the t=10 message");
+        let left = store.export(None, None).await.expect("export");
+        let times: Vec<_> = left.iter().map(|m| m.id.sent_at_ms).collect();
+        assert_eq!(times, vec![20, 30], "{name}: wrong messages kept");
+        let hits = store.search(&search("x")).await.expect("search");
+        assert_eq!(hits.len(), 2, "{name}: pruned message still searchable");
+    }
+    stores.close().await;
+}
+
+/// Export is oldest first and honours both filters, so a partial export of
+/// one conversation since a date is exactly that.
+#[tokio::test]
+async fn export_filters_by_conversation_and_start_oldest_first() {
+    let alice = Recipient::Contact(sid(1));
+    let bob = Recipient::Contact(sid(2));
+    let stores = Stores::open().await;
+    for (name, store) in stores.each() {
+        for (t, c) in [(30, alice), (10, alice), (20, alice), (15, bob)] {
+            store.insert(&msg(1, t, c, "x")).await.expect("insert");
+        }
+        let all = store.export(None, None).await.expect("export");
+        let times: Vec<_> = all.iter().map(|m| m.id.sent_at_ms).collect();
+        assert_eq!(times, vec![10, 15, 20, 30], "{name}: all");
+        let some = store.export(Some(alice), Some(20)).await.expect("export");
+        let times: Vec<_> = some.iter().map(|m| m.id.sent_at_ms).collect();
+        assert_eq!(times, vec![20, 30], "{name}: filtered");
     }
     stores.close().await;
 }

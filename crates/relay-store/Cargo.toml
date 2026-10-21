@@ -12,13 +12,13 @@ relay-secrets.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx = { version = "0.9.0", default-features = false, features = ["sqlite", "runtime-tokio", "migrate", "macros"] }
-# NOTE: must stay the same libsqlite3-sys presage-store-sqlite links, with
-# SQLCipher bundled; a second SQLite build can't link into the binary
-# (docs/slices.md, "One SQLCipher").
-libsqlite3-sys = { version = "0.36.0", features = ["bundled-sqlcipher"] }
+# NOTE: every crate linking libsqlite3-sys declares exactly this, so Cargo's
+# feature unification yields one SQLCipher with one crypto backend whatever
+# else is in the graph (docs/slices.md, "One SQLCipher").
+libsqlite3-sys = { version = "0.36.0", features = ["bundled-sqlcipher-custom-crypto"] }
 log = "0.4.34"
 
-# Windows has no system OpenSSL for SQLCipher to link, so build it in.
+# The fork's build.rs still demands OpenSSL on Windows even with custom crypto.
 [target.'cfg(windows)'.dependencies]
 libsqlite3-sys = { version = "0.36.0", features = ["bundled-sqlcipher-vendored-openssl"] }
 

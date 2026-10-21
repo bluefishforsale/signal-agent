@@ -75,6 +75,23 @@ pub trait MessageStore: Send + Sync {
     async fn search(&self, query: &SearchQuery) -> anyhow::Result<Vec<Message>>;
     async fn unread(&self) -> anyhow::Result<Vec<Message>>;
     async fn stats(&self) -> anyhow::Result<StoreStats>;
+    /// Deletes stored messages sent before `older_than_ms`, returning how many.
+    /// Local only; nothing is sent to Signal.
+    async fn prune(&self, older_than_ms: u64) -> anyhow::Result<u64>;
+    /// Every stored message, oldest first, optionally limited to one
+    /// conversation and to messages sent at or after `since_ms`.
+    async fn export(
+        &self,
+        conversation: Option<Recipient>,
+        since_ms: Option<u64>,
+    ) -> anyhow::Result<Vec<Message>>;
+    /// Releases the store's connections. The agent calls this before exiting.
+    // NOTE: dropping the SQLCipher store without closing it first crashed the
+    // process at exit (sqlite3FreeCodecArg, 24 of 40 runs in L2's testing), so
+    // every owner must await close() on shutdown paths.
+    async fn close(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// Signal only lets a message's author edit or delete it.

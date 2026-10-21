@@ -163,6 +163,30 @@ impl MessageStore for MemoryStore {
             .collect())
     }
 
+    async fn prune(&self, older_than_ms: u64) -> anyhow::Result<u64> {
+        let mut inner = self.inner();
+        let before = inner.messages.len();
+        inner.messages.retain(|m| m.id.sent_at_ms >= older_than_ms);
+        Ok((before - inner.messages.len()) as u64)
+    }
+
+    async fn export(
+        &self,
+        conversation: Option<Recipient>,
+        since_ms: Option<u64>,
+    ) -> anyhow::Result<Vec<Message>> {
+        let inner = self.inner();
+        let mut out: Vec<_> = inner
+            .messages
+            .iter()
+            .filter(|m| conversation.is_none_or(|c| m.conversation == c))
+            .filter(|m| since_ms.is_none_or(|s| m.id.sent_at_ms >= s))
+            .cloned()
+            .collect();
+        out.sort_by_key(|m| m.id.sent_at_ms);
+        Ok(out)
+    }
+
     async fn stats(&self) -> anyhow::Result<StoreStats> {
         let unread = self.unread().await?.len() as u64;
         let conversations = self.conversations().await?.len() as u64;

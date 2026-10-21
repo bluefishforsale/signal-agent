@@ -63,14 +63,6 @@ impl SqlCipherStore {
         tx.commit().await?;
         Ok(())
     }
-
-    /// Closes every connection. Call before the process exits.
-    // NOTE: dropping the store without this leaves sqlx worker threads closing
-    // connections while the process tears down SQLCipher's crypto state, which
-    // segfaults in sqlite3FreeCodecArg on exit.
-    pub async fn close(&self) {
-        self.pool.close().await;
-    }
 }
 
 /// A `SELECT` of every `MessageRow` column from `messages m`, followed by
@@ -340,6 +332,38 @@ impl MessageStore for SqlCipherStore {
         to_messages(rows)
     }
 
+    async fn prune(&self, older_than_ms: u64) -> anyhow::Result<u64> {
+        let deleted = sqlx::query("DELETE FROM messages WHERE sent_at_ms < ?")
+            .bind(to_i64(older_than_ms)?)
+            .execute(&self.pool)
+            .await?;
+        Ok(deleted.rows_affected())
+    }
+
+    async fn export(
+        &self,
+        conversation: Option<Recipient>,
+        since_ms: Option<u64>,
+    ) -> anyhow::Result<Vec<Message>> {
+        let rows = sqlx::query_as(select_messages!(
+            "FROM messages m WHERE (?1 IS NULL OR m.conversation = ?1) \
+             AND m.sent_at_ms >= ?2 ORDER BY m.sent_at_ms"
+        ))
+        .bind(conversation.map(recipient_key))
+        .bind(since_ms.map(to_i64).transpose()?.unwrap_or(0))
+        .fetch_all(&self.pool)
+        .await?;
+        to_messages(rows)
+    }
+
+    // NOTE: dropping the pool without this leaves sqlx worker threads closing
+    // connections while the process tears down SQLCipher's crypto state, which
+    // segfaults in sqlite3FreeCodecArg on exit.
+    async fn close(&self) -> anyhow::Result<()> {
+        self.pool.close().await;
+        Ok(())
+    }
+
     async fn stats(&self) -> anyhow::Result<StoreStats> {
         let (messages, conversations, unread, oldest, newest): (
             i64,
@@ -377,7 +401,7 @@ mod tests {
         let store = SqlCipherStore::open(&path, &StoreKey::from_bytes([1; 32]))
             .await
             .expect("create");
-        store.close().await;
+        store.close().await.expect("close");
         let reopened = SqlCipherStore::open(&path, &StoreKey::from_bytes([2; 32])).await;
         assert!(reopened.is_err(), "opened with the wrong key");
     }
@@ -441,7 +465,7 @@ mod tests {
             .expect("search");
         let times: Vec<_> = hits.iter().map(|m| m.id.sent_at_ms).collect();
         assert_eq!(times, vec![1, 2], "ranked by recency, not relevance");
-        store.close().await;
+        store.close().await.expect("close");
     }
 
     /// Nothing written to disk, including the WAL and the FTS index, may
@@ -477,7 +501,7 @@ mod tests {
             files.iter().any(|f| f.ends_with("-wal")),
             "expected a WAL file to check too: {files:?}"
         );
-        store.close().await;
+        store.close().await.expect("close");
     }
 
     /// Search depends on FTS5 being compiled into the bundled SQLCipher.
@@ -489,7 +513,7 @@ mod tests {
             .await
             .expect("query");
         assert_eq!(used, 1, "SQLCipher built without FTS5");
-        store.close().await;
+        store.close().await.expect("close");
     }
 
     /// History and unread run on every read tool call, so they must use an
@@ -513,6 +537,26 @@ mod tests {
                 "full scan for {sql}: {details:?}"
             );
         }
-        store.close().await;
+        store.close().await.expect("close");
+    }
+
+    /// The cipher backend must be the one docs/slices.md declares: pure-Rust
+    /// crypto, except on Windows, where the fork's build.rs lets the
+    /// vendored-OpenSSL feature win over custom crypto. Either backend writes
+    /// the standard SQLCipher format, so stores stay portable across OSes.
+    #[tokio::test]
+    async fn sqlcipher_uses_the_declared_crypto_backend() {
+        let (store, _dir) = open_temp().await;
+        let (provider,): (String,) = sqlx::query_as("PRAGMA cipher_provider")
+            .fetch_one(&store.pool)
+            .await
+            .expect("query");
+        let expected = if cfg!(windows) {
+            "openssl"
+        } else {
+            "rustcrypto"
+        };
+        assert_eq!(provider.to_lowercase(), expected, "cipher provider");
+        store.close().await.expect("close");
     }
 }
