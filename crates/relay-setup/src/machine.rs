@@ -138,6 +138,38 @@ pub fn transition(state: &SetupState, event: SetupEvent) -> (SetupState, Vec<Com
                 choice: AccountChoice::LinkExisting,
             },
         ) => start_link(device_name),
+        (
+            S::ChooseAccount { .. },
+            E::AccountChosen {
+                choice: AccountChoice::OwnNumber,
+            },
+        ) => (S::EnterNumber, Vec::new()),
+        (S::EnterNumber, E::NumberEntered { number }) if !number.trim().is_empty() => {
+            request_code(number.trim(), None)
+        }
+        (S::RequestingCode { number }, E::CaptchaRequired) => (
+            S::SolveCaptcha {
+                number: number.clone(),
+            },
+            Vec::new(),
+        ),
+        (S::SolveCaptcha { number }, E::CaptchaSolved { token }) => {
+            request_code(number, Some(token))
+        }
+        (S::RequestingCode { number }, E::CodeSent) => (
+            S::EnterCode {
+                number: number.clone(),
+            },
+            Vec::new(),
+        ),
+        (S::EnterCode { number }, E::CodeEntered { code }) if !code.trim().is_empty() => (
+            S::VerifyingCode {
+                number: number.clone(),
+            },
+            vec![Command::VerifyCode {
+                code: code.trim().to_owned(),
+            }],
+        ),
         (S::Linking { device_name, .. }, E::LinkUri { uri }) => (
             S::Linking {
                 device_name: device_name.clone(),
@@ -157,6 +189,18 @@ pub fn transition(state: &SetupState, event: SetupEvent) -> (SetupState, Vec<Com
             },
             E::AccessChosen { access },
         ) => import_history(access),
+        (S::VerifyingCode { .. }, E::Registered) => (
+            S::ChooseAccess {
+                kind: ProfileKind::Primary,
+            },
+            Vec::new(),
+        ),
+        (
+            S::ChooseAccess {
+                kind: ProfileKind::Primary,
+            },
+            E::AccessChosen { access },
+        ) => connect_clients(access),
         (S::ImportingHistory { access, .. }, E::HistoryProgress { imported, total }) => (
             S::ImportingHistory {
                 imported,
@@ -182,6 +226,18 @@ fn start_link(device_name: &str) -> (SetupState, Vec<Command>) {
         },
         vec![Command::StartLink {
             device_name: device_name.to_owned(),
+        }],
+    )
+}
+
+fn request_code(number: &str, captcha: Option<String>) -> (SetupState, Vec<Command>) {
+    (
+        SetupState::RequestingCode {
+            number: number.to_owned(),
+        },
+        vec![Command::RequestCode {
+            number: number.to_owned(),
+            captcha,
         }],
     )
 }
@@ -399,5 +455,184 @@ mod tests {
         let (state, commands) = transition(&done, SetupEvent::RestartDesktop);
         assert_eq!(state, done);
         assert_eq!(commands, vec![Command::RestartDesktop]);
+    }
+
+    /// Giving the agent its own number asks for the number before talking to Signal.
+    #[test]
+    fn choosing_own_number_asks_for_the_number() {
+        let (state, commands) = transition(
+            &start(),
+            SetupEvent::AccountChosen {
+                choice: AccountChoice::OwnNumber,
+            },
+        );
+        assert_eq!(state, SetupState::EnterNumber);
+        assert!(commands.is_empty(), "{commands:?}");
+    }
+
+    const NUMBER: &str = "+15555550100";
+
+    fn requesting() -> SetupState {
+        SetupState::RequestingCode {
+            number: NUMBER.into(),
+        }
+    }
+
+    /// A number asks Signal for a code without a captcha first, and waits in a
+    /// state that can't send a second request (each one costs an SMS).
+    #[test]
+    fn an_entered_number_requests_a_code_once() {
+        let (state, commands) = transition(
+            &SetupState::EnterNumber,
+            SetupEvent::NumberEntered {
+                number: format!(" {NUMBER} "),
+            },
+        );
+        assert_eq!(state, requesting());
+        assert_eq!(
+            commands,
+            vec![Command::RequestCode {
+                number: NUMBER.into(),
+                captcha: None
+            }]
+        );
+        let (again, commands) = transition(
+            &state,
+            SetupEvent::NumberEntered {
+                number: NUMBER.into(),
+            },
+        );
+        assert_eq!(again, state);
+        assert!(commands.is_empty(), "requested a second code: {commands:?}");
+    }
+
+    /// A blank number is a stray submit, not a request: it must not reach Signal.
+    #[test]
+    fn a_blank_number_is_ignored() {
+        let (state, commands) = transition(
+            &SetupState::EnterNumber,
+            SetupEvent::NumberEntered {
+                number: "  ".into(),
+            },
+        );
+        assert_eq!(state, SetupState::EnterNumber);
+        assert!(commands.is_empty(), "{commands:?}");
+    }
+
+    /// When Signal wants a captcha, the solved token goes back with the same
+    /// number in a fresh code request.
+    #[test]
+    fn a_solved_captcha_re_requests_the_code_with_its_token() {
+        let (state, commands) = transition(&requesting(), SetupEvent::CaptchaRequired);
+        assert_eq!(
+            state,
+            SetupState::SolveCaptcha {
+                number: NUMBER.into()
+            }
+        );
+        assert!(commands.is_empty(), "{commands:?}");
+
+        let (state, commands) = transition(
+            &state,
+            SetupEvent::CaptchaSolved {
+                token: "signalcaptcha://abc".into(),
+            },
+        );
+        assert_eq!(state, requesting());
+        assert_eq!(
+            commands,
+            vec![Command::RequestCode {
+                number: NUMBER.into(),
+                captcha: Some("signalcaptcha://abc".into())
+            }]
+        );
+    }
+
+    /// A sent code asks for it, and an entered code is verified exactly once
+    /// (repeat submits must not burn verification attempts).
+    #[test]
+    fn an_entered_code_is_verified_once() {
+        let (state, _) = transition(&requesting(), SetupEvent::CodeSent);
+        assert_eq!(
+            state,
+            SetupState::EnterCode {
+                number: NUMBER.into()
+            }
+        );
+        let (state, commands) = transition(
+            &state,
+            SetupEvent::CodeEntered {
+                code: " 123456 ".into(),
+            },
+        );
+        assert_eq!(
+            state,
+            SetupState::VerifyingCode {
+                number: NUMBER.into()
+            }
+        );
+        assert_eq!(
+            commands,
+            vec![Command::VerifyCode {
+                code: "123456".into()
+            }]
+        );
+        let (again, commands) = transition(
+            &state,
+            SetupEvent::CodeEntered {
+                code: "123456".into(),
+            },
+        );
+        assert_eq!(again, state);
+        assert!(commands.is_empty(), "verified twice: {commands:?}");
+    }
+
+    /// A blank code would burn a verification attempt for nothing.
+    #[test]
+    fn a_blank_code_is_ignored() {
+        let entering = SetupState::EnterCode {
+            number: NUMBER.into(),
+        };
+        let (state, commands) =
+            transition(&entering, SetupEvent::CodeEntered { code: "\t".into() });
+        assert_eq!(state, entering);
+        assert!(commands.is_empty(), "{commands:?}");
+    }
+
+    /// A newly registered number has no history to import, so access leads
+    /// straight to saving it and connecting clients.
+    #[test]
+    fn a_registered_number_skips_history_after_choosing_access() {
+        let verifying = SetupState::VerifyingCode {
+            number: NUMBER.into(),
+        };
+        let (state, _) = transition(&verifying, SetupEvent::Registered);
+        assert_eq!(
+            state,
+            SetupState::ChooseAccess {
+                kind: ProfileKind::Primary
+            }
+        );
+        let (state, commands) = transition(
+            &state,
+            SetupEvent::AccessChosen {
+                access: AccessMode::Full,
+            },
+        );
+        assert_eq!(
+            state,
+            SetupState::ConnectingClients {
+                access: AccessMode::Full
+            }
+        );
+        assert_eq!(
+            commands,
+            vec![
+                Command::SaveAccess {
+                    access: AccessMode::Full
+                },
+                Command::ConnectClients
+            ]
+        );
     }
 }
