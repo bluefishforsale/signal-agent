@@ -128,3 +128,91 @@ fn is_e164(s: &str) -> bool {
     };
     (8..=15).contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_digit())
 }
+
+/// A moment in time, given as an ISO 8601 date (`2024-01-01`) or UTC datetime
+/// (`2024-01-01T09:30:00Z`, seconds and `Z` optional), held as epoch ms.
+// NOTE: read as UTC, unlike upstream signal-mcp, which used the server's local
+// time. The agent may run in another timezone than the client, so local time
+// would silently shift every window by the difference.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(try_from = "String")]
+pub struct Instant(u64);
+
+impl Instant {
+    pub fn schema(description: &str) -> Value {
+        json!({
+            "type": "string",
+            "format": "iso-datetime",
+            "description": format!("{description}: an ISO date (2024-01-01) or UTC datetime (2024-01-01T09:30:00Z)"),
+        })
+    }
+
+    pub fn ms(self) -> u64 {
+        self.0
+    }
+}
+
+impl TryFrom<String> for Instant {
+    type Error = String;
+    fn try_from(s: String) -> Result<Self, String> {
+        epoch_ms(&s)
+            .map(Self)
+            .ok_or_else(|| format!("\"{s}\" is not an ISO date or UTC datetime"))
+    }
+}
+
+fn epoch_ms(s: &str) -> Option<u64> {
+    let s = s.strip_suffix('Z').unwrap_or(s);
+    let (date, time) = match s.split_once('T') {
+        Some((date, time)) => (date, Some(time)),
+        None => (s, None),
+    };
+    let mut parts = date.split('-');
+    let (y, m, d) = (
+        digits(parts.next()?, 4)?,
+        digits(parts.next()?, 2)?,
+        digits(parts.next()?, 2)?,
+    );
+    if parts.next().is_some() || y < 1970 || !(1..=12).contains(&m) || d < 1 || d > days_in(y, m) {
+        return None;
+    }
+    let mut secs = 0;
+    if let Some(time) = time {
+        let mut parts = time.split(':');
+        let (h, min) = (digits(parts.next()?, 2)?, digits(parts.next()?, 2)?);
+        let sec = parts.next().map_or(Some(0), |p| digits(p, 2))?;
+        if parts.next().is_some() || h > 23 || min > 59 || sec > 59 {
+            return None;
+        }
+        secs = u64::from(h * 3600 + min * 60 + sec);
+    }
+    Some((days_since_epoch(y, m, d) * 86_400 + secs) * 1000)
+}
+
+fn digits(s: &str, len: usize) -> Option<u32> {
+    if s.len() != len || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
+fn days_in(y: u32, m: u32) -> u32 {
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    match m {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+// Howard Hinnant's days_from_civil, for years from 1970 on.
+fn days_since_epoch(y: u32, m: u32, d: u32) -> u64 {
+    let y = u64::from(if m <= 2 { y - 1 } else { y });
+    let (m, d) = (u64::from(m), u64::from(d));
+    let era = y / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}

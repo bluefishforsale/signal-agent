@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use crate::{
     Tool, ToolContext, ToolError,
-    input::{Limit, Offset, parse, recipient, recipient_schema},
+    input::{Instant, Limit, Offset, parse, recipient, recipient_schema},
 };
 
 pub struct ListConversations;
@@ -136,6 +136,7 @@ struct GetConversationInput {
     limit: Limit,
     #[serde(default)]
     offset: Offset,
+    since: Option<Instant>,
 }
 
 #[async_trait]
@@ -146,7 +147,8 @@ impl Tool for GetConversation {
     fn description(&self) -> &'static str {
         "Read one conversation's history from the local store, oldest first. recipient comes \
          from list_conversations. limit is the page size; offset skips the newest N to page \
-         back; has_more says whether older messages remain. Local only, nothing marked read."
+         back; since keeps only messages at or after a time; has_more says whether older \
+         messages remain. Local only, nothing marked read."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -155,6 +157,7 @@ impl Tool for GetConversation {
                 "recipient": recipient_schema(),
                 "limit": Limit::schema(),
                 "offset": Offset::schema(),
+                "since": Instant::schema("Only messages at or after this time"),
             },
             "required": ["recipient"],
             "additionalProperties": false,
@@ -167,10 +170,14 @@ impl Tool for GetConversation {
         let input: GetConversationInput = parse(input)?;
         let conversation = recipient(ctx, &input.recipient).await?;
         let (limit, offset) = (input.limit.get(), input.offset.get());
-        let newest_first = ctx
+        let since_ms = input.since.map_or(0, Instant::ms);
+        let newest_first: Vec<_> = ctx
             .store
             .history(conversation, None, offset + limit + 1)
-            .await?;
+            .await?
+            .into_iter()
+            .take_while(|m| m.id.sent_at_ms >= since_ms)
+            .collect();
         let has_more = newest_first.len() > (offset + limit) as usize;
         let mut messages: Vec<_> = newest_first
             .into_iter()
@@ -330,5 +337,35 @@ mod tests {
             matches!(stranger, Err(ToolError::InvalidInput(_))),
             "unknown number gave {stranger:?}"
         );
+    }
+
+    const JAN_1_2024_MS: u64 = 1_704_067_200_000;
+    const DAY_MS: u64 = 86_400_000;
+
+    /// since is inclusive, read as UTC, and accepts a bare date or a full
+    /// datetime; older messages must not count toward has_more.
+    #[tokio::test]
+    async fn get_conversation_since_keeps_messages_at_or_after_the_instant() {
+        let (ctx, _) = ctx(AccessMode::ReadOnly, ProfileKind::Linked);
+        for (t, body) in [
+            (JAN_1_2024_MS - 1, "dec 31"),
+            (JAN_1_2024_MS, "midnight"),
+            (JAN_1_2024_MS + DAY_MS + 3_600_000, "jan 2 1am"),
+        ] {
+            ctx.store.upsert(&incoming(2, t, body)).await.unwrap();
+        }
+        let registry = Registry::standard();
+        let call = |since: &'static str| {
+            registry.call(
+                &ctx,
+                "get_conversation",
+                json!({"recipient": sid(2).to_string(), "since": since}),
+            )
+        };
+        let out = call("2024-01-01").await.unwrap();
+        assert_eq!(bodies(&out["messages"]), ["midnight", "jan 2 1am"], "{out}");
+        assert_eq!(out["has_more"], json!(false), "{out}");
+        let out = call("2024-01-02T01:00:00Z").await.unwrap();
+        assert_eq!(bodies(&out["messages"]), ["jan 2 1am"], "{out}");
     }
 }
