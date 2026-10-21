@@ -2,12 +2,19 @@
 //! `Send` and its receive loop needs a `LocalSet`, so every call runs on one
 //! dedicated thread and the trait methods only pass work to it.
 
-use std::{future::Future, path::Path, pin::Pin, thread};
+use std::{
+    future::Future,
+    path::Path,
+    pin::Pin,
+    sync::atomic::{AtomicBool, Ordering},
+    thread,
+    time::Duration,
+};
 
-use anyhow::{Context, bail};
+use anyhow::{Context, anyhow, bail};
 use async_trait::async_trait;
 use futures::{StreamExt, stream::BoxStream};
-use presage::{Manager, manager::Registered, store::ContentsStore};
+use presage::{Manager, manager::Registered, model::messages::Received, store::ContentsStore};
 use presage_store_sqlite::{OnNewIdentity, SqliteConnectOptions, SqliteStore};
 use relay_core::prelude::*;
 use tokio::sync::{mpsc, oneshot};
@@ -70,6 +77,7 @@ pub struct PresageSignal {
     worker: Worker,
     manager: Manager<SqliteStore, Registered>,
     account: Account,
+    incoming_taken: AtomicBool,
 }
 
 impl PresageSignal {
@@ -94,6 +102,7 @@ impl PresageSignal {
             worker,
             manager,
             account,
+            incoming_taken: AtomicBool::new(false),
         })
     }
 }
@@ -142,9 +151,74 @@ impl SignalBackend for PresageSignal {
     }
 
     fn incoming(&self) -> BoxStream<'static, anyhow::Result<Incoming>> {
-        futures::stream::empty().boxed()
+        if self.incoming_taken.swap(true, Ordering::SeqCst) {
+            return futures::stream::once(async {
+                Err(anyhow!("incoming() already taken by another consumer"))
+            })
+            .boxed();
+        }
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (worker, manager, me) = (
+            self.worker.clone(),
+            self.manager.clone(),
+            self.account.service_id,
+        );
+        // Connecting waits for the first poll, so holding the stream unpolled
+        // never touches the network.
+        let start = async move {
+            let started = worker
+                .run(move || async move {
+                    tokio::task::spawn_local(receive(manager, me, tx));
+                })
+                .await;
+            match started {
+                Ok(()) => futures::stream::poll_fn(move |cx| rx.poll_recv(cx)).boxed(),
+                Err(e) => futures::stream::once(async { Err(e) }).boxed(),
+            }
+        };
+        futures::stream::once(start).flatten().boxed()
     }
 }
+
+/// Receives from Signal for as long as anyone holds the other end of `tx`,
+/// reconnecting with backoff whenever the connection drops.
+async fn receive(
+    mut manager: Manager<SqliteStore, Registered>,
+    me: ServiceId,
+    tx: mpsc::UnboundedSender<anyhow::Result<Incoming>>,
+) {
+    let mut delay = MIN_RECONNECT_DELAY;
+    while !tx.is_closed() {
+        match manager.receive_messages().await {
+            Ok(messages) => {
+                delay = MIN_RECONNECT_DELAY;
+                let mut messages = std::pin::pin!(messages);
+                while let Some(received) = messages.next().await {
+                    let Received::Content(content) = received else {
+                        continue;
+                    };
+                    let Some(event) = convert::incoming(&content, me) else {
+                        continue;
+                    };
+                    if tx.send(Ok(event)).is_err() {
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                let e = anyhow!(e).context("unable to receive from Signal");
+                if tx.send(Err(e)).is_err() {
+                    return;
+                }
+            }
+        }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(MAX_RECONNECT_DELAY);
+    }
+}
+
+const MIN_RECONNECT_DELAY: Duration = Duration::from_secs(1);
+const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(300);
 
 /// Opens (creating if needed) presage's store at `path`, encrypted with `key`.
 // NOTE: the key goes in as a raw SQLCipher key (x'..'), not a passphrase. It's
@@ -324,6 +398,21 @@ mod tests {
                 title: "cats".into(),
                 members: vec![ServiceId::new(me)],
             }]
+        );
+    }
+
+    /// The agent is the one consumer of incoming(); a second caller would steal
+    /// half the messages, so it must get an error instead.
+    #[tokio::test]
+    async fn incoming_can_only_be_taken_once() {
+        let (_dir, path) = temp_store();
+        register_linked(&path).await;
+        let signal = PresageSignal::open(&path, &KEY).await.expect("opens");
+        let _first = signal.incoming();
+        let second: Vec<_> = signal.incoming().collect().await;
+        assert!(
+            matches!(second.as_slice(), [Err(_)]),
+            "second consumer got {second:?}"
         );
     }
 
