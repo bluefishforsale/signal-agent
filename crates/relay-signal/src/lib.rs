@@ -5,6 +5,7 @@
 mod backend;
 mod convert;
 mod fake;
+mod presage_backend;
 
 pub use backend::{
     Account, Contact, Group, Incoming, LinkEvent, Outgoing, Provisioner, RegistrationStep,
