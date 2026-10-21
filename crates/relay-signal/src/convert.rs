@@ -13,6 +13,7 @@ use presage::{
         protocol,
         zkgroup::groups::{GroupMasterKey, GroupSecretParams},
     },
+    manager::{RegistrationData, RegistrationType},
     proto::{
         AttachmentPointer, DataMessage, EditMessage, GroupContextV2, ReceiptMessage, SyncMessage,
         TypingMessage, data_message, receipt_message,
@@ -23,7 +24,7 @@ use presage::{
 };
 use relay_core::prelude::*;
 
-use crate::{Incoming, Outgoing};
+use crate::{Account, Incoming, Outgoing};
 
 /// What `content` means to the agent, or `None` when it carries nothing the
 /// agent keeps (delivery receipts, calls, stories, key syncs). `me` is the
@@ -261,6 +262,20 @@ pub(crate) fn group_from(
             .iter()
             .map(|member| ServiceId::new(member.aci.into()))
             .collect(),
+    }
+}
+
+/// The account a registration describes.
+pub(crate) fn account(data: &RegistrationData, kind: RegistrationType) -> Account {
+    Account {
+        service_id: ServiceId::new(data.service_ids.aci),
+        phone_number: Some(e164(&data.phone_number)),
+        kind: match kind {
+            RegistrationType::Primary => ProfileKind::Primary,
+            RegistrationType::Secondary => ProfileKind::Linked,
+        },
+        // A primary device has no name of its own on Signal.
+        device_name: data.device_name().unwrap_or_default().to_owned(),
     }
 }
 
