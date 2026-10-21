@@ -9,7 +9,7 @@ use std::{
     pin::Pin,
     sync::{
         Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -95,6 +95,7 @@ pub struct PresageSignal {
     manager: Manager<SqliteStore, Registered>,
     account: Account,
     incoming_taken: AtomicBool,
+    last_sent_at_ms: AtomicU64,
 }
 
 impl PresageSignal {
@@ -120,6 +121,7 @@ impl PresageSignal {
             manager,
             account,
             incoming_taken: AtomicBool::new(false),
+            last_sent_at_ms: AtomicU64::new(0),
         })
     }
 }
@@ -137,7 +139,7 @@ impl SignalBackend for PresageSignal {
         {
             bail!("Signal only edits and deletes your own messages; {target:?} is someone else's");
         }
-        let sent_at_ms = now_ms()?;
+        let sent_at_ms = next_timestamp(&self.last_sent_at_ms, now_ms()?);
         let manager = self.manager.clone();
         self.worker
             .run(move || send(manager, to, message, sent_at_ms))
@@ -437,6 +439,17 @@ async fn group_by_id(
         }
     }
     bail!("not a member of group {id}")
+}
+
+/// A send timestamp: the clock, or one past the last one when the clock
+/// hasn't moved on.
+fn next_timestamp(last: &AtomicU64, now_ms: u64) -> u64 {
+    let previous = last
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |last| {
+            Some(now_ms.max(last + 1))
+        })
+        .unwrap_or_else(|last| last);
+    now_ms.max(previous + 1)
 }
 
 fn now_ms() -> anyhow::Result<u64> {
@@ -808,6 +821,21 @@ mod tests {
         assert!(
             err.to_string().contains("request a code first"),
             "unclear error: {err:#}"
+        );
+    }
+
+    /// Signal identifies a message by author and timestamp, so two sends in
+    /// the same millisecond must still get distinct timestamps, or the second
+    /// would be taken as a duplicate of the first.
+    #[test]
+    fn send_timestamps_never_repeat_within_a_millisecond() {
+        let last = AtomicU64::new(0);
+        let first = next_timestamp(&last, 1_000);
+        let second = next_timestamp(&last, 1_000);
+        let earlier_clock = next_timestamp(&last, 999);
+        assert!(
+            first < second && second < earlier_clock,
+            "timestamps repeated or went backwards: {first}, {second}, {earlier_clock}"
         );
     }
 
