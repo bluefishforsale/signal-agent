@@ -1,0 +1,7 @@
+# Windows CI checks out with autocrlf, which turns LF into CRLF and breaks
+# byte-exact fixtures, plists and shell scripts. Text stays LF everywhere.
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.png binary
+*.icns binary
+*.ico binary
