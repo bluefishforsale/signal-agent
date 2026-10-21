@@ -8,7 +8,7 @@ use presage::{
         zkgroup::groups::{GroupMasterKey, GroupSecretParams},
     },
     proto::{
-        SyncMessage,
+        SyncMessage, receipt_message,
         sync_message::{self, Content as SyncContent},
     },
     store::Thread,
@@ -52,6 +52,15 @@ pub(crate) fn incoming(content: &Content, me: ServiceId) -> Option<Incoming> {
                 body: edit.data_message.as_ref()?.body.clone()?,
             });
         }
+        ContentBody::ReceiptMessage(receipt) if receipt.r#type() == receipt_message::Type::Read => {
+            let targets = receipt.timestamp.iter().map(|&sent_at_ms| MessageId {
+                author: me,
+                sent_at_ms,
+            });
+            return Some(Incoming::Read {
+                targets: targets.collect(),
+            });
+        }
         _ => return None,
     };
     if let Some(reaction) = &data.reaction {
@@ -74,6 +83,16 @@ pub(crate) fn incoming(content: &Content, me: ServiceId) -> Option<Incoming> {
             conversation,
             target: MessageId {
                 author: sender,
+                sent_at_ms: delete.target_sent_timestamp?,
+            },
+            from: sender,
+        });
+    }
+    if let Some(delete) = &data.admin_delete {
+        return Some(Incoming::Delete {
+            conversation,
+            target: MessageId {
+                author: aci_of(delete.target_author_aci_binary.as_deref(), None)?,
                 sent_at_ms: delete.target_sent_timestamp?,
             },
             from: sender,
@@ -136,7 +155,7 @@ mod tests {
     use presage::libsignal_service::{
         content::Metadata,
         prelude::Uuid,
-        proto::{DataMessage, EditMessage, GroupContextV2, data_message},
+        proto::{DataMessage, EditMessage, GroupContextV2, ReceiptMessage, data_message},
         protocol::{Aci, DeviceId},
     };
 
@@ -356,6 +375,70 @@ mod tests {
                 },
                 from: alice,
             })
+        );
+    }
+
+    /// A group admin deleting someone else's message must arrive as a delete
+    /// whose `from` is the admin and whose target keeps its real author, so the
+    /// store sees the mismatch instead of a forged self-delete.
+    #[test]
+    fn admin_delete_keeps_target_author_and_admin_as_from() {
+        let content = content_from(
+            ALICE,
+            ContentBody::DataMessage(DataMessage {
+                timestamp: Some(61),
+                admin_delete: Some(data_message::AdminDelete {
+                    target_author_aci_binary: Some(ME.as_bytes().to_vec()),
+                    target_sent_timestamp: Some(51),
+                }),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(
+            incoming(&content, ServiceId::new(ME)),
+            Some(Incoming::Delete {
+                conversation: Recipient::Contact(ServiceId::new(ALICE)),
+                target: MessageId {
+                    author: ServiceId::new(ME),
+                    sent_at_ms: 51
+                },
+                from: ServiceId::new(ALICE),
+            })
+        );
+    }
+
+    /// A read receipt from a contact marks the account's own messages read;
+    /// delivery receipts carry nothing the agent keeps.
+    #[test]
+    fn read_receipt_targets_own_messages_and_delivery_is_ignored() {
+        let receipt = |kind: receipt_message::Type| {
+            content_from(
+                ALICE,
+                ContentBody::ReceiptMessage(ReceiptMessage {
+                    r#type: Some(kind.into()),
+                    timestamp: vec![10, 11],
+                }),
+            )
+        };
+        let me = ServiceId::new(ME);
+        assert_eq!(
+            incoming(&receipt(receipt_message::Type::Read), me),
+            Some(Incoming::Read {
+                targets: vec![
+                    MessageId {
+                        author: me,
+                        sent_at_ms: 10
+                    },
+                    MessageId {
+                        author: me,
+                        sent_at_ms: 11
+                    },
+                ]
+            })
+        );
+        assert_eq!(
+            incoming(&receipt(receipt_message::Type::Delivery), me),
+            None
         );
     }
 }
