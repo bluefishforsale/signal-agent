@@ -90,6 +90,12 @@ pub enum Incoming {
     Read {
         targets: Vec<MessageId>,
     },
+    /// A contact's identity key (safety number) changed, usually a reinstall or
+    /// new phone. The backend trusts the new key as Signal's own apps do, so
+    /// messaging keeps working; this event is how the change stays visible.
+    IdentityChanged {
+        contact: ServiceId,
+    },
 }
 
 /// A registered account's live connection to Signal.

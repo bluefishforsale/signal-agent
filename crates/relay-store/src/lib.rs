@@ -54,6 +54,8 @@ pub trait MessageStore: Send + Sync {
     /// Fails unless `deleter` wrote `target`.
     async fn mark_deleted(&self, target: MessageId, deleter: ServiceId) -> anyhow::Result<()>;
     async fn mark_read(&self, targets: &[MessageId]) -> anyhow::Result<()>;
+    /// Local-only: makes `targets` count as unread again. Nothing is sent to Signal.
+    async fn mark_unread(&self, targets: &[MessageId]) -> anyhow::Result<()>;
     async fn set_title(&self, conversation: Recipient, title: &str) -> anyhow::Result<()>;
     /// Most recent first.
     async fn conversations(&self) -> anyhow::Result<Vec<Conversation>>;
