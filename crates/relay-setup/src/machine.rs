@@ -214,7 +214,59 @@ pub fn transition(state: &SetupState, event: SetupEvent) -> (SetupState, Vec<Com
             (S::Done { clients }, Vec::new())
         }
         (S::Done { .. }, E::RestartDesktop) => (state.clone(), vec![Command::RestartDesktop]),
+        (state, E::CommandFailed { message }) => match resume_point(state) {
+            Some(retry) => (
+                S::Failed {
+                    message,
+                    retry: Box::new(retry),
+                },
+                Vec::new(),
+            ),
+            None => (state.clone(), Vec::new()),
+        },
+        (S::Failed { retry, .. }, E::Retry) => resume(retry),
         (state, _) => (state.clone(), Vec::new()),
+    }
+}
+
+/// Where a failure in `state` resumes, or `None` when `state` runs no command
+/// and a failure report can only be stale.
+fn resume_point(state: &SetupState) -> Option<SetupState> {
+    use SetupState as S;
+
+    match state {
+        S::Linking { device_name, .. } => Some(S::Linking {
+            device_name: device_name.clone(),
+            uri: None,
+        }),
+        S::RequestingCode { .. } => Some(S::EnterNumber),
+        S::VerifyingCode { number } => Some(S::EnterCode {
+            number: number.clone(),
+        }),
+        S::ImportingHistory { access, .. } => Some(S::ImportingHistory {
+            imported: 0,
+            total: None,
+            access: *access,
+        }),
+        S::ConnectingClients { .. } | S::Done { .. } => Some(state.clone()),
+        S::ChooseAccount { .. }
+        | S::EnterNumber
+        | S::SolveCaptcha { .. }
+        | S::EnterCode { .. }
+        | S::ChooseAccess { .. }
+        | S::Failed { .. } => None,
+    }
+}
+
+/// Re-enters `state`, re-issuing the command it waits on, if any.
+fn resume(state: &SetupState) -> (SetupState, Vec<Command>) {
+    use SetupState as S;
+
+    match state {
+        S::Linking { device_name, .. } => start_link(device_name),
+        S::ImportingHistory { access, .. } => import_history(*access),
+        S::ConnectingClients { access } => connect_clients(*access),
+        state => (state.clone(), Vec::new()),
     }
 }
 
@@ -266,6 +318,7 @@ fn connect_clients(access: AccessMode) -> (SetupState, Vec<Command>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     const DEVICE: &str = "Claude (Terrac's MacBook)";
 
@@ -634,5 +687,293 @@ mod tests {
                 Command::ConnectClients
             ]
         );
+    }
+
+    /// A failed command shows its message, and Retry resumes where the user can
+    /// act again: a fresh link, the number or code to correct, or the same work
+    /// re-run with the access choice still saved first.
+    #[test]
+    fn a_failed_command_retries_from_where_the_user_can_act() {
+        let full = AccessMode::Full;
+        let cases = [
+            (
+                linking(Some("sgnl://x")),
+                linking(None),
+                vec![Command::StartLink {
+                    device_name: DEVICE.into(),
+                }],
+            ),
+            (requesting(), SetupState::EnterNumber, vec![]),
+            (
+                SetupState::VerifyingCode {
+                    number: NUMBER.into(),
+                },
+                SetupState::EnterCode {
+                    number: NUMBER.into(),
+                },
+                vec![],
+            ),
+            (
+                SetupState::ImportingHistory {
+                    imported: 40,
+                    total: Some(100),
+                    access: full,
+                },
+                SetupState::ImportingHistory {
+                    imported: 0,
+                    total: None,
+                    access: full,
+                },
+                vec![Command::ImportHistory],
+            ),
+            (
+                SetupState::ConnectingClients { access: full },
+                SetupState::ConnectingClients { access: full },
+                vec![
+                    Command::SaveAccess { access: full },
+                    Command::ConnectClients,
+                ],
+            ),
+            (
+                SetupState::Done {
+                    clients: outcomes(),
+                },
+                SetupState::Done {
+                    clients: outcomes(),
+                },
+                vec![],
+            ),
+        ];
+        for (waiting, resumed, rerun) in cases {
+            let (failed, commands) = transition(
+                &waiting,
+                SetupEvent::CommandFailed {
+                    message: "network down".into(),
+                },
+            );
+            let SetupState::Failed { message, .. } = &failed else {
+                panic!("{waiting:?} did not fail: {failed:?}");
+            };
+            assert_eq!(message, "network down");
+            assert!(commands.is_empty(), "{commands:?}");
+
+            let (state, commands) = transition(&failed, SetupEvent::Retry);
+            assert_eq!(state, resumed, "retry from {waiting:?}");
+            assert_eq!(commands, rerun, "retry from {waiting:?}");
+        }
+    }
+
+    fn every_event() -> Vec<SetupEvent> {
+        use SetupEvent as E;
+        vec![
+            E::AccountChosen {
+                choice: AccountChoice::LinkExisting,
+            },
+            E::AccountChosen {
+                choice: AccountChoice::OwnNumber,
+            },
+            E::LinkUri {
+                uri: "sgnl://y".into(),
+            },
+            E::Linked,
+            E::NumberEntered {
+                number: NUMBER.into(),
+            },
+            E::CaptchaRequired,
+            E::CaptchaSolved { token: "t".into() },
+            E::CodeSent,
+            E::CodeEntered { code: "1".into() },
+            E::Registered,
+            E::AccessChosen {
+                access: AccessMode::Full,
+            },
+            E::HistoryProgress {
+                imported: 1,
+                total: None,
+            },
+            E::HistoryDone,
+            E::ClientsConnected { clients: vec![] },
+            E::RestartDesktop,
+            E::CommandFailed {
+                message: "boom".into(),
+            },
+            E::Retry,
+        ]
+    }
+
+    /// Events that don't belong to a state (a late reply, a double click, a
+    /// confused driver) must leave it untouched and run nothing, in every state.
+    #[test]
+    fn events_that_do_not_belong_to_a_state_leave_it_untouched() {
+        use SetupEvent as E;
+        use std::mem::discriminant;
+
+        let failed = SetupState::Failed {
+            message: "boom".into(),
+            retry: Box::new(SetupState::EnterNumber),
+        };
+        let failure = E::CommandFailed {
+            message: String::new(),
+        };
+        let accepts: Vec<(SetupState, Vec<E>)> = vec![
+            (
+                start(),
+                vec![E::AccountChosen {
+                    choice: AccountChoice::OwnNumber,
+                }],
+            ),
+            (
+                linking(None),
+                vec![
+                    E::LinkUri { uri: String::new() },
+                    E::Linked,
+                    failure.clone(),
+                ],
+            ),
+            (
+                SetupState::EnterNumber,
+                vec![E::NumberEntered {
+                    number: String::new(),
+                }],
+            ),
+            (
+                requesting(),
+                vec![E::CaptchaRequired, E::CodeSent, failure.clone()],
+            ),
+            (
+                SetupState::SolveCaptcha {
+                    number: NUMBER.into(),
+                },
+                vec![E::CaptchaSolved {
+                    token: String::new(),
+                }],
+            ),
+            (
+                SetupState::EnterCode {
+                    number: NUMBER.into(),
+                },
+                vec![E::CodeEntered {
+                    code: String::new(),
+                }],
+            ),
+            (
+                SetupState::VerifyingCode {
+                    number: NUMBER.into(),
+                },
+                vec![E::Registered, failure.clone()],
+            ),
+            (
+                SetupState::ChooseAccess {
+                    kind: ProfileKind::Linked,
+                },
+                vec![E::AccessChosen {
+                    access: AccessMode::Full,
+                }],
+            ),
+            (
+                SetupState::ImportingHistory {
+                    imported: 0,
+                    total: None,
+                    access: AccessMode::Full,
+                },
+                vec![
+                    E::HistoryProgress {
+                        imported: 0,
+                        total: None,
+                    },
+                    E::HistoryDone,
+                    failure.clone(),
+                ],
+            ),
+            (
+                SetupState::ConnectingClients {
+                    access: AccessMode::Full,
+                },
+                vec![E::ClientsConnected { clients: vec![] }, failure.clone()],
+            ),
+            (
+                SetupState::Done { clients: vec![] },
+                vec![E::RestartDesktop, failure.clone()],
+            ),
+            (failed, vec![E::Retry]),
+        ];
+        for (state, accepted) in accepts {
+            for event in every_event() {
+                if accepted
+                    .iter()
+                    .any(|a| discriminant(a) == discriminant(&event))
+                {
+                    continue;
+                }
+                let (next, commands) = transition(&state, event.clone());
+                assert_eq!(next, state, "{event:?} changed {state:?}");
+                assert!(
+                    commands.is_empty(),
+                    "{event:?} in {state:?} ran {commands:?}"
+                );
+            }
+        }
+    }
+
+    fn any_event() -> impl Strategy<Value = SetupEvent> {
+        use SetupEvent as E;
+        let text = prop_oneof![Just(String::new()), Just(" ".to_owned()), ".{0,12}"];
+        let access = prop_oneof![Just(AccessMode::Full), Just(AccessMode::ReadOnly)];
+        prop_oneof![
+            prop_oneof![
+                Just(AccountChoice::LinkExisting),
+                Just(AccountChoice::OwnNumber)
+            ]
+            .prop_map(|choice| E::AccountChosen { choice }),
+            text.clone().prop_map(|uri| E::LinkUri { uri }),
+            Just(E::Linked),
+            text.clone().prop_map(|number| E::NumberEntered { number }),
+            Just(E::CaptchaRequired),
+            text.clone().prop_map(|token| E::CaptchaSolved { token }),
+            Just(E::CodeSent),
+            text.clone().prop_map(|code| E::CodeEntered { code }),
+            Just(E::Registered),
+            access.prop_map(|access| E::AccessChosen { access }),
+            (any::<u64>(), any::<Option<u64>>())
+                .prop_map(|(imported, total)| E::HistoryProgress { imported, total }),
+            Just(E::HistoryDone),
+            Just(E::ClientsConnected { clients: vec![] }),
+            Just(E::RestartDesktop),
+            text.prop_map(|message| E::CommandFailed { message }),
+            Just(E::Retry),
+        ]
+    }
+
+    proptest! {
+        /// No sequence of events, however nonsensical, may panic the machine or
+        /// connect a client before the user chose an access mode and it was saved.
+        #[test]
+        fn clients_never_connect_before_access_is_chosen_and_saved(
+            events in prop::collection::vec(any_event(), 0..80)
+        ) {
+            let mut state = start();
+            let mut chosen = None;
+            for event in events {
+                if let (SetupState::ChooseAccess { .. }, SetupEvent::AccessChosen { access }) =
+                    (&state, &event)
+                {
+                    chosen = Some(*access);
+                }
+                let (next, commands) = transition(&state, event.clone());
+                if let Some(i) = commands.iter().position(|c| *c == Command::ConnectClients) {
+                    let Some(access) = chosen else {
+                        panic!("{event:?} in {state:?} connected clients before an access choice");
+                    };
+                    prop_assert!(
+                        i > 0 && commands.get(i - 1) == Some(&Command::SaveAccess { access }),
+                        "{event:?} in {state:?} connected without saving {access:?} first: {commands:?}"
+                    );
+                }
+                if matches!(next, SetupState::ConnectingClients { .. } | SetupState::Done { .. }) {
+                    prop_assert!(chosen.is_some(), "reached {next:?} without an access choice");
+                }
+                state = next;
+            }
+        }
     }
 }
