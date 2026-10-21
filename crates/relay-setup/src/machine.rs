@@ -138,6 +138,38 @@ pub fn transition(state: &SetupState, event: SetupEvent) -> (SetupState, Vec<Com
                 choice: AccountChoice::LinkExisting,
             },
         ) => start_link(device_name),
+        (S::Linking { device_name, .. }, E::LinkUri { uri }) => (
+            S::Linking {
+                device_name: device_name.clone(),
+                uri: Some(uri),
+            },
+            Vec::new(),
+        ),
+        (S::Linking { .. }, E::Linked) => (
+            S::ChooseAccess {
+                kind: ProfileKind::Linked,
+            },
+            Vec::new(),
+        ),
+        (
+            S::ChooseAccess {
+                kind: ProfileKind::Linked,
+            },
+            E::AccessChosen { access },
+        ) => import_history(access),
+        (S::ImportingHistory { access, .. }, E::HistoryProgress { imported, total }) => (
+            S::ImportingHistory {
+                imported,
+                total,
+                access: *access,
+            },
+            Vec::new(),
+        ),
+        (S::ImportingHistory { access, .. }, E::HistoryDone) => connect_clients(*access),
+        (S::ConnectingClients { .. }, E::ClientsConnected { clients }) => {
+            (S::Done { clients }, Vec::new())
+        }
+        (S::Done { .. }, E::RestartDesktop) => (state.clone(), vec![Command::RestartDesktop]),
         (state, _) => (state.clone(), Vec::new()),
     }
 }
@@ -151,6 +183,27 @@ fn start_link(device_name: &str) -> (SetupState, Vec<Command>) {
         vec![Command::StartLink {
             device_name: device_name.to_owned(),
         }],
+    )
+}
+
+fn import_history(access: AccessMode) -> (SetupState, Vec<Command>) {
+    (
+        SetupState::ImportingHistory {
+            imported: 0,
+            total: None,
+            access,
+        },
+        vec![Command::ImportHistory],
+    )
+}
+
+// NOTE: SaveAccess must come first. The driver runs commands in order, and a
+// client connecting before the mode is saved would see a read-only profile's
+// write tools.
+fn connect_clients(access: AccessMode) -> (SetupState, Vec<Command>) {
+    (
+        SetupState::ConnectingClients { access },
+        vec![Command::SaveAccess { access }, Command::ConnectClients],
     )
 }
 
@@ -187,5 +240,164 @@ mod tests {
                 device_name: DEVICE.into()
             }]
         );
+    }
+
+    fn linking(uri: Option<&str>) -> SetupState {
+        SetupState::Linking {
+            device_name: DEVICE.into(),
+            uri: uri.map(Into::into),
+        }
+    }
+
+    /// The QR code expires, so each new URI must replace the shown one without
+    /// starting another link session.
+    #[test]
+    fn a_refreshed_link_uri_replaces_the_qr_without_restarting_the_link() {
+        for before in [None, Some("sgnl://old")] {
+            let (state, commands) = transition(
+                &linking(before),
+                SetupEvent::LinkUri {
+                    uri: "sgnl://new".into(),
+                },
+            );
+            assert_eq!(state, linking(Some("sgnl://new")), "from {before:?}");
+            assert!(commands.is_empty(), "restarted the link: {commands:?}");
+        }
+    }
+
+    /// A linked device goes to the access choice next, remembering it is linked
+    /// so history import follows.
+    #[test]
+    fn a_scanned_link_asks_for_access_as_a_linked_device() {
+        let (state, commands) = transition(&linking(Some("sgnl://x")), SetupEvent::Linked);
+        assert_eq!(
+            state,
+            SetupState::ChooseAccess {
+                kind: ProfileKind::Linked
+            }
+        );
+        assert!(commands.is_empty(), "{commands:?}");
+    }
+
+    /// A linked device imports history after the access choice, carrying the
+    /// choice forward so it is saved before any client connects.
+    #[test]
+    fn a_linked_device_imports_history_after_choosing_access() {
+        for access in [AccessMode::Full, AccessMode::ReadOnly] {
+            let (state, commands) = transition(
+                &SetupState::ChooseAccess {
+                    kind: ProfileKind::Linked,
+                },
+                SetupEvent::AccessChosen { access },
+            );
+            assert_eq!(
+                state,
+                SetupState::ImportingHistory {
+                    imported: 0,
+                    total: None,
+                    access
+                }
+            );
+            assert_eq!(commands, vec![Command::ImportHistory]);
+        }
+    }
+
+    /// Progress updates the counts the UI shows and keeps the access choice.
+    #[test]
+    fn history_progress_updates_counts_and_keeps_the_access_choice() {
+        let importing = SetupState::ImportingHistory {
+            imported: 0,
+            total: None,
+            access: AccessMode::ReadOnly,
+        };
+        let (state, commands) = transition(
+            &importing,
+            SetupEvent::HistoryProgress {
+                imported: 40,
+                total: Some(100),
+            },
+        );
+        assert_eq!(
+            state,
+            SetupState::ImportingHistory {
+                imported: 40,
+                total: Some(100),
+                access: AccessMode::ReadOnly
+            }
+        );
+        assert!(commands.is_empty(), "{commands:?}");
+    }
+
+    /// The access mode must be saved before any client can connect, or a client
+    /// could reach a read-only profile's write tools in the gap.
+    #[test]
+    fn finished_history_saves_access_before_connecting_clients() {
+        let importing = SetupState::ImportingHistory {
+            imported: 100,
+            total: Some(100),
+            access: AccessMode::ReadOnly,
+        };
+        let (state, commands) = transition(&importing, SetupEvent::HistoryDone);
+        assert_eq!(
+            state,
+            SetupState::ConnectingClients {
+                access: AccessMode::ReadOnly
+            }
+        );
+        assert_eq!(
+            commands,
+            vec![
+                Command::SaveAccess {
+                    access: AccessMode::ReadOnly
+                },
+                Command::ConnectClients
+            ]
+        );
+    }
+
+    fn outcomes() -> Vec<ClientOutcome> {
+        vec![
+            ClientOutcome {
+                client: ClaudeClient::Code,
+                result: Ok(()),
+            },
+            ClientOutcome {
+                client: ClaudeClient::Desktop,
+                result: Err("config is not valid JSON".into()),
+            },
+        ]
+    }
+
+    /// Done shows each client's own outcome, so one client failing doesn't hide
+    /// that the other worked.
+    #[test]
+    fn connected_clients_finish_setup_with_each_outcome() {
+        let (state, commands) = transition(
+            &SetupState::ConnectingClients {
+                access: AccessMode::Full,
+            },
+            SetupEvent::ClientsConnected {
+                clients: outcomes(),
+            },
+        );
+        assert_eq!(
+            state,
+            SetupState::Done {
+                clients: outcomes()
+            }
+        );
+        assert!(commands.is_empty(), "{commands:?}");
+    }
+
+    /// The Restart Claude Desktop button stays on the done screen and asks the
+    /// driver to restart, since Desktop only reads its config at launch.
+    #[test]
+    fn restart_desktop_from_done_keeps_the_done_screen() {
+        let done = SetupState::Done {
+            clients: outcomes(),
+        };
+        let (state, commands) = transition(&done, SetupEvent::RestartDesktop);
+        assert_eq!(state, done);
+        assert_eq!(commands, vec![Command::RestartDesktop]);
     }
 }
