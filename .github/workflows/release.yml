@@ -188,7 +188,7 @@ jobs:
       - run: cargo build --release --locked -p signal-agent
       - name: Binary runs on glibc 2.31
         run: |
-          ldd --version | head -n1
+          ldd --version | sed -n 1p
           scripts/check-glibc.sh target/release/signal-agent 2.31
       - name: Package the CLI tarball
         run: |
