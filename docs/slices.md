@@ -6,7 +6,7 @@ How the PRD gets built by several agents at once without them colliding. The PRD
 
 1. **Contracts first, by one agent.** Wave 0 lands the whole workspace with every crate's public API, a fake Signal backend, stub implementations, and CI. After that, crate APIs change only through a small "contract change" PR that the integrating agent reviews and merges. Nobody edits another lane's API on the side.
 2. **One lane owns each path.** A lane edits only the paths listed for it below. Needing a change elsewhere means opening an issue or a contract-change PR, not editing it.
-3. **Worktree per agent, always.** Each agent works in its own `git worktree` on its own branch (`lane/<id>-<topic>`). `git fetch` before branching, rebase on the freshest `origin/main` before every push.
+3. **Worktree per agent, always.** Each agent works in its own `git worktree` on its own branch (`lane/<id>-<topic>`). `git fetch` before branching and before every push. Rebase onto the freshest `origin/main` only until the branch is first pushed; after that, bring base changes in with `git merge origin/main`. Never force-push.
 4. **Green or it doesn't merge.** Every PR must pass `cargo fmt -- --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` on macOS, Linux and Windows CI. Lanes test against `FakeSignal` and in-memory stubs, never a real Signal account.
 5. **Vertical inside the lane.** Each PR is one test plus the smallest general implementation that passes it, following the repo owner's TDD rules. No speculative features beyond the lane's acceptance.
 6. **Style.** Follow the Rust style guide given to every agent: two-tier errors (anyhow, plus `thiserror` only at a seam a caller matches on), no runtime unwraps, private modules with a curated `pub use` surface, a `//!` on each file, tests named for the invariant they pin, property tests at the registry.
@@ -42,7 +42,7 @@ signal-agent/
 Two decisions that every lane depends on:
 
 - The agent speaks MCP itself on its socket, so `signal-agent mcp` is just connect, start the agent if needed, then copy bytes between stdio and the socket. Tools execute in the agent, the only process holding the Signal connection (PRD goal 5). The HTTP front end serves the same MCP over HTTP. One protocol, three transports.
-- One SQLCipher for the whole binary. presage-store-sqlite links `libsqlite3-sys` 0.36 with `bundled-sqlcipher` through `sqlx` 0.9, and presage's workspace patches `libsqlite3-sys` to whisperfish's fork. Our message store (L2) uses the same `sqlx` 0.9 and `libsqlite3-sys` 0.36, and the root `Cargo.toml` carries the same `[patch.crates-io]` entry as presage at the pinned revision (added by L1, the first lane to pull presage in). Two SQLite builds can't link into one binary, so nobody adds `rusqlite` or a second `libsqlite3-sys`. `MessageStore` is async for the same reason.
+- One SQLCipher for the whole binary. presage-store-sqlite links `libsqlite3-sys` 0.36 with `bundled-sqlcipher` through `sqlx` 0.9, and presage's workspace patches `libsqlite3-sys` to whisperfish's fork. Our message store (L2) uses the same `sqlx` 0.9 and `libsqlite3-sys` 0.36, and the root `Cargo.toml` carries the same `[patch.crates-io]` entry as presage at the pinned revision (added by L1, the first lane to pull presage in). Two SQLite builds can't link into one binary, so nobody adds `rusqlite` or a second `libsqlite3-sys`. `MessageStore` is async for the same reason. Every crate that declares `libsqlite3-sys` uses exactly `features = ["bundled-sqlcipher-custom-crypto"]` with `sqlcipher-crypto-provider`, plus, under `[target.'cfg(windows)'.dependencies]`, `features = ["bundled-sqlcipher-vendored-openssl"]`, because at the pinned whisperfish revision SQLCipher's Windows build script requires OpenSSL (`OPENSSL_DIR`) even with custom crypto. Identical declarations everywhere keep the build independent of the dependency graph, since Cargo unifies features into one `libsqlite3-sys`. Windows ARM64 with vendored OpenSSL is unproven until a CI job builds the crates (not just the app) there.
 - Setup is a state machine in `relay-setup` with no UI code. The Tauri window and the Linux terminal flow are both thin renderers of its states, so setup behavior is tested once, without a UI.
 
 ## Lanes
@@ -84,6 +84,8 @@ Build against: relay-core types, the trait APIs as merged in L0, FakeSignal for 
 Deliver: <lane acceptance from its issue>. One failing test, then the smallest general code that
 passes it; repeat. Follow the Rust style guide you were given.
 Gates before every push: cargo fmt -- --check; cargo clippy --all-targets -- -D warnings; cargo test.
-Rebase on origin/main before pushing. Open a PR into main; no Co-Authored-By or generated-by lines.
+Before the first push, rebase on origin/main; after it, merge origin/main in instead (never force-push).
+Never search ~ or ~/Library (find/fd/rg/ls -R): it triggers macOS privacy prompts; use your worktree or exact paths.
+Open a PR into main; no Co-Authored-By or generated-by lines. Never merge PRs or delete branches.
 Report: what merged, which acceptance boxes are checked, anything blocked and on whom.
 ```
