@@ -1,6 +1,8 @@
 //! Uninstall as an ordered list of named steps, so the in-app button, the
 //! Windows uninstaller and the CLI remove the same things in the same order.
 
+use serde::{Deserialize, Serialize};
+
 use crate::claude::{Clients, ServerEntry};
 
 /// One named piece of cleanup.
@@ -20,6 +22,24 @@ impl<'a> Step<'a> {
     pub fn name(&self) -> &str {
         &self.name
     }
+}
+
+/// What one step did.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepOutcome {
+    pub name: String,
+    pub result: Result<(), String>,
+}
+
+/// Runs every step in order, carrying on past failures.
+pub fn run_steps(steps: Vec<Step<'_>>) -> Vec<StepOutcome> {
+    steps
+        .into_iter()
+        .map(|step| StepOutcome {
+            result: (step.action)().map_err(|e| format!("{e:#}")),
+            name: step.name,
+        })
+        .collect()
 }
 
 /// The cleanup for one profile: Claude entries first, then the caller's login
@@ -109,5 +129,34 @@ mod tests {
             }
             assert_eq!(names, expected, "delete={delete}");
         }
+    }
+
+    /// One failed step (a locked Keychain, say) must not leave the rest of the
+    /// install behind; every step runs and reports its own outcome.
+    #[test]
+    fn a_failed_step_does_not_stop_the_rest() {
+        let ran = RefCell::new(Vec::new());
+        let steps = vec![
+            Step::new("first", || anyhow::bail!("keychain locked")),
+            Step::new("second", || {
+                ran.borrow_mut().push("second");
+                Ok(())
+            }),
+        ];
+        let outcomes = run_steps(steps);
+        assert_eq!(*ran.borrow(), ["second"]);
+        assert_eq!(
+            outcomes,
+            vec![
+                StepOutcome {
+                    name: "first".into(),
+                    result: Err("keychain locked".into())
+                },
+                StepOutcome {
+                    name: "second".into(),
+                    result: Ok(())
+                },
+            ]
+        );
     }
 }
