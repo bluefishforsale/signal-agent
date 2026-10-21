@@ -19,7 +19,7 @@ use relay_core::prelude::*;
 use relay_store::MessageStore;
 use zkgroup::groups::{GroupMasterKey, GroupSecretParams};
 
-use crate::{ImportProgress, ImportSummary};
+use crate::{ImportProgress, ImportSummary, full_name};
 
 /// The 32-byte key the phone sends in the provisioning message when it offers
 /// to transfer history. Single-use; never persist it.
@@ -279,12 +279,6 @@ impl Importer<'_> {
         }
         Ok(())
     }
-}
-
-/// Given and family name joined, or None if both are empty.
-fn full_name(parts: [&str; 2]) -> Option<String> {
-    let parts: Vec<_> = parts.into_iter().filter(|p| !p.is_empty()).collect();
-    (!parts.is_empty()).then(|| parts.join(" "))
 }
 
 /// When a chat item arrived and whether it had been read.

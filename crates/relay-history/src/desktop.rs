@@ -12,7 +12,7 @@ use relay_store::MessageStore;
 use serde_json::Value;
 use sqlx::{ConnectOptions as _, sqlite::SqliteConnectOptions};
 
-use crate::{ImportProgress, ImportSummary, desktop_key};
+use crate::{ImportProgress, ImportSummary, desktop_key, full_name};
 
 /// Imports the messages in Signal Desktop's database under `signal_dir` (its
 /// data directory, holding `config.json` and `sql/db.sqlite`) into `store`.
@@ -47,6 +47,7 @@ pub async fn import_signal_desktop(
         .context("Signal Desktop's account has no ACI")?;
 
     let mut conversations = HashMap::new();
+    let mut titles = Vec::new();
     let mut rows = sqlx::query_as::<_, (String, String)>("SELECT id, json FROM conversations")
         .fetch(&mut conn);
     while let Some((id, json)) = rows
@@ -54,11 +55,22 @@ pub async fn import_signal_desktop(
         .await
         .context("reading Signal Desktop's conversations")?
     {
-        if let Some(recipient) = conversation(&parse(&json)?) {
-            conversations.insert(id, recipient);
+        let json = parse(&json)?;
+        let Some(recipient) = conversation(&json) else {
+            continue;
+        };
+        conversations.insert(id, recipient);
+        if let Some(title) = title(&json) {
+            titles.push((recipient, title));
         }
     }
     drop(rows);
+    for (recipient, title) in titles {
+        store
+            .set_title(recipient, &title)
+            .await
+            .with_context(|| format!("titling imported conversation {recipient:?}"))?;
+    }
 
     let mut summary = ImportSummary::default();
     let mut read = Vec::new();
@@ -114,6 +126,21 @@ fn conversation(json: &Value) -> Option<Recipient> {
         }
         _ => None,
     }
+}
+
+/// The name Desktop shows for a conversation: a group's name, or for a
+/// contact the user's nickname, then their address book name, then the
+/// contact's profile name.
+fn title(json: &Value) -> Option<String> {
+    let field = |key: &str| json.get(key).and_then(Value::as_str).unwrap_or_default();
+    [
+        full_name([field("nicknameGivenName"), field("nicknameFamilyName")]),
+        full_name([field("name"), ""]),
+        full_name([field("profileName"), field("profileFamilyName")]),
+    ]
+    .into_iter()
+    .flatten()
+    .next()
 }
 
 /// A Desktop message row as a relay-core message, if it's one a person sent.
@@ -516,5 +543,64 @@ mod tests {
                 sent_at_ms: 1_000
             })
         );
+    }
+
+    /// Imported conversations get Desktop's names: the user's nickname, then
+    /// their address book name, then the contact's profile name; a group's name.
+    #[tokio::test]
+    async fn conversations_are_titled_with_the_name_desktop_shows() {
+        let mut desktop = Desktop::new().await;
+        let contacts = [
+            (
+                "c1",
+                "00000000-0000-0000-0000-0000000000b1",
+                json!({ "nicknameGivenName": "Mom", "name": "Jane Doe", "profileName": "Jane" }),
+            ),
+            (
+                "c2",
+                "00000000-0000-0000-0000-0000000000b2",
+                json!({ "name": "Dad", "profileName": "John" }),
+            ),
+            (
+                "c3",
+                "00000000-0000-0000-0000-0000000000b3",
+                json!({ "profileName": "Alice", "profileFamilyName": "Liddell" }),
+            ),
+        ];
+        for (id, aci, mut names) in contacts {
+            names["type"] = json!("private");
+            names["serviceId"] = json!(aci);
+            desktop.conversation(id, names).await;
+            desktop
+                .message(
+                    &format!("m-{id}"),
+                    id,
+                    json!({ "type": "incoming", "sent_at": 1_000, "sourceServiceId": aci, "body": "hi" }),
+                )
+                .await;
+        }
+        desktop
+            .conversation(
+                "c-group",
+                json!({ "type": "group", "groupId": "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk=", "name": "Book club" }),
+            )
+            .await;
+        desktop
+            .message(
+                "m-group",
+                "c-group",
+                json!({ "type": "outgoing", "sent_at": 2_000, "body": "chapter 3?" }),
+            )
+            .await;
+        let (store, _) = desktop.import().await;
+        let mut titles: Vec<_> = store
+            .conversations()
+            .await
+            .expect("conversations")
+            .into_iter()
+            .map(|c| c.title)
+            .collect();
+        titles.sort();
+        assert_eq!(titles, vec!["Alice Liddell", "Book club", "Dad", "Mom"]);
     }
 }

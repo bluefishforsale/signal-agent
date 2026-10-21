@@ -24,3 +24,9 @@ pub struct ImportSummary {
     pub skipped: u64,
     pub already_stored: u64,
 }
+
+/// Given and family name joined, or None if both are empty.
+fn full_name(parts: [&str; 2]) -> Option<String> {
+    let parts: Vec<_> = parts.into_iter().filter(|p| !p.is_empty()).collect();
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
