@@ -17,7 +17,9 @@ impl Registry {
     /// Every tool this build ships.
     pub fn standard() -> Self {
         // Lanes L3b to L3e add their tools here.
-        Self::default().with(read::ListConversations)
+        Self::default()
+            .with(read::ListConversations)
+            .with(read::GetOwnNumber)
     }
 
     pub fn with(mut self, tool: impl Tool + 'static) -> Self {
