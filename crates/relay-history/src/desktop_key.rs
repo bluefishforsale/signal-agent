@@ -211,4 +211,21 @@ mod tests {
             .expect("decrypt");
         assert_eq!(key.0, DB_KEY);
     }
+
+    /// Older Windows builds DPAPI-protected the key directly and Local State
+    /// has no os_crypt key; then DPAPI alone recovers it.
+    #[test]
+    fn windows_value_without_a_local_state_key_is_raw_dpapi() {
+        let key = decrypt_windows(DB_KEY.as_bytes(), Some("{}"), no_dpapi).expect("decrypt");
+        assert_eq!(key.0, DB_KEY);
+    }
+
+    /// A Local State key without the "DPAPI" marker isn't something we know
+    /// how to unwrap; guessing would hand SQLCipher a wrong key.
+    #[test]
+    fn windows_local_state_key_without_the_dpapi_prefix_is_refused() {
+        let local_state = local_state_with(&hex(WINDOWS_GCM_KEY));
+        let result = decrypt_windows(&hex(WINDOWS_GCM_VECTOR), Some(&local_state), no_dpapi);
+        assert!(result.is_err(), "accepted an unmarked key: {result:?}");
+    }
 }
