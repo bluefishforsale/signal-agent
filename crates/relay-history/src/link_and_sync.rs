@@ -16,6 +16,7 @@ use libsignal_message_backup::{
 use protobuf::Message as _;
 use relay_core::prelude::*;
 use relay_store::MessageStore;
+use zkgroup::groups::{GroupMasterKey, GroupSecretParams};
 
 use crate::ImportProgress;
 
@@ -98,6 +99,7 @@ pub async fn import_link_and_sync(
 enum Peer {
     Me,
     Contact(ServiceId),
+    Group(GroupId),
 }
 
 /// Frames refer to recipients and chats by ids local to the archive, defined
@@ -130,6 +132,12 @@ impl Importer<'_> {
                 };
                 Peer::Contact(aci)
             }
+            Some(pb::recipient::Destination::Group(g)) => {
+                let Ok(master_key) = <[u8; 32]>::try_from(g.masterKey.as_slice()) else {
+                    return;
+                };
+                Peer::Group(group_id(master_key))
+            }
             _ => return,
         };
         self.recipients.insert(recipient.id, peer);
@@ -139,6 +147,7 @@ impl Importer<'_> {
         let conversation = match self.recipients.get(&chat.recipientId) {
             Some(Peer::Me) => Recipient::Contact(self.our_aci),
             Some(Peer::Contact(aci)) => Recipient::Contact(*aci),
+            Some(Peer::Group(id)) => Recipient::Group(*id),
             None => return,
         };
         self.chats.insert(chat.id, conversation);
@@ -148,7 +157,7 @@ impl Importer<'_> {
         let author = match self.recipients.get(&item.authorId) {
             Some(Peer::Me) => Some(self.our_aci),
             Some(Peer::Contact(aci)) => Some(*aci),
-            None => None,
+            Some(Peer::Group(_)) | None => None,
         };
         let (Some(author), Some(&conversation)) = (author, self.chats.get(&item.chatId)) else {
             self.summary.skipped += 1;
@@ -186,6 +195,15 @@ impl Importer<'_> {
         self.summary.imported += 1;
         Ok(())
     }
+}
+
+/// The group's public identifier. The master key is a secret, so it never
+/// leaves this function.
+fn group_id(master_key: [u8; 32]) -> GroupId {
+    GroupId::new(
+        GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key))
+            .get_group_identifier(),
+    )
 }
 
 fn service_id(bytes: &[u8]) -> Option<ServiceId> {
@@ -392,6 +410,25 @@ mod tests {
         out
     }
 
+    fn outgoing_text(chat_id: u64, sent: u64, body: &str) -> pb::ChatItem {
+        pb::ChatItem {
+            directionalDetails: Some(pb::chat_item::DirectionalDetails::Outgoing(
+                Default::default(),
+            )),
+            ..incoming_text(chat_id, SELF_ID, sent, body)
+        }
+    }
+
+    fn group(id: u64, master_key: [u8; 32]) -> pb::Frame {
+        recipient(
+            id,
+            pb::recipient::Destination::Group(pb::Group {
+                masterKey: master_key.to_vec(),
+                ..Default::default()
+            }),
+        )
+    }
+
     /// The point of link-and-sync: a text a contact sent before linking must
     /// land in the store under their conversation with its original timestamps.
     #[tokio::test]
@@ -426,5 +463,51 @@ mod tests {
             deleted: false,
         };
         assert_eq!(stored, vec![expected]);
+    }
+
+    /// What I sent to Alice belongs in Alice's conversation, attributed to me.
+    #[tokio::test]
+    async fn an_outgoing_text_is_mine_in_the_contacts_conversation() {
+        let (store, _) = import(vec![
+            self_recipient(),
+            contact(ALICE_ID, ALICE_ACI),
+            chat(ALICE_CHAT, ALICE_ID),
+            item(outgoing_text(ALICE_CHAT, 2_000, "on my way")),
+        ])
+        .await;
+        let stored = all_messages(&store).await;
+        let [m] = stored.as_slice() else {
+            panic!("expected one message, got {stored:?}");
+        };
+        assert_eq!(m.conversation, Recipient::Contact(aci(ALICE_ACI)));
+        assert_eq!((m.sender, m.from_me), (aci(OUR_ACI), true), "{m:?}");
+        assert_eq!(m.id.author, aci(OUR_ACI));
+    }
+
+    /// A group is keyed by the identifier derived from its master key, as live
+    /// messages are, and the master key itself (a secret) must never be the id.
+    #[tokio::test]
+    async fn group_messages_are_keyed_by_the_derived_group_identifier() {
+        let master_key = [9; 32];
+        let (store, _) = import(vec![
+            self_recipient(),
+            contact(ALICE_ID, ALICE_ACI),
+            group(3, master_key),
+            chat(11, 3),
+            item(incoming_text(11, ALICE_ID, 3_000, "group hello")),
+        ])
+        .await;
+        let expected = GroupId::new(
+            GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key))
+                .get_group_identifier(),
+        );
+        assert_ne!(
+            expected,
+            GroupId::new(master_key),
+            "identifier must not be the key"
+        );
+        let stored = all_messages(&store).await;
+        let conversations: Vec<_> = stored.iter().map(|m| m.conversation).collect();
+        assert_eq!(conversations, vec![Recipient::Group(expected)]);
     }
 }

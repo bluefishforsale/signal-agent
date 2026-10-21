@@ -4027,6 +4027,7 @@ dependencies = [
  "relay-store",
  "tokio",
  "uuid",
+ "zkgroup",
 ]
 
 [[package]]
