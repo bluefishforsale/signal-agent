@@ -3,7 +3,10 @@
 
 use anyhow::Context;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use presage::libsignal_service::prelude::ProtobufMessage;
+use presage::libsignal_service::prelude::{
+    ProtobufMessage,
+    phonenumber::{self, PhoneNumber},
+};
 use presage::{
     libsignal_service::{
         content::{Content, ContentBody},
@@ -236,6 +239,18 @@ pub(crate) fn content_body(
             timestamp: targets.iter().map(|t| t.sent_at_ms).collect(),
         }),
     }
+}
+
+pub(crate) fn contact_from(contact: &presage::model::contacts::Contact) -> crate::Contact {
+    crate::Contact {
+        service_id: ServiceId::new(contact.uuid),
+        name: Some(contact.name.clone()).filter(|name| !name.is_empty()),
+        phone_number: contact.phone_number.as_ref().map(e164),
+    }
+}
+
+pub(crate) fn e164(number: &PhoneNumber) -> String {
+    number.format().mode(phonenumber::Mode::E164).to_string()
 }
 
 fn aci(id: ServiceId) -> protocol::Aci {
@@ -782,6 +797,31 @@ mod tests {
         assert_eq!(
             typing.group_id,
             Some(group_id(master_key).as_bytes().to_vec())
+        );
+    }
+
+    /// Signal stores an unnamed contact as an empty name; tools must see no
+    /// name rather than a blank one, and the number in E.164.
+    #[test]
+    fn unnamed_contact_has_no_name_and_an_e164_number() {
+        let contact = presage::model::contacts::Contact {
+            uuid: ALICE,
+            phone_number: Some("+15550001111".parse().expect("valid number")),
+            name: String::new(),
+            verified: Default::default(),
+            profile_key: Vec::new(),
+            expire_timer: 0,
+            expire_timer_version: 2,
+            inbox_position: 0,
+            avatar: None,
+        };
+        assert_eq!(
+            contact_from(&contact),
+            crate::Contact {
+                service_id: ServiceId::new(ALICE),
+                name: None,
+                phone_number: Some("+15550001111".into()),
+            }
         );
     }
 }
