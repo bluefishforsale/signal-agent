@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use crate::{
     Tool, ToolContext, ToolError,
-    input::{Limit, parse},
+    input::{Limit, Offset, parse, recipient, recipient_schema},
 };
 
 pub struct ListConversations;
@@ -126,6 +126,62 @@ impl Tool for GetUnread {
     }
 }
 
+pub struct GetConversation;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GetConversationInput {
+    recipient: String,
+    #[serde(default)]
+    limit: Limit,
+    #[serde(default)]
+    offset: Offset,
+}
+
+#[async_trait]
+impl Tool for GetConversation {
+    fn name(&self) -> &'static str {
+        "get_conversation"
+    }
+    fn description(&self) -> &'static str {
+        "Read one conversation's history from the local store, oldest first. recipient comes \
+         from list_conversations. limit is the page size; offset skips the newest N to page \
+         back; has_more says whether older messages remain. Local only, nothing marked read."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "recipient": recipient_schema(),
+                "limit": Limit::schema(),
+                "offset": Offset::schema(),
+            },
+            "required": ["recipient"],
+            "additionalProperties": false,
+        })
+    }
+    fn writes(&self) -> bool {
+        false
+    }
+    async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
+        let input: GetConversationInput = parse(input)?;
+        let conversation = recipient(&input.recipient)?;
+        let (limit, offset) = (input.limit.get(), input.offset.get());
+        let newest_first = ctx
+            .store
+            .history(conversation, None, offset + limit + 1)
+            .await?;
+        let has_more = newest_first.len() > (offset + limit) as usize;
+        let mut messages: Vec<_> = newest_first
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect();
+        messages.reverse();
+        Ok(json!({ "messages": messages, "has_more": has_more }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
@@ -213,5 +269,29 @@ mod tests {
         let second = registry.call(&ctx, "get_unread", json!({})).await.unwrap();
         assert_eq!(bodies(&second["messages"]), ["a"], "{second}");
         assert_eq!(second["has_more"], json!(false), "{second}");
+    }
+
+    /// Paging back through a chat: offset skips the newest N, the page reads
+    /// oldest first, and other conversations never leak in.
+    #[tokio::test]
+    async fn get_conversation_pages_back_from_the_newest_and_reads_oldest_first() {
+        let (ctx, _) = ctx(AccessMode::ReadOnly, ProfileKind::Linked);
+        for (t, body) in [(100, "a"), (200, "b"), (300, "c"), (400, "d")] {
+            ctx.store.upsert(&incoming(2, t, body)).await.unwrap();
+        }
+        ctx.store
+            .upsert(&incoming(3, 250, "other chat"))
+            .await
+            .unwrap();
+        let out = Registry::standard()
+            .call(
+                &ctx,
+                "get_conversation",
+                json!({"recipient": sid(2).to_string(), "limit": 2, "offset": 1}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bodies(&out["messages"]), ["b", "c"], "{out}");
+        assert_eq!(out["has_more"], json!(true), "{out}");
     }
 }

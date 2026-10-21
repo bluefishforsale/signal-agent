@@ -22,6 +22,7 @@ impl Registry {
             .with(read::GetOwnNumber)
             .with(read::StoreStats)
             .with(read::GetUnread)
+            .with(read::GetConversation)
     }
 
     pub fn with(mut self, tool: impl Tool + 'static) -> Self {
