@@ -125,7 +125,7 @@ pub(crate) fn incoming(content: &Content, me: ServiceId) -> Option<Incoming> {
         from_me: sender == me,
         received_at_ms: millis(content),
         body: data.body.clone(),
-        attachments: Vec::new(),
+        attachments: data.attachments.iter().map(attachment_ref).collect(),
         quote: data.quote.as_ref().and_then(|quote| {
             Some(MessageId {
                 author: aci_of(
@@ -578,6 +578,46 @@ mod tests {
             prop_assert_eq!(&reference.file_name, &pointer.file_name);
             let back = attachment_pointer(&reference).expect("own id decodes");
             prop_assert_eq!(back, pointer);
+        }
+    }
+
+    /// Every attachment on a message must reach the agent, or a photo sent with
+    /// a caption would arrive as the caption alone.
+    #[test]
+    fn message_lists_every_attachment() {
+        let photo = AttachmentPointer {
+            content_type: Some("image/jpeg".into()),
+            size: Some(1234),
+            ..Default::default()
+        };
+        let content = content_from(
+            ALICE,
+            ContentBody::DataMessage(DataMessage {
+                timestamp: Some(70),
+                attachments: vec![photo.clone(), photo.clone()],
+                ..Default::default()
+            }),
+        );
+        let Some(Incoming::Message(message)) = incoming(&content, ServiceId::new(ME)) else {
+            panic!("not a message");
+        };
+        assert_eq!(
+            message.attachments,
+            vec![attachment_ref(&photo), attachment_ref(&photo)]
+        );
+    }
+
+    proptest! {
+        /// Attachment ids come back from MCP clients; garbage must be an error,
+        /// never a panic in the agent.
+        #[test]
+        fn attachment_id_garbage_is_an_error_not_a_panic(id in ".*") {
+            let _ = attachment_pointer(&AttachmentRef {
+                id,
+                content_type: String::new(),
+                file_name: None,
+                size: 0,
+            });
         }
     }
 }
