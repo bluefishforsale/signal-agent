@@ -169,10 +169,9 @@ impl Importer<'_> {
             self.summary.skipped += 1;
             return Ok(());
         };
-        let (received_at_ms, read) = match &item.directionalDetails {
-            Some(pb::chat_item::DirectionalDetails::Incoming(d)) => (d.dateReceived, d.read),
-            _ => (item.dateSent, false),
-        };
+        let (_, read) = arrival(&item);
+        let original = item.revisions.first().unwrap_or(&item);
+        let (received_at_ms, _) = arrival(original);
         let body = match &item.item {
             Some(pb::chat_item::Item::StandardMessage(m)) => {
                 m.text.as_ref().map(|t| t.body.clone())
@@ -182,7 +181,7 @@ impl Importer<'_> {
         let message = Message {
             id: MessageId {
                 author,
-                sent_at_ms: item.dateSent,
+                sent_at_ms: original.dateSent,
             },
             conversation,
             sender: author,
@@ -191,7 +190,7 @@ impl Importer<'_> {
             body,
             attachments: vec![],
             quote: None,
-            edited: false,
+            edited: !item.revisions.is_empty(),
             deleted: matches!(
                 item.item,
                 Some(pb::chat_item::Item::RemoteDeletedMessage(_))
@@ -206,6 +205,14 @@ impl Importer<'_> {
         }
         self.summary.imported += 1;
         Ok(())
+    }
+}
+
+/// When a chat item arrived and whether it had been read.
+fn arrival(item: &pb::ChatItem) -> (u64, bool) {
+    match &item.directionalDetails {
+        Some(pb::chat_item::DirectionalDetails::Incoming(d)) => (d.dateReceived, d.read),
+        _ => (item.dateSent, false),
     }
 }
 
@@ -596,5 +603,34 @@ mod tests {
             panic!("expected one message, got {stored:?}");
         };
         assert!(m.deleted && m.body.is_none(), "{m:?}");
+    }
+
+    /// An edited message carries its earlier versions as revisions and the
+    /// edit's own timestamp on top. It imports once, with the latest text, under
+    /// the original's timestamp, since that's what reactions and quotes target
+    /// (Signal-Desktop's importer does the same).
+    #[tokio::test]
+    async fn an_edited_message_imports_once_with_its_latest_text() {
+        let edited = pb::ChatItem {
+            revisions: vec![incoming_text(ALICE_CHAT, ALICE_ID, 1_000, "frist")],
+            ..incoming_text(ALICE_CHAT, ALICE_ID, 1_500, "first")
+        };
+        let (store, summary) = import(vec![
+            self_recipient(),
+            contact(ALICE_ID, ALICE_ACI),
+            chat(ALICE_CHAT, ALICE_ID),
+            item(edited),
+        ])
+        .await;
+        assert_eq!(summary.imported, 1, "{summary:?}");
+        let stored = all_messages(&store).await;
+        let [m] = stored.as_slice() else {
+            panic!("expected one message, got {stored:?}");
+        };
+        assert_eq!(
+            (m.body.as_deref(), m.edited),
+            (Some("first"), true),
+            "{m:?}"
+        );
     }
 }
