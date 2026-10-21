@@ -1,0 +1,401 @@
+name: release
+
+# A v* tag builds, signs and notarizes every installer into a draft GitHub
+# release (PRD goal 2). Manual runs never sign or publish: `dry-run` proves the
+# whole pipeline unsigned, `check-secrets` runs only the signing-input gate.
+#
+# NOTE: "signed" means `github.event_name == 'push'`, which the trigger limits to
+# v* tags. Signing secrets are referenced only in jobs bound to the `release`
+# environment, and every publishing path waits on the preflight secrets check.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: dry-run builds everything unsigned; check-secrets runs only the release gate
+        type: choice
+        options: [dry-run, check-secrets]
+        default: dry-run
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  TAURI_CLI: npx --yes @tauri-apps/cli@2.12.4
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    environment: ${{ (github.event_name == 'push' || inputs.mode == 'check-secrets') && 'release' || '' }}
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Every signing input is present
+        if: github.event_name == 'push' || inputs.mode == 'check-secrets'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          AZURE_SIGNING_ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          AZURE_SIGNING_ACCOUNT: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          AZURE_CERT_PROFILE: ${{ vars.AZURE_CERT_PROFILE }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: scripts/check-release-secrets.sh
+      - id: version
+        name: Tag matches the app and workspace versions
+        run: |
+          version=$(jq -r .version app/src-tauri/tauri.conf.json)
+          workspace=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          [[ "$version" == "$workspace" ]] || { echo "::error::tauri.conf.json is $version but Cargo.toml is $workspace"; exit 1; }
+          if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match app version $version"
+            exit 1
+          fi
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+
+  macos:
+    needs: preflight
+    if: inputs.mode != 'check-secrets'
+    runs-on: macos-latest
+    environment: ${{ github.event_name == 'push' && 'release' || '' }}
+    env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+      BUNDLE: target/universal-apple-darwin/release/bundle
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-universal-apple-darwin
+      - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - name: Signing keychain and notarization key
+        if: github.event_name == 'push'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: scripts/macos-signing-setup.sh
+      - name: Build, sign and notarize the app
+        if: github.event_name == 'push'
+        working-directory: app/src-tauri
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: $TAURI_CLI build --ci --target universal-apple-darwin --bundles app,dmg
+      - name: Build the app unsigned (dry run)
+        if: github.event_name != 'push'
+        working-directory: app/src-tauri
+        run: $TAURI_CLI build --ci --target universal-apple-darwin --bundles app,dmg
+      - name: Sign, notarize and staple the dmg
+        if: github.event_name == 'push'
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: |
+          dmg=$(echo "$BUNDLE"/dmg/*.dmg)
+          codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$dmg"
+          xcrun notarytool submit "$dmg" --key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" --wait
+          xcrun stapler staple "$dmg"
+      - name: Gatekeeper accepts the app and dmg
+        if: github.event_name == 'push'
+        run: |
+          app=$(echo "$BUNDLE"/macos/*.app)
+          dmg=$(echo "$BUNDLE"/dmg/*.dmg)
+          codesign --verify --deep --strict --verbose=2 "$app"
+          spctl --assess --type execute --verbose=2 "$app"
+          xcrun stapler validate "$app"
+          xcrun stapler validate "$dmg"
+          spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg"
+      - name: Package the dmg and updater payload
+        run: |
+          mkdir dist
+          cp "$BUNDLE"/dmg/*.dmg "dist/signal-agent-$VERSION-macos-universal.dmg"
+          COPYFILE_DISABLE=1 tar -czf "dist/signal-agent-$VERSION-macos-universal.app.tar.gz" -C "$BUNDLE/macos" "MCP Relay for Signal.app"
+          lipo -archs "$BUNDLE/macos/MCP Relay for Signal.app/Contents/MacOS/relay-app"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-macos-universal
+          path: dist/*
+          if-no-files-found: error
+
+  # Built inside Ubuntu 20.04 so the binary links against glibc 2.31, the
+  # oldest the PRD promises; a newer build host would silently raise the floor.
+  linux:
+    needs: preflight
+    if: inputs.mode != 'check-secrets'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    container: ubuntu:20.04
+    env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+    steps:
+      - name: Build tools
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            binutils build-essential ca-certificates clang cmake curl git pkg-config protobuf-compiler
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        run: |
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >>"$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-linux-${{ matrix.arch }}
+      - run: cargo build --release --locked -p signal-agent
+      - name: Binary runs on glibc 2.31
+        run: |
+          ldd --version | head -n1
+          scripts/check-glibc.sh target/release/signal-agent 2.31
+      - name: Package the CLI tarball
+        run: |
+          name="signal-agent-$VERSION-linux-${{ matrix.arch }}"
+          mkdir -p "stage/$name" dist
+          cp target/release/signal-agent LICENSE README.md "stage/$name/"
+          tar -czf "dist/$name.tar.gz" -C stage "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  # Windows signs in two passes because the signing action runs only on x64
+  # runners: the app exe is signed before NSIS packs it, then the installer.
+  windows-build:
+    needs: preflight
+    if: inputs.mode != 'check-secrets'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            arch: x64
+            target: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            arch: arm64
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - run: rustup target add ${{ matrix.target }}
+      - run: $TAURI_CLI build --ci --target ${{ matrix.target }} --no-bundle
+        working-directory: app/src-tauri
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-app-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/release/relay-app.exe
+          if-no-files-found: error
+
+  windows-sign-app:
+    needs: windows-build
+    if: github.event_name == 'push'
+    strategy:
+      matrix:
+        arch: [x64, arm64]
+    runs-on: windows-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-app-${{ matrix.arch }}
+          path: app-exe
+      - uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - uses: Azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.AZURE_CERT_PROFILE }}
+          files-folder: ${{ github.workspace }}\app-exe
+          files-folder-filter: exe
+          exclude-environment-credential: true
+      - run: ./scripts/verify-authenticode.ps1 -Folder app-exe
+        shell: pwsh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-app-${{ matrix.arch }}
+          path: app-exe/relay-app.exe
+          if-no-files-found: error
+          overwrite: true
+
+  windows-bundle:
+    needs: [preflight, windows-build, windows-sign-app]
+    if: >-
+      !cancelled() && needs.windows-build.result == 'success' &&
+      (needs.windows-sign-app.result == 'success' || github.event_name != 'push')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            arch: x64
+            target: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            arch: arm64
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-app-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/release
+      - run: $TAURI_CLI bundle --ci --target ${{ matrix.target }} --bundles nsis
+        working-directory: app/src-tauri
+      - name: Name the installer
+        run: |
+          mkdir dist
+          cp target/${{ matrix.target }}/release/bundle/nsis/*-setup.exe "dist/signal-agent-$VERSION-windows-${{ matrix.arch }}-setup.exe"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-windows-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  windows-sign-installer:
+    needs: windows-bundle
+    if: github.event_name == 'push'
+    strategy:
+      matrix:
+        arch: [x64, arm64]
+    runs-on: windows-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-windows-${{ matrix.arch }}
+          path: dist
+      - uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - uses: Azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.AZURE_CERT_PROFILE }}
+          files-folder: ${{ github.workspace }}\dist
+          files-folder-filter: exe
+          exclude-environment-credential: true
+      - run: ./scripts/verify-authenticode.ps1 -Folder dist
+        shell: pwsh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-windows-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+          overwrite: true
+
+  assemble:
+    needs: [preflight, macos, linux, windows-bundle, windows-sign-installer]
+    if: >-
+      !cancelled() && needs.macos.result == 'success' && needs.linux.result == 'success' &&
+      needs.windows-bundle.result == 'success' &&
+      (needs.windows-sign-installer.result == 'success' || github.event_name != 'push')
+    runs-on: ubuntu-latest
+    environment: ${{ github.event_name == 'push' && 'release' || '' }}
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+      BASE_URL: https://github.com/${{ github.repository }}/releases/download/v${{ needs.preflight.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - name: Updater signatures, latest.json and SHA256SUMS
+        if: github.event_name == 'push'
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: scripts/release-manifest.sh dist "$VERSION" "$BASE_URL"
+      - name: Updater signatures with a throwaway key, latest.json and SHA256SUMS (dry run)
+        if: github.event_name != 'push'
+        run: |
+          $TAURI_CLI signer generate --ci --password "" --write-keys "$RUNNER_TEMP/throwaway.key"
+          TAURI_SIGNING_PRIVATE_KEY_PATH="$RUNNER_TEMP/throwaway.key" TAURI_SIGNING_PRIVATE_KEY_PASSWORD="" \
+            scripts/release-manifest.sh dist "$VERSION" "$BASE_URL"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ github.event_name == 'push' && github.ref_name || 'dry-run' }}
+          path: dist/*
+          if-no-files-found: error
+      - name: Attach everything to a draft release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # A re-run refreshes an existing draft; a published release is never touched.
+          if [[ "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft 2>/dev/null)" == true ]]; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* --draft --verify-tag \
+              --title "MCP Relay for Signal $VERSION" --generate-notes
+          fi
