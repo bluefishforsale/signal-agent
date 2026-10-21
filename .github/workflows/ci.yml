@@ -28,6 +28,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+      # libsignal's message-backup (relay-history) and libsignal-service-rs
+      # (presage) generate their protobuf code with protoc at build time.
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
