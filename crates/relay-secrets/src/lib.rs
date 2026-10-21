@@ -8,6 +8,10 @@ mod key_file;
 #[cfg(target_os = "macos")]
 mod keychain;
 mod memory;
+// Only Linux can gain a keyring after falling back to the file; the unit
+// tests run wherever the file store exists.
+#[cfg(all(unix, any(target_os = "linux", test)))]
+mod migrating;
 #[cfg(target_os = "linux")]
 mod secret_service;
 
@@ -78,7 +82,10 @@ pub fn platform_store() -> anyhow::Result<Box<dyn SecretStore>> {
     return Ok(Box::new(DpapiFileStore::default()));
     #[cfg(target_os = "linux")]
     return Ok(match SecretServiceStore::connect(SERVICE) {
-        Ok(store) => Box::new(store),
+        Ok(store) => Box::new(migrating::MigratingStore::new(
+            Box::new(store),
+            Box::new(KeyFileStore::default()),
+        )),
         Err(_) => Box::new(KeyFileStore::default()),
     });
     #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
