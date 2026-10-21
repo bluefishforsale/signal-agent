@@ -3,18 +3,22 @@
 //! dedicated thread and the trait methods only pass work to it.
 
 use std::{
+    collections::BTreeMap,
     future::Future,
     path::Path,
     pin::Pin,
     sync::atomic::{AtomicBool, Ordering},
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, anyhow, bail};
 use async_trait::async_trait;
 use futures::{StreamExt, stream::BoxStream};
-use presage::{Manager, manager::Registered, model::messages::Received, store::ContentsStore};
+use presage::{
+    Manager, manager::Registered, model::messages::Received, proto::GroupContextV2,
+    store::ContentsStore,
+};
 use presage_store_sqlite::{OnNewIdentity, SqliteConnectOptions, SqliteStore};
 use relay_core::prelude::*;
 use tokio::sync::{mpsc, oneshot};
@@ -114,7 +118,21 @@ impl SignalBackend for PresageSignal {
     }
 
     async fn send(&self, to: Recipient, message: Outgoing) -> anyhow::Result<MessageId> {
-        bail!("not yet")
+        let me = self.account.service_id;
+        if let Outgoing::Edit { target, .. } | Outgoing::Delete { target } = &message
+            && target.author != me
+        {
+            bail!("Signal only edits and deletes your own messages; {target:?} is someone else's");
+        }
+        let sent_at_ms = now_ms()?;
+        let manager = self.manager.clone();
+        self.worker
+            .run(move || send(manager, to, message, sent_at_ms))
+            .await??;
+        Ok(MessageId {
+            author: me,
+            sent_at_ms,
+        })
     }
 
     async fn contacts(&self) -> anyhow::Result<Vec<Contact>> {
@@ -183,6 +201,72 @@ impl SignalBackend for PresageSignal {
         };
         futures::stream::once(start).flatten().boxed()
     }
+}
+
+async fn send(
+    mut manager: Manager<SqliteStore, Registered>,
+    to: Recipient,
+    message: Outgoing,
+    sent_at_ms: u64,
+) -> anyhow::Result<()> {
+    // Read receipts go to each message's author, wherever the messages were read.
+    if let Outgoing::ReadReceipt { targets } = &message {
+        let mut by_author: BTreeMap<ServiceId, Vec<MessageId>> = BTreeMap::new();
+        for target in targets {
+            by_author.entry(target.author).or_default().push(*target);
+        }
+        for (author, targets) in by_author {
+            let body = convert::content_body(&Outgoing::ReadReceipt { targets }, sent_at_ms, None);
+            manager
+                .send_message(convert::aci(author), body, sent_at_ms)
+                .await
+                .with_context(|| format!("unable to send read receipts to {author}"))?;
+        }
+        return Ok(());
+    }
+    match to {
+        Recipient::Contact(contact) => {
+            let body = convert::content_body(&message, sent_at_ms, None);
+            manager
+                .send_message(convert::aci(contact), body, sent_at_ms)
+                .await
+                .with_context(|| format!("unable to send to {contact}"))
+        }
+        Recipient::Group(id) => {
+            let (master_key, group) = group_by_id(manager.store(), id).await?;
+            let context = GroupContextV2 {
+                master_key: Some(master_key.to_vec()),
+                revision: Some(group.revision),
+                group_change: None,
+            };
+            let body = convert::content_body(&message, sent_at_ms, Some(&context));
+            manager
+                .send_message_to_group(&master_key, body, sent_at_ms)
+                .await
+                .with_context(|| format!("unable to send to group {id}"))
+        }
+    }
+}
+
+/// The cached group with public id `id`, with the master key sending needs.
+async fn group_by_id(
+    store: &SqliteStore,
+    id: GroupId,
+) -> anyhow::Result<([u8; 32], presage::model::groups::Group)> {
+    for group in store.groups().await.context("unable to list groups")? {
+        let (master_key, group) = group.context("unreadable group in the store")?;
+        if convert::group_id(master_key) == id {
+            return Ok((master_key, group));
+        }
+    }
+    bail!("not a member of group {id}")
+}
+
+fn now_ms() -> anyhow::Result<u64> {
+    let since_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before 1970")?;
+    u64::try_from(since_epoch.as_millis()).context("system clock is past the year 500 million")
 }
 
 /// Receives from Signal for as long as anyone holds the other end of `tx`,
@@ -441,6 +525,36 @@ mod tests {
             err.to_string().contains("attachment id"),
             "unclear error: {err:#}"
         );
+    }
+
+    /// Signal only honors edits and deletes of your own messages; asking for
+    /// someone else's must fail here, before a send the recipients would drop.
+    #[tokio::test]
+    async fn editing_or_deleting_someone_elses_message_is_refused() {
+        let (_dir, path) = temp_store();
+        register_linked(&path).await;
+        let signal = PresageSignal::open(&path, &KEY).await.expect("opens");
+        let alice = ServiceId::new(uuid::Uuid::from_u128(0xa11ce));
+        let theirs = MessageId {
+            author: alice,
+            sent_at_ms: 5,
+        };
+        for message in [
+            Outgoing::Edit {
+                target: theirs,
+                body: "rewritten".into(),
+            },
+            Outgoing::Delete { target: theirs },
+        ] {
+            let err = signal
+                .send(Recipient::Contact(alice), message.clone())
+                .await
+                .expect_err("sent an edit or delete of someone else's message");
+            assert!(
+                err.to_string().contains("your own"),
+                "{message:?} failed for the wrong reason: {err:#}"
+            );
+        }
     }
 
     /// The store must be unreadable without its key. If the SQLCipher build

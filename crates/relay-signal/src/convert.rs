@@ -283,7 +283,7 @@ pub(crate) fn e164(number: &PhoneNumber) -> String {
     number.format().mode(phonenumber::Mode::E164).to_string()
 }
 
-fn aci(id: ServiceId) -> protocol::Aci {
+pub(crate) fn aci(id: ServiceId) -> protocol::Aci {
     protocol::Aci::from_uuid_bytes(id.uuid().into_bytes())
 }
 
