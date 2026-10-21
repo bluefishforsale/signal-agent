@@ -2780,6 +2780,7 @@ dependencies = [
  "proptest",
  "relay-core",
  "serde",
+ "tempfile",
 ]
 
 [[package]]
