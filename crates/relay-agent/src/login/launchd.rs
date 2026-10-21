@@ -104,7 +104,10 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("launchd")
             .join(PLIST_NAME);
-        let plist = std::fs::read_to_string(&path).expect("plist next to the crate");
+        // Windows checkouts may convert line endings; the content is what matters.
+        let plist = std::fs::read_to_string(&path)
+            .expect("plist next to the crate")
+            .replace("\r\n", "\n");
         let label = PLIST_NAME.trim_end_matches(".plist");
         let default = relay_core::ProfileName::default_profile();
         for expected in [
