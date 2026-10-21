@@ -25,29 +25,50 @@ pub struct ClientOutcome {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum SetupState {
-    ChooseAccount,
+    /// `device_name` is what the phone will list this computer as once linked.
+    ChooseAccount {
+        device_name: String,
+    },
     /// `uri` is the current QR payload; `None` while the first one is coming.
     Linking {
+        device_name: String,
         uri: Option<String>,
     },
     EnterNumber,
+    /// Waiting for Signal to send a verification code, or ask for a captcha.
+    RequestingCode {
+        number: String,
+    },
     SolveCaptcha {
         number: String,
     },
     EnterCode {
         number: String,
     },
-    ChooseAccess,
+    /// Waiting for Signal to accept the verification code.
+    VerifyingCode {
+        number: String,
+    },
+    /// `kind` decides what follows: a linked device imports history, a new
+    /// number has none.
+    ChooseAccess {
+        kind: ProfileKind,
+    },
     ImportingHistory {
         imported: u64,
         total: Option<u64>,
+        access: AccessMode,
     },
-    ConnectingClients,
+    ConnectingClients {
+        access: AccessMode,
+    },
     Done {
         clients: Vec<ClientOutcome>,
     },
+    /// `retry` is the state a `Retry` event resumes from.
     Failed {
         message: String,
+        retry: Box<SetupState>,
     },
 }
 
@@ -68,7 +89,9 @@ pub enum SetupEvent {
     HistoryProgress { imported: u64, total: Option<u64> },
     HistoryDone,
     ClientsConnected { clients: Vec<ClientOutcome> },
+    RestartDesktop,
     CommandFailed { message: String },
+    Retry,
 }
 
 /// Side effects the driver performs.
@@ -90,16 +113,79 @@ pub enum Command {
     },
     ImportHistory,
     ConnectClients,
+    RestartDesktop,
+}
+
+impl SetupState {
+    /// Where setup begins on the computer called `computer_name`.
+    pub fn start(computer_name: &str) -> Self {
+        Self::ChooseAccount {
+            device_name: format!("Claude ({computer_name})"),
+        }
+    }
 }
 
 /// The next state and the commands to run, given the current state and an event.
+/// An event that makes no sense in the current state leaves it unchanged.
 pub fn transition(state: &SetupState, event: SetupEvent) -> (SetupState, Vec<Command>) {
-    // Lane L5 implements the transitions; until then every event fails visibly.
-    let _ = state;
+    use SetupEvent as E;
+    use SetupState as S;
+
+    match (state, event) {
+        (
+            S::ChooseAccount { device_name },
+            E::AccountChosen {
+                choice: AccountChoice::LinkExisting,
+            },
+        ) => start_link(device_name),
+        (state, _) => (state.clone(), Vec::new()),
+    }
+}
+
+fn start_link(device_name: &str) -> (SetupState, Vec<Command>) {
     (
-        SetupState::Failed {
-            message: format!("setup is not implemented yet (lane L5); got {event:?}"),
+        SetupState::Linking {
+            device_name: device_name.to_owned(),
+            uri: None,
         },
-        Vec::new(),
+        vec![Command::StartLink {
+            device_name: device_name.to_owned(),
+        }],
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DEVICE: &str = "Claude (Terrac's MacBook)";
+
+    fn start() -> SetupState {
+        SetupState::start("Terrac's MacBook")
+    }
+
+    /// Linking must tell the phone a readable device name, so the user can tell
+    /// this computer apart in Signal's linked-devices list.
+    #[test]
+    fn linking_starts_with_the_readable_device_name() {
+        let (state, commands) = transition(
+            &start(),
+            SetupEvent::AccountChosen {
+                choice: AccountChoice::LinkExisting,
+            },
+        );
+        assert_eq!(
+            state,
+            SetupState::Linking {
+                device_name: DEVICE.into(),
+                uri: None
+            }
+        );
+        assert_eq!(
+            commands,
+            vec![Command::StartLink {
+                device_name: DEVICE.into()
+            }]
+        );
+    }
 }

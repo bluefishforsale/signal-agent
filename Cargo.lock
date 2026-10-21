@@ -2777,6 +2777,7 @@ name = "relay-setup"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "proptest",
  "relay-core",
  "serde",
 ]
