@@ -5,6 +5,7 @@
 use std::{collections::HashMap, path::Path};
 
 use anyhow::Context;
+use base64::Engine as _;
 use futures::TryStreamExt as _;
 use relay_core::prelude::*;
 use relay_store::MessageStore;
@@ -91,6 +92,14 @@ fn parse(json: &str) -> anyhow::Result<Value> {
 fn conversation(json: &Value) -> Option<Recipient> {
     match json.get("type")?.as_str()? {
         "private" => Some(Recipient::Contact(service_id(json.get("serviceId")?)?)),
+        // Legacy v1 groups have 16-byte ids and no derived identifier; they
+        // can't take messages any more, so they're left out.
+        "group" => {
+            let id = base64::engine::general_purpose::STANDARD
+                .decode(json.get("groupId")?.as_str()?)
+                .ok()?;
+            Some(Recipient::Group(GroupId::new(id.try_into().ok()?)))
+        }
         _ => None,
     }
 }
@@ -322,6 +331,48 @@ mod tests {
                 Recipient::Contact(aci(ALICE_ACI))
             ),
             "{m:?}"
+        );
+    }
+
+    /// Desktop stores a group's derived identifier (base64), the same id
+    /// link-and-sync and live messages use, so all three agree on the group.
+    #[tokio::test]
+    async fn group_messages_use_the_same_group_id_as_link_and_sync() {
+        use zkgroup::groups::{GroupMasterKey, GroupSecretParams};
+        let identifier = GroupSecretParams::derive_from_master_key(GroupMasterKey::new([9; 32]))
+            .get_group_identifier();
+        let mut desktop = Desktop::new().await;
+        desktop
+            .conversation(
+                "c-group",
+                json!({
+                    "type": "group",
+                    "groupVersion": 2,
+                    "groupId": base64::engine::general_purpose::STANDARD.encode(identifier),
+                }),
+            )
+            .await;
+        desktop
+            .message(
+                "m1",
+                "c-group",
+                json!({
+                    "type": "incoming",
+                    "sent_at": 3_000,
+                    "sourceServiceId": ALICE_ACI,
+                    "body": "group hello",
+                }),
+            )
+            .await;
+        let (store, _) = desktop.import().await;
+        let conversations: Vec<_> = all_messages(&store)
+            .await
+            .iter()
+            .map(|m| m.conversation)
+            .collect();
+        assert_eq!(
+            conversations,
+            vec![Recipient::Group(GroupId::new(identifier))]
         );
     }
 }
