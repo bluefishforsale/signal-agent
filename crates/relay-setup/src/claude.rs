@@ -85,6 +85,27 @@ pub enum Unregistration {
     Foreign,
 }
 
+/// One client's state, as doctor reports it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientReport {
+    pub client: ClaudeClient,
+    pub status: ClientStatus,
+}
+
+/// Whether a client can launch this profile's server.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ClientStatus {
+    NotInstalled,
+    Registered,
+    Missing,
+    /// A different server holds this profile's name.
+    Foreign,
+    Unreadable {
+        error: String,
+    },
+}
+
 /// Whose entry, if any, a client has under a server's name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EntryStatus {
@@ -181,6 +202,29 @@ impl Clients {
                     Err(e) => Err(format!("{e:#}")),
                 };
                 ClientOutcome { client, result }
+            })
+            .collect()
+    }
+
+    /// What every Claude client has registered for `entry`.
+    pub fn doctor(&self, entry: &ServerEntry) -> Vec<ClientReport> {
+        let installed = self.detect();
+        [ClaudeClient::Code, ClaudeClient::Desktop]
+            .into_iter()
+            .map(|client| {
+                let status = if !installed.contains(&client) {
+                    ClientStatus::NotInstalled
+                } else {
+                    match self.status(client, entry) {
+                        Ok(EntryStatus::Ours) => ClientStatus::Registered,
+                        Ok(EntryStatus::Missing) => ClientStatus::Missing,
+                        Ok(EntryStatus::Foreign) => ClientStatus::Foreign,
+                        Err(e) => ClientStatus::Unreadable {
+                            error: format!("{e:#}"),
+                        },
+                    }
+                };
+                ClientReport { client, status }
             })
             .collect()
     }
@@ -1034,5 +1078,48 @@ mod tests {
             config["mcpServers"][entry().name]["command"],
             serde_json::json!(entry().command)
         );
+    }
+
+    /// Doctor reports both clients every time, so "not installed", "missing",
+    /// "someone else's", and "can't read the config" are each visible rather
+    /// than collapsing into one failure.
+    #[test]
+    fn doctor_reports_every_client_and_why() {
+        let m = machine(Platform::MacOs, false, true);
+        let path = m.desktop_dir.join("claude_desktop_config.json");
+        assert_eq!(
+            m.clients.doctor(&entry()),
+            vec![
+                ClientReport {
+                    client: ClaudeClient::Code,
+                    status: ClientStatus::NotInstalled
+                },
+                ClientReport {
+                    client: ClaudeClient::Desktop,
+                    status: ClientStatus::Missing
+                },
+            ]
+        );
+
+        m.clients
+            .register(ClaudeClient::Desktop, &entry())
+            .expect("register");
+        assert_eq!(
+            m.clients.doctor(&entry())[1].status,
+            ClientStatus::Registered
+        );
+
+        std::fs::write(
+            &path,
+            r#"{"mcpServers": {"signal-personal": {"command": "/opt/x"}}}"#,
+        )
+        .expect("seed");
+        assert_eq!(m.clients.doctor(&entry())[1].status, ClientStatus::Foreign);
+
+        std::fs::write(&path, "{").expect("seed");
+        let ClientStatus::Unreadable { error } = &m.clients.doctor(&entry())[1].status else {
+            panic!("broken config not reported as unreadable");
+        };
+        assert!(error.contains("claude_desktop_config.json"), "{error}");
     }
 }
