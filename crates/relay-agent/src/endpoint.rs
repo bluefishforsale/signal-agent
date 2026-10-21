@@ -6,3 +6,14 @@
 mod unix;
 #[cfg(unix)]
 pub use unix::{Listener, connect};
+
+use relay_core::{ProfileName, ProfilePaths};
+
+/// The endpoint name the agent for `profile` listens on and clients connect to.
+pub fn name(profile: &ProfileName, paths: &ProfilePaths) -> anyhow::Result<String> {
+    #[cfg(windows)]
+    let sid = Some(windows::current_user_sid()?);
+    #[cfg(not(windows))]
+    let sid: Option<String> = None;
+    paths.agent_endpoint(profile, sid.as_deref())
+}
