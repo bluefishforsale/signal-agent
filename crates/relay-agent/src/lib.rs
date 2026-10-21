@@ -62,13 +62,16 @@ impl Agent {
             registry: self.registry,
         };
         let capture = tokio::spawn(capture::run(self.signal, self.store));
-        let result = accept_loop(&listener, handler).await;
+        let result = accept_loop(listener, handler).await;
         capture.abort();
         result
     }
 }
 
-async fn accept_loop(listener: &endpoint::Listener, handler: mcp::Handler) -> anyhow::Result<()> {
+async fn accept_loop(
+    mut listener: endpoint::Listener,
+    handler: mcp::Handler,
+) -> anyhow::Result<()> {
     loop {
         let stream = listener.accept().await?;
         let handler = handler.clone();

@@ -6,6 +6,10 @@
 mod unix;
 #[cfg(unix)]
 pub use unix::{Listener, connect};
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub use windows::{Listener, connect};
 
 use relay_core::{ProfileName, ProfilePaths};
 

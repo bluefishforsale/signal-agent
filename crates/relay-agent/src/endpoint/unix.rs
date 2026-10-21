@@ -59,7 +59,7 @@ impl Listener {
 
     /// The next connection from this user. Connections from anyone else are
     /// closed and skipped, so a stranger can neither talk nor stop the agent.
-    pub async fn accept(&self) -> anyhow::Result<UnixStream> {
+    pub async fn accept(&mut self) -> anyhow::Result<UnixStream> {
         loop {
             let (stream, _) = self.inner.accept().await.context("accept failed")?;
             match stream.peer_cred() {
