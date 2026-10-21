@@ -31,6 +31,12 @@ presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "
 # store_refuses_to_open_with_the_wrong_key fails if encryption ever goes missing.
 libsqlite3-sys = { version = "0.36.0", features = ["bundled-sqlcipher-custom-crypto"] }
 
+# NOTE: at this libsqlite3-sys rev the Windows build.rs panics without
+# OPENSSL_DIR even with custom crypto, so Windows also vendors OpenSSL. relay-store
+# declares the same; keep the two identical (docs/slices.md).
+[target.'cfg(windows)'.dependencies]
+libsqlite3-sys = { version = "0.36.0", features = ["bundled-sqlcipher-vendored-openssl"] }
+
 [dev-dependencies]
 chrono = "0.4.45"
 getrandom.workspace = true
