@@ -7,7 +7,10 @@ use std::{
     future::Future,
     path::Path,
     pin::Pin,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -17,8 +20,11 @@ use async_trait::async_trait;
 use futures::{StreamExt, stream::BoxStream};
 use presage::{
     Manager,
-    libsignal_service::{configuration::SignalServers, provisioning::ProvisioningError},
-    manager::Registered,
+    libsignal_service::{
+        configuration::SignalServers, prelude::phonenumber::PhoneNumber,
+        provisioning::ProvisioningError,
+    },
+    manager::{Confirmation, Registered, RegistrationOptions},
     model::messages::Received,
     proto::GroupContextV2,
     store::{ContentsStore, StateStore},
@@ -223,6 +229,7 @@ pub struct PresageProvisioner {
     worker: Worker,
     store: SqliteStore,
     servers: SignalServers,
+    pending: Mutex<Option<Manager<SqliteStore, Confirmation>>>,
 }
 
 impl PresageProvisioner {
@@ -241,6 +248,7 @@ impl PresageProvisioner {
                 Servers::Production => SignalServers::Production,
                 Servers::Staging => SignalServers::Staging,
             },
+            pending: Mutex::new(None),
         })
     }
 }
@@ -270,7 +278,35 @@ impl Provisioner for PresageProvisioner {
         captcha: Option<&str>,
         voice: bool,
     ) -> anyhow::Result<RegistrationStep> {
-        bail!("not yet")
+        let phone_number: PhoneNumber = phone_number
+            .parse()
+            .with_context(|| format!("\"{phone_number}\" is not a phone number"))?;
+        let captcha = captcha.map(str::to_owned);
+        let (store, servers) = (self.store.clone(), self.servers);
+        let requested = self
+            .worker
+            .run(move || async move {
+                Manager::register(
+                    store,
+                    RegistrationOptions {
+                        signal_servers: servers,
+                        phone_number,
+                        use_voice_call: voice,
+                        captcha: captcha.as_deref(),
+                        force: false,
+                    },
+                )
+                .await
+            })
+            .await?;
+        match requested {
+            Ok(confirmation) => {
+                *self.pending.lock().expect("pending registration lock") = Some(confirmation);
+                Ok(RegistrationStep::CodeSent)
+            }
+            Err(presage::Error::CaptchaRequired) => Ok(RegistrationStep::CaptchaRequired),
+            Err(e) => Err(anyhow!(e).context("unable to request a verification code")),
+        }
     }
 
     async fn verify_code(&self, code: &str) -> anyhow::Result<RegistrationStep> {
@@ -710,6 +746,27 @@ mod tests {
         assert!(
             matches!(events.as_slice(), [Err(_)]),
             "linking over an account produced {events:?}"
+        );
+        let still = PresageSignal::open(&path, &KEY).await;
+        assert!(still.is_ok(), "the existing account was erased");
+    }
+
+    /// Registering a number over an existing account would orphan it; the
+    /// request must fail and leave the account in place.
+    #[tokio::test]
+    async fn registering_refuses_a_store_that_already_has_an_account() {
+        let (_dir, path) = temp_store();
+        register_linked(&path).await;
+        let provisioner = PresageProvisioner::open(&path, &KEY, Servers::Staging)
+            .await
+            .expect("opens");
+        let err = provisioner
+            .request_code("+15550000002", None, false)
+            .await
+            .expect_err("registered over an existing account");
+        assert!(
+            format!("{err:#}").contains("already"),
+            "failed for the wrong reason: {err:#}"
         );
         let still = PresageSignal::open(&path, &KEY).await;
         assert!(still.is_ok(), "the existing account was erased");
