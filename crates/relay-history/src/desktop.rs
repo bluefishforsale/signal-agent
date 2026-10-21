@@ -33,6 +33,18 @@ pub async fn import_signal_desktop(
         .await
         .with_context(|| format!("unable to open \"{}\"", db_path.display()))?;
 
+    let (our_aci,) = sqlx::query_as::<_, (String,)>("SELECT json FROM items WHERE id = 'uuid_id'")
+        .fetch_optional(&mut conn)
+        .await
+        .context("reading Signal Desktop's account")?
+        .context("Signal Desktop isn't linked to an account")?;
+    let our_aci = parse(&our_aci)?
+        .get("value")
+        .and_then(Value::as_str)
+        .and_then(|v| v.split('.').next())
+        .and_then(|aci| ServiceId::parse(aci).ok())
+        .context("Signal Desktop's account has no ACI")?;
+
     let mut conversations = HashMap::new();
     let mut rows = sqlx::query_as::<_, (String, String)>("SELECT id, json FROM conversations")
         .fetch(&mut conn);
@@ -57,7 +69,8 @@ pub async fn import_signal_desktop(
         .context("reading Signal Desktop's messages")?
     {
         let conversation = conversation_id.and_then(|id| conversations.get(&id).copied());
-        let Some(message) = conversation.and_then(|c| message(c, &parse(&json).ok()?)) else {
+        let Some(message) = conversation.and_then(|c| message(our_aci, c, &parse(&json).ok()?))
+        else {
             summary.skipped += 1;
             continue;
         };
@@ -83,10 +96,11 @@ fn conversation(json: &Value) -> Option<Recipient> {
 }
 
 /// A Desktop message row as a relay-core message, if it's one a person sent.
-fn message(conversation: Recipient, json: &Value) -> Option<Message> {
+fn message(our_aci: ServiceId, conversation: Recipient, json: &Value) -> Option<Message> {
     let sent_at_ms = json.get("sent_at")?.as_u64()?;
     let sender = match json.get("type")?.as_str()? {
         "incoming" => service_id(json.get("sourceServiceId")?)?,
+        "outgoing" => our_aci,
         _ => return None,
     };
     Some(Message {
@@ -96,7 +110,7 @@ fn message(conversation: Recipient, json: &Value) -> Option<Message> {
         },
         conversation,
         sender,
-        from_me: false,
+        from_me: sender == our_aci,
         received_at_ms: json
             .get("received_at_ms")
             .and_then(Value::as_u64)
@@ -269,5 +283,45 @@ mod tests {
             deleted: false,
         };
         assert_eq!(all_messages(&store).await, vec![expected]);
+    }
+
+    async fn with_alice() -> Desktop {
+        let mut desktop = Desktop::new().await;
+        desktop
+            .conversation(
+                "c-alice",
+                json!({ "type": "private", "serviceId": ALICE_ACI }),
+            )
+            .await;
+        desktop
+    }
+
+    /// Desktop doesn't store an author on what we sent; it's us, and our ACI
+    /// is in Desktop's items table.
+    #[tokio::test]
+    async fn an_outgoing_text_is_attributed_to_our_aci() {
+        let mut desktop = with_alice().await;
+        desktop
+            .message(
+                "m1",
+                "c-alice",
+                json!({ "type": "outgoing", "sent_at": 2_000, "body": "sent from desktop" }),
+            )
+            .await;
+        let (store, _) = desktop.import().await;
+        let stored = all_messages(&store).await;
+        let [m] = stored.as_slice() else {
+            panic!("expected one message, got {stored:?}");
+        };
+        assert_eq!(
+            (m.id.author, m.sender, m.from_me, m.conversation),
+            (
+                aci(OUR_ACI),
+                aci(OUR_ACI),
+                true,
+                Recipient::Contact(aci(ALICE_ACI))
+            ),
+            "{m:?}"
+        );
     }
 }
