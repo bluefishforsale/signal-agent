@@ -57,7 +57,7 @@ So the import needs exactly two inputs besides the file: the 32-byte ephemeral k
 IV (16 bytes) || AES-256-CBC(PKCS7, gzip(frames)) || HMAC-SHA256(hmac_key, IV || ciphertext) (32 bytes)
 ```
 
-This is the *legacy* layout: no `SBACKUP\x01` magic number and no forward-secrecy metadata, which only paid remote backups carry (`frame/forward_secrecy.rs:19`; Android only writes the magic number when it has forward-secrecy metadata, `EncryptedBackupWriter.kt:132-133`). The gzip payload may carry zero padding after the stream ends.
+This is the *legacy* layout: no `SBACKUP\x01` magic number and no forward-secrecy metadata, which only paid remote backups carry (`frame/forward_secrecy.rs:19`; Android only writes the magic number when it has forward-secrecy metadata, `EncryptedBackupWriter.kt:132-133`).
 
 Inside the gzip stream is a sequence of varint-length-delimited protobufs from `backup.proto`: first a `BackupInfo`, then `Frame`s, each holding one of `AccountData`, `Recipient`, `Chat`, `ChatItem`, `StickerPack`, `AdHocCall`, `NotificationProfile` or `ChatFolder`. Recipients and chats get file-local numeric ids; a `ChatItem` refers to its chat and its author by those ids. The export order puts each recipient and chat before the items that use them (**inferred** from the format's reference rules, which libsignal's validator enforces by failing on unknown references).
 
@@ -88,6 +88,10 @@ Mapping into relay-core:
 - `MessageId` is the author's ACI plus `dateSent`, which is what reactions, edits and deletes reference.
 - Messages whose author has no ACI (PNI-only or e164-only contacts, release notes) are skipped and counted.
 - Incoming messages the phone had read are marked read, so a fresh link doesn't show years of history as unread.
+- An edited message imports once, with its latest text, under the original's `dateSent`, since the archive's top-level `dateSent` is the edit's own (Signal-Desktop `ts/services/backups/import.preload.ts:1882-1908`, **verified**).
+- Chat events (`ChatUpdateMessage`: joins, timer changes, and so on) are skipped, not stored as empty messages.
+- Attachments are not imported yet, not even as metadata. Fetching one later needs its CDN key, decryption key and digest kept somewhere the agent can resolve, and `AttachmentRef::id` has no agreed meaning for that yet; that's a follow-up with L1.
+- The archive is decrypted into memory before frames are written, because libsignal's `FramesReader` isn't `Send`. Text-only archives keep that to tens of MB.
 
 ## What L1 needs to provide
 
