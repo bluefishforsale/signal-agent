@@ -19,7 +19,9 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 pub async fn run_stdio(profile: &ProfileName) -> anyhow::Result<()> {
     let paths = ProfilePaths::for_profile(profile)?;
     let name = endpoint::name(profile, &paths)?;
-    let agent = connect_or_spawn(&name, || spawn_agent(profile, &paths), AGENT_START_WAIT).await?;
+    let agent = connect_or_spawn(&name, || spawn_agent(profile, &paths), AGENT_START_WAIT)
+        .await
+        .with_context(|| format!("the agent's log is \"{}\"", paths.agent_log.display()))?;
     let client = tokio::io::join(tokio::io::stdin(), tokio::io::stdout());
     pipe(client, agent).await
 }

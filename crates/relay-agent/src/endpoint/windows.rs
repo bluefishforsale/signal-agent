@@ -257,9 +257,10 @@ mod tests {
     use tokio::io::AsyncReadExt;
     use windows_sys::Win32::Security::{
         Authorization::{
-            ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo, SE_KERNEL_OBJECT,
+            ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertStringSidToSidW,
+            GetSecurityInfo, SE_KERNEL_OBJECT,
         },
-        DACL_SECURITY_INFORMATION,
+        DACL_SECURITY_INFORMATION, PSID,
     };
 
     use super::*;
@@ -302,6 +303,22 @@ mod tests {
         sddl
     }
 
+    fn full_sid(sddl_trustee: &str) -> String {
+        let text = wide(sddl_trustee);
+        let mut sid: PSID = ptr::null_mut();
+        let ok = unsafe { ConvertStringSidToSidW(text.as_ptr(), &mut sid) };
+        assert_ne!(ok, 0, "not a SID or alias: {sddl_trustee}");
+        let mut out: *mut u16 = ptr::null_mut();
+        let ok = unsafe { ConvertSidToStringSidW(sid, &mut out) };
+        assert_ne!(ok, 0, "formatting {sddl_trustee} failed");
+        let full = unsafe { from_wide(out) };
+        unsafe {
+            LocalFree(out.cast());
+            LocalFree(sid);
+        }
+        full
+    }
+
     /// The pipe name and DACL must come from the token's SID, a real
     /// `S-1-...` string, never USERNAME or an empty fallback.
     #[test]
@@ -321,10 +338,14 @@ mod tests {
         let sddl = dacl_of(&listener.next);
         let sid = current_user_sid().expect("sid");
         assert_eq!(sddl.matches("(A;").count(), 1, "extra ACEs in {sddl}");
-        assert!(
-            sddl.contains(&format!(";;;{sid})")),
-            "ACE is not for {sid}: {sddl}"
-        );
+        // SDDL abbreviates well-known SIDs ("LA" for the built-in admin CI runs
+        // as), so compare the ACE's trustee as a full SID.
+        let trustee = sddl
+            .split(";;;")
+            .nth(1)
+            .and_then(|rest| rest.split(')').next())
+            .expect("an ACE trustee");
+        assert_eq!(full_sid(trustee), sid, "ACE is not for this user: {sddl}");
         assert!(sddl.starts_with("D:P"), "DACL inherits entries: {sddl}");
     }
 

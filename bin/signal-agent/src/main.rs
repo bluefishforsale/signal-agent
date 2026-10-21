@@ -5,6 +5,7 @@
 use anyhow::bail;
 use clap::{Parser, Subcommand};
 use relay_core::prelude::*;
+use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(name = "signal-agent", version, about = "MCP Relay for Signal")]
@@ -33,6 +34,14 @@ enum Cmd {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    // stderr only: in `mcp` mode stdout carries the protocol, and a detached
+    // agent's stderr is its log file.
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
     let profile = ProfileName::new(cli.profile)?;
     match cli.command {
         Cmd::Agent => {
