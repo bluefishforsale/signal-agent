@@ -3,7 +3,7 @@
 //! made themselves.
 
 use std::{
-    fs, io,
+    fmt, fs, io,
     path::{Path, PathBuf},
 };
 
@@ -19,6 +19,15 @@ use crate::ClientOutcome;
 pub enum ClaudeClient {
     Code,
     Desktop,
+}
+
+impl fmt::Display for ClaudeClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Code => "Claude Code",
+            Self::Desktop => "Claude Desktop",
+        })
+    }
 }
 
 /// How a client should launch this profile's server.
@@ -196,7 +205,7 @@ impl Clients {
                 let result = match self.register(client, entry) {
                     Ok(Registration::Added | Registration::Present) => Ok(()),
                     Ok(Registration::Foreign) => Err(format!(
-                        "{client:?} already has a different server named \"{}\"; it was left untouched",
+                        "{client} already has a different server named \"{}\"; it was left untouched",
                         entry.name
                     )),
                     Err(e) => Err(format!("{e:#}")),

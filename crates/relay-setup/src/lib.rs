@@ -4,8 +4,10 @@
 
 pub mod claude;
 mod machine;
+mod uninstall;
 
 pub use machine::{AccountChoice, ClientOutcome, Command, SetupEvent, SetupState, transition};
+pub use uninstall::{Step, uninstall_steps};
 
 pub mod prelude {
     pub use crate::{
