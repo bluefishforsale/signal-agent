@@ -176,7 +176,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            binutils build-essential ca-certificates clang cmake curl git pkg-config protobuf-compiler
+            binutils build-essential ca-certificates clang cmake curl git perl pkg-config protobuf-compiler
       - uses: actions/checkout@v4
       - name: Rust toolchain
         run: |
@@ -227,7 +227,10 @@ jobs:
         with:
           key: release-${{ matrix.target }}
       - run: rustup target add ${{ matrix.target }}
-      - run: $TAURI_CLI build --ci --target ${{ matrix.target }} --no-bundle
+      # NOTE: pwsh, like ci.yml, because vendored OpenSSL needs Strawberry Perl;
+      # under Git Bash the msys perl comes first on PATH and its build fails.
+      - run: Invoke-Expression "$env:TAURI_CLI build --ci --target ${{ matrix.target }} --no-bundle"
+        shell: pwsh
         working-directory: app/src-tauri
       - uses: actions/upload-artifact@v4
         with:
