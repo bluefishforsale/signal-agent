@@ -2,13 +2,112 @@
 //! starts the agent and copies bytes, so any number of clients share the one
 //! process that holds the Signal connection.
 
-use relay_core::ProfileName;
+use std::{
+    fs::OpenOptions,
+    path::Path,
+    process::{Command, Stdio},
+    time::{Duration, Instant},
+};
+
+use anyhow::Context;
+use relay_agent::endpoint;
+use relay_core::{ProfileName, ProfilePaths};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 /// Serves MCP on stdin/stdout by connecting to the profile's agent (starting
 /// it if needed) and copying bytes both ways.
 pub async fn run_stdio(profile: &ProfileName) -> anyhow::Result<()> {
-    anyhow::bail!("stdio front end for \"{profile}\" is not implemented yet (lane L4)")
+    let paths = ProfilePaths::for_profile(profile)?;
+    let name = endpoint::name(profile, &paths)?;
+    let agent = connect_or_spawn(&name, || spawn_agent(profile, &paths), AGENT_START_WAIT).await?;
+    let client = tokio::io::join(tokio::io::stdin(), tokio::io::stdout());
+    pipe(client, agent).await
+}
+
+/// How long a cold agent gets to open its stores and bind before the shim
+/// gives up. Opening SQLCipher and presage dominates.
+const AGENT_START_WAIT: Duration = Duration::from_secs(15);
+
+/// Starts `signal-agent agent` for `profile` as a detached background process
+/// that outlives this shim, logging to the profile's agent log.
+// NOTE: this assumes the shim runs from the signal-agent binary itself, which
+// is what Claude clients are registered to launch.
+fn spawn_agent(profile: &ProfileName, paths: &ProfilePaths) -> anyhow::Result<()> {
+    let exe = std::env::current_exe().context("unable to locate the signal-agent executable")?;
+    create_private_dir(&paths.root)?;
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&paths.agent_log)
+        .with_context(|| format!("unable to open \"{}\"", paths.agent_log.display()))?;
+    let mut command = Command::new(&exe);
+    command
+        .args(["agent", "--profile", profile])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(log);
+    detach(&mut command);
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("unable to start \"{}\" agent", exe.display()))?;
+    // Reap the agent if it exits while this shim is still running.
+    std::thread::spawn(move || child.wait());
+    Ok(())
+}
+
+#[cfg(unix)]
+fn detach(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // Its own process group, so signals aimed at the client's group (Claude
+    // quitting) don't take the shared agent down with this shim.
+    command.process_group(0);
+}
+
+#[cfg(windows)]
+fn detach(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+}
+
+#[cfg(unix)]
+fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .with_context(|| format!("unable to create \"{}\"", dir.display()))
+}
+
+#[cfg(windows)]
+fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
+    // %LOCALAPPDATA% is already private to the user.
+    std::fs::create_dir_all(dir).with_context(|| format!("unable to create \"{}\"", dir.display()))
+}
+
+/// Connects to the agent at `endpoint`, calling `spawn` to start it if nobody
+/// is listening, then waiting up to `wait` for it to come up.
+async fn connect_or_spawn(
+    endpoint: &str,
+    spawn: impl FnOnce() -> anyhow::Result<()>,
+    wait: Duration,
+) -> anyhow::Result<impl AsyncRead + AsyncWrite> {
+    if let Ok(agent) = endpoint::connect(endpoint).await {
+        return Ok(agent);
+    }
+    spawn()?;
+    let deadline = Instant::now() + wait;
+    loop {
+        match endpoint::connect(endpoint).await {
+            Ok(agent) => return Ok(agent),
+            Err(e) if Instant::now() >= deadline => {
+                return Err(e.context(format!("the agent did not come up within {wait:?}")));
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
 }
 
 /// Copies bytes between a client and the agent until the agent hangs up.
@@ -46,7 +145,7 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use async_trait::async_trait;
-    use relay_agent::{Agent, endpoint};
+    use relay_agent::Agent;
     use relay_core::prelude::*;
     use relay_signal::{Account, FakeSignal, Outgoing};
     use relay_store::MemoryStore;
@@ -104,6 +203,84 @@ mod tests {
         ().serve(client_io)
             .await
             .expect("initialize through the shim")
+    }
+
+    /// With no agent running, the shim must start one and connect once it is up,
+    /// since Claude may launch the shim before the login item has run.
+    #[tokio::test]
+    async fn a_missing_agent_is_spawned_and_waited_for() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let name = test_endpoint(tmp.path());
+        let (bound_tx, bound_rx) = std::sync::mpsc::channel();
+        let spawn_name = name.clone();
+        let spawn = move || {
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let mut listener = endpoint::Listener::bind(&spawn_name).await.expect("bind");
+                bound_tx.send(()).expect("report bind");
+                loop {
+                    let _ = listener.accept().await;
+                }
+            });
+            Ok(())
+        };
+        let connected = connect_or_spawn(&name, spawn, Duration::from_secs(5)).await;
+        assert!(connected.is_ok(), "never connected: {:?}", connected.err());
+        assert!(
+            bound_rx.try_recv().is_ok(),
+            "connected before the agent existed"
+        );
+    }
+
+    /// If the agent never comes up, the shim must give up within its bound with
+    /// an error naming the endpoint, not hang Claude's tool list forever.
+    #[tokio::test]
+    async fn an_agent_that_never_starts_fails_within_the_bound() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let name = test_endpoint(tmp.path());
+        let started = std::time::Instant::now();
+        let result = connect_or_spawn(&name, || Ok(()), Duration::from_millis(300)).await;
+        let Err(e) = result else {
+            panic!("connected to an agent that never started")
+        };
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "waited {:?}",
+            started.elapsed()
+        );
+        assert!(
+            format!("{e:#}").contains("did not come up"),
+            "unclear error: {e:#}"
+        );
+    }
+
+    /// A running agent must be reused; spawning another would only fail to
+    /// bind, and on a slow machine would race the live one.
+    #[tokio::test]
+    async fn a_running_agent_is_reused_without_spawning() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let name = test_endpoint(tmp.path());
+        let mut listener = endpoint::Listener::bind(&name).await.expect("bind");
+        tokio::spawn(async move {
+            loop {
+                let _ = listener.accept().await;
+            }
+        });
+        let spawned = std::sync::atomic::AtomicBool::new(false);
+        let result = connect_or_spawn(
+            &name,
+            || {
+                spawned.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(result.is_ok(), "could not reach the running agent");
+        assert!(
+            !spawned.load(std::sync::atomic::Ordering::SeqCst),
+            "spawned a second agent"
+        );
     }
 
     /// PRD acceptance 8: two clients (Claude Code and Claude Desktop) driving

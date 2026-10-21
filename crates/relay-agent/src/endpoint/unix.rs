@@ -99,7 +99,9 @@ fn current_uid() -> u32 {
 
 /// Connects to the agent listening at `endpoint`.
 pub async fn connect(endpoint: &str) -> anyhow::Result<UnixStream> {
-    Ok(UnixStream::connect(Path::new(endpoint)).await?)
+    UnixStream::connect(Path::new(endpoint))
+        .await
+        .with_context(|| format!("unable to connect to \"{endpoint}\""))
 }
 
 #[cfg(test)]
