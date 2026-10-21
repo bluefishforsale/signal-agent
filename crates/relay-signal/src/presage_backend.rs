@@ -124,7 +124,17 @@ impl SignalBackend for PresageSignal {
     }
 
     async fn groups(&self) -> anyhow::Result<Vec<Group>> {
-        bail!("not yet")
+        let store = self.manager.store().clone();
+        self.worker
+            .run(move || async move {
+                let mut groups = Vec::new();
+                for group in store.groups().await.context("unable to list groups")? {
+                    let (master_key, group) = group.context("unreadable group in the store")?;
+                    groups.push(convert::group_from(master_key, &group));
+                }
+                anyhow::Ok(groups)
+            })
+            .await?
     }
 
     async fn attachment(&self, attachment: &AttachmentRef) -> anyhow::Result<Vec<u8>> {
@@ -260,6 +270,60 @@ mod tests {
                 kind: ProfileKind::Linked,
                 device_name: "Claude (test)".into(),
             }
+        );
+    }
+
+    /// A group presage has cached, as it does on the first message from it.
+    fn cached_group(title: &str, members: &[uuid::Uuid]) -> presage::model::groups::Group {
+        presage::model::groups::Group {
+            title: title.into(),
+            avatar: String::new(),
+            disappearing_messages_timer: None,
+            access_control: None,
+            revision: 1,
+            members: members
+                .iter()
+                .map(|uuid| presage::model::groups::Member {
+                    aci: presage::libsignal_service::protocol::Aci::from_uuid_bytes(
+                        uuid.into_bytes(),
+                    ),
+                    role: presage::libsignal_service::groups_v2::Role::Default,
+                    profile_key: presage::libsignal_service::prelude::ProfileKey::create([0; 32]),
+                    joined_at_revision: 0,
+                    label: None,
+                    label_emoji: None,
+                })
+                .collect(),
+            pending_members: Vec::new(),
+            requesting_members: Vec::new(),
+            invite_link_password: Vec::new(),
+            description: None,
+        }
+    }
+
+    /// Groups presage has cached are listed under their public id, straight
+    /// from the store.
+    #[tokio::test]
+    async fn groups_cached_in_the_store_are_listed() {
+        let (_dir, path) = temp_store();
+        register_linked(&path).await;
+        let me = uuid::Uuid::parse_str(ME).expect("uuid");
+        seed(&path, move |store| async move {
+            store
+                .save_group([4; 32], cached_group("cats", &[me]))
+                .await
+                .expect("saved");
+        })
+        .await;
+        let signal = PresageSignal::open(&path, &KEY).await.expect("opens");
+        let groups = signal.groups().await.expect("groups");
+        assert_eq!(
+            groups,
+            vec![Group {
+                id: convert::group_id([4; 32]),
+                title: "cats".into(),
+                members: vec![ServiceId::new(me)],
+            }]
         );
     }
 
