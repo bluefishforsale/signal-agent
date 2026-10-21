@@ -169,6 +169,13 @@ impl Importer<'_> {
     }
 
     async fn chat_item(&mut self, item: pb::ChatItem) -> anyhow::Result<()> {
+        if matches!(
+            item.item,
+            None | Some(pb::chat_item::Item::UpdateMessage(_))
+        ) {
+            self.summary.skipped += 1;
+            return Ok(());
+        }
         let author = self.person(item.authorId);
         let (Some(author), Some(&conversation)) = (author, self.chats.get(&item.chatId)) else {
             self.summary.skipped += 1;
@@ -675,6 +682,35 @@ mod tests {
                 author: aci(ALICE_ACI),
                 sent_at_ms: 1_000
             }]
+        );
+    }
+
+    /// Chat events (someone joined, the timer changed) aren't messages; storing
+    /// them would fill history and unread counts with empty rows.
+    #[tokio::test]
+    async fn chat_update_events_are_not_stored_as_messages() {
+        let update = pb::ChatItem {
+            directionalDetails: Some(pb::chat_item::DirectionalDetails::Directionless(
+                Default::default(),
+            )),
+            item: Some(pb::chat_item::Item::UpdateMessage(Default::default())),
+            ..incoming_text(ALICE_CHAT, ALICE_ID, 1_000, "")
+        };
+        let (store, summary) = import(vec![
+            self_recipient(),
+            contact(ALICE_ID, ALICE_ACI),
+            chat(ALICE_CHAT, ALICE_ID),
+            item(update),
+        ])
+        .await;
+        let stored = all_messages(&store).await;
+        assert!(stored.is_empty(), "stored a chat event: {stored:?}");
+        assert_eq!(
+            summary,
+            ImportSummary {
+                imported: 0,
+                skipped: 1
+            }
         );
     }
 }
