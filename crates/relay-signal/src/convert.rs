@@ -8,7 +8,7 @@ use presage::{
         zkgroup::groups::{GroupMasterKey, GroupSecretParams},
     },
     proto::{
-        DataMessage, SyncMessage,
+        SyncMessage,
         sync_message::{self, Content as SyncContent},
     },
     store::Thread,
@@ -23,14 +23,8 @@ use crate::Incoming;
 pub(crate) fn incoming(content: &Content, me: ServiceId) -> Option<Incoming> {
     let sender = service_id(content.metadata.sender);
     let conversation = conversation(content)?;
-    match &content.body {
-        ContentBody::DataMessage(data) => Some(Incoming::Message(message(
-            data,
-            sender,
-            conversation,
-            me,
-            content,
-        )?)),
+    let data = match &content.body {
+        ContentBody::DataMessage(data) => data,
         ContentBody::SynchronizeMessage(SyncMessage {
             content:
                 Some(SyncContent::Sent(sync_message::Sent {
@@ -38,25 +32,54 @@ pub(crate) fn incoming(content: &Content, me: ServiceId) -> Option<Incoming> {
                     ..
                 })),
             ..
-        }) => Some(Incoming::Message(message(
-            data,
-            sender,
+        }) => data,
+        ContentBody::EditMessage(edit)
+        | ContentBody::SynchronizeMessage(SyncMessage {
+            content:
+                Some(SyncContent::Sent(sync_message::Sent {
+                    edit_message: Some(edit),
+                    ..
+                })),
+            ..
+        }) => {
+            return Some(Incoming::Edit {
+                conversation,
+                target: MessageId {
+                    author: sender,
+                    sent_at_ms: edit.target_sent_timestamp?,
+                },
+                from: sender,
+                body: edit.data_message.as_ref()?.body.clone()?,
+            });
+        }
+        _ => return None,
+    };
+    if let Some(reaction) = &data.reaction {
+        return Some(Incoming::Reaction {
             conversation,
-            me,
-            content,
-        )?)),
-        _ => None,
+            target: MessageId {
+                author: aci_of(
+                    reaction.target_author_aci_binary.as_deref(),
+                    reaction.target_author_aci.as_deref(),
+                )?,
+                sent_at_ms: reaction.target_sent_timestamp?,
+            },
+            from: sender,
+            emoji: reaction.emoji.clone()?,
+            remove: reaction.remove.unwrap_or(false),
+        });
     }
-}
-
-fn message(
-    data: &DataMessage,
-    sender: ServiceId,
-    conversation: Recipient,
-    me: ServiceId,
-    content: &Content,
-) -> Option<Message> {
-    Some(Message {
+    if let Some(delete) = &data.delete {
+        return Some(Incoming::Delete {
+            conversation,
+            target: MessageId {
+                author: sender,
+                sent_at_ms: delete.target_sent_timestamp?,
+            },
+            from: sender,
+        });
+    }
+    Some(Incoming::Message(Message {
         id: MessageId {
             author: sender,
             sent_at_ms: data.timestamp?,
@@ -70,7 +93,7 @@ fn message(
         quote: None,
         edited: false,
         deleted: false,
-    })
+    }))
 }
 
 fn conversation(content: &Content) -> Option<Recipient> {
@@ -85,6 +108,17 @@ fn conversation(content: &Content) -> Option<Recipient> {
 pub(crate) fn group_id(master_key: [u8; 32]) -> GroupId {
     let params = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key));
     GroupId::new(params.get_group_identifier())
+}
+
+/// An ACI from a proto's binary field, falling back to its string twin; newer
+/// clients fill only the binary one, older ones only the string.
+fn aci_of(binary: Option<&[u8]>, string: Option<&str>) -> Option<ServiceId> {
+    let aci = match (binary, string) {
+        (Some(bytes), _) => protocol::Aci::parse_from_service_id_binary(bytes)?,
+        (None, Some(s)) => protocol::Aci::parse_from_service_id_string(s)?,
+        (None, None) => return None,
+    };
+    Some(ServiceId::new(aci.into()))
 }
 
 fn service_id(id: protocol::ServiceId) -> ServiceId {
@@ -102,7 +136,7 @@ mod tests {
     use presage::libsignal_service::{
         content::Metadata,
         prelude::Uuid,
-        proto::GroupContextV2,
+        proto::{DataMessage, EditMessage, GroupContextV2, data_message},
         protocol::{Aci, DeviceId},
     };
 
@@ -230,5 +264,98 @@ mod tests {
         );
         assert_eq!(message.body.as_deref(), Some("on my way"));
         assert_eq!(message.id.author, ServiceId::new(ME));
+    }
+
+    /// Newer Signal clients send the target author only in binary form; a
+    /// reaction from one must still point at the right message.
+    #[test]
+    fn reaction_with_binary_only_author_targets_that_author() {
+        let content = content_from(
+            ALICE,
+            ContentBody::DataMessage(DataMessage {
+                timestamp: Some(90),
+                reaction: Some(data_message::Reaction {
+                    emoji: Some("🐈".into()),
+                    remove: Some(false),
+                    target_author_aci: None,
+                    target_author_aci_binary: Some(ME.as_bytes().to_vec()),
+                    target_sent_timestamp: Some(80),
+                }),
+                ..Default::default()
+            }),
+        );
+        let event = incoming(&content, ServiceId::new(ME));
+        assert_eq!(
+            event,
+            Some(Incoming::Reaction {
+                conversation: Recipient::Contact(ServiceId::new(ALICE)),
+                target: MessageId {
+                    author: ServiceId::new(ME),
+                    sent_at_ms: 80
+                },
+                from: ServiceId::new(ALICE),
+                emoji: "🐈".into(),
+                remove: false,
+            })
+        );
+    }
+
+    /// An edit can only rewrite its sender's own message, so the target's author
+    /// and `from` must both be the authenticated sender; the store's
+    /// author check rests on that.
+    #[test]
+    fn edit_targets_and_comes_from_its_authenticated_sender() {
+        let content = content_from(
+            ALICE,
+            ContentBody::EditMessage(EditMessage {
+                target_sent_timestamp: Some(40),
+                data_message: Some(DataMessage {
+                    body: Some("fixed typo".into()),
+                    timestamp: Some(41),
+                    ..Default::default()
+                }),
+            }),
+        );
+        let alice = ServiceId::new(ALICE);
+        assert_eq!(
+            incoming(&content, ServiceId::new(ME)),
+            Some(Incoming::Edit {
+                conversation: Recipient::Contact(alice),
+                target: MessageId {
+                    author: alice,
+                    sent_at_ms: 40
+                },
+                from: alice,
+                body: "fixed typo".into(),
+            })
+        );
+    }
+
+    /// Delete-for-everyone erases only the sender's own message, so its target
+    /// author is the sender, never a guess from the timestamp alone.
+    #[test]
+    fn delete_targets_and_comes_from_its_authenticated_sender() {
+        let content = content_from(
+            ALICE,
+            ContentBody::DataMessage(DataMessage {
+                timestamp: Some(60),
+                delete: Some(data_message::Delete {
+                    target_sent_timestamp: Some(50),
+                }),
+                ..Default::default()
+            }),
+        );
+        let alice = ServiceId::new(ALICE);
+        assert_eq!(
+            incoming(&content, ServiceId::new(ME)),
+            Some(Incoming::Delete {
+                conversation: Recipient::Contact(alice),
+                target: MessageId {
+                    author: alice,
+                    sent_at_ms: 50
+                },
+                from: alice,
+            })
+        );
     }
 }
