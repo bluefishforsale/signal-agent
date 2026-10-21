@@ -143,7 +143,12 @@ fn message(our_aci: ServiceId, conversation: Recipient, json: &Value) -> Option<
             .filter(|_| !deleted)
             .map(str::to_owned),
         attachments: vec![],
-        quote: None,
+        quote: json.get("quote").and_then(|q| {
+            Some(MessageId {
+                author: service_id(q.get("authorAci")?)?,
+                sent_at_ms: q.get("id")?.as_u64()?,
+            })
+        }),
         edited: json
             .get("editHistory")
             .and_then(Value::as_array)
@@ -484,6 +489,32 @@ mod tests {
             (m.id.sent_at_ms, m.body.as_deref(), m.edited),
             (1_000, Some("first"), true),
             "{m:?}"
+        );
+    }
+
+    /// A Desktop reply keeps its reference to the quoted message.
+    #[tokio::test]
+    async fn a_reply_keeps_a_reference_to_the_quoted_message() {
+        let mut desktop = with_alice().await;
+        desktop
+            .message(
+                "m1",
+                "c-alice",
+                json!({
+                    "type": "outgoing",
+                    "sent_at": 2_000,
+                    "body": "agreed",
+                    "quote": { "id": 1_000, "authorAci": ALICE_ACI, "isViewOnce": false },
+                }),
+            )
+            .await;
+        let m = only_message(desktop).await;
+        assert_eq!(
+            m.quote,
+            Some(MessageId {
+                author: aci(ALICE_ACI),
+                sent_at_ms: 1_000
+            })
         );
     }
 }
