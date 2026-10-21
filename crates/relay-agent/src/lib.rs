@@ -2,6 +2,7 @@
 //! else (stdio shims, the HTTP front end, setup) reaches Signal through it,
 //! because two processes driving one Signal device corrupt its sessions.
 
+mod capture;
 pub mod login;
 
 use anyhow::bail;

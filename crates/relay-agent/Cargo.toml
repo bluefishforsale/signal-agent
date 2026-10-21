@@ -6,7 +6,13 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+futures.workspace = true
 relay-core.workspace = true
 relay-signal.workspace = true
 relay-store.workspace = true
 relay-tools.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true
