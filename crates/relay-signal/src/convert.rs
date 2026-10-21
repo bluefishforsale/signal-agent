@@ -123,7 +123,15 @@ pub(crate) fn incoming(content: &Content, me: ServiceId) -> Option<Incoming> {
         received_at_ms: millis(content),
         body: data.body.clone(),
         attachments: Vec::new(),
-        quote: None,
+        quote: data.quote.as_ref().and_then(|quote| {
+            Some(MessageId {
+                author: aci_of(
+                    quote.author_aci_binary.as_deref(),
+                    quote.author_aci.as_deref(),
+                )?,
+                sent_at_ms: quote.id?,
+            })
+        }),
         edited: false,
         deleted: false,
     }))
@@ -478,6 +486,35 @@ mod tests {
                     author: ServiceId::new(ALICE),
                     sent_at_ms: 33
                 }]
+            })
+        );
+    }
+
+    /// A reply must point at the quoted message, or threads flatten into
+    /// unrelated lines in the history.
+    #[test]
+    fn reply_carries_the_quoted_message_id() {
+        let content = content_from(
+            ALICE,
+            ContentBody::DataMessage(DataMessage {
+                body: Some("agreed".into()),
+                timestamp: Some(21),
+                quote: Some(data_message::Quote {
+                    id: Some(20),
+                    author_aci_binary: Some(ME.as_bytes().to_vec()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        );
+        let Some(Incoming::Message(message)) = incoming(&content, ServiceId::new(ME)) else {
+            panic!("not a message");
+        };
+        assert_eq!(
+            message.quote,
+            Some(MessageId {
+                author: ServiceId::new(ME),
+                sent_at_ms: 20
             })
         );
     }
