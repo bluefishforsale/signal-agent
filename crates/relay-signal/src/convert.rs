@@ -61,6 +61,20 @@ pub(crate) fn incoming(content: &Content, me: ServiceId) -> Option<Incoming> {
                 targets: targets.collect(),
             });
         }
+        ContentBody::SynchronizeMessage(sync) if !sync.read.is_empty() => {
+            let targets = sync.read.iter().filter_map(|read| {
+                Some(MessageId {
+                    author: aci_of(
+                        read.sender_aci_binary.as_deref(),
+                        read.sender_aci.as_deref(),
+                    )?,
+                    sent_at_ms: read.timestamp?,
+                })
+            });
+            return Some(Incoming::Read {
+                targets: targets.collect(),
+            });
+        }
         _ => return None,
     };
     if let Some(reaction) = &data.reaction {
@@ -439,6 +453,32 @@ mod tests {
         assert_eq!(
             incoming(&receipt(receipt_message::Type::Delivery), me),
             None
+        );
+    }
+
+    /// Reading a chat on the phone syncs here; the read messages are the
+    /// original senders', not the account's.
+    #[test]
+    fn read_synced_from_own_phone_targets_original_senders() {
+        let content = content_from(
+            ME,
+            ContentBody::SynchronizeMessage(SyncMessage {
+                read: vec![sync_message::Read {
+                    sender_aci: None,
+                    sender_aci_binary: Some(ALICE.as_bytes().to_vec()),
+                    timestamp: Some(33),
+                }],
+                ..Default::default()
+            }),
+        );
+        assert_eq!(
+            incoming(&content, ServiceId::new(ME)),
+            Some(Incoming::Read {
+                targets: vec![MessageId {
+                    author: ServiceId::new(ALICE),
+                    sent_at_ms: 33
+                }]
+            })
         );
     }
 }
