@@ -80,6 +80,7 @@ pub async fn import_link_and_sync(
         store,
         recipients: HashMap::new(),
         chats: HashMap::new(),
+        read: Vec::new(),
         summary: ImportSummary::default(),
     };
     while let Some(raw) = reader
@@ -91,6 +92,10 @@ pub async fn import_link_and_sync(
             .context("malformed frame in link-and-sync archive")?;
         importer.frame(frame).await?;
     }
+    store
+        .mark_read(&importer.read)
+        .await
+        .context("marking imported messages read")?;
     Ok(importer.summary)
 }
 
@@ -109,6 +114,7 @@ struct Importer<'a> {
     store: &'a dyn MessageStore,
     recipients: HashMap<u64, Peer>,
     chats: HashMap<u64, Recipient>,
+    read: Vec<MessageId>,
     summary: ImportSummary,
 }
 
@@ -163,9 +169,9 @@ impl Importer<'_> {
             self.summary.skipped += 1;
             return Ok(());
         };
-        let received_at_ms = match &item.directionalDetails {
-            Some(pb::chat_item::DirectionalDetails::Incoming(d)) => d.dateReceived,
-            _ => item.dateSent,
+        let (received_at_ms, read) = match &item.directionalDetails {
+            Some(pb::chat_item::DirectionalDetails::Incoming(d)) => (d.dateReceived, d.read),
+            _ => (item.dateSent, false),
         };
         let body = match &item.item {
             Some(pb::chat_item::Item::StandardMessage(m)) => {
@@ -192,6 +198,9 @@ impl Importer<'_> {
             .upsert(&message)
             .await
             .with_context(|| format!("storing imported message {:?}", message.id))?;
+        if read {
+            self.read.push(message.id);
+        }
         self.summary.imported += 1;
         Ok(())
     }
@@ -509,5 +518,58 @@ mod tests {
         let stored = all_messages(&store).await;
         let conversations: Vec<_> = stored.iter().map(|m| m.conversation).collect();
         assert_eq!(conversations, vec![Recipient::Group(expected)]);
+    }
+
+    /// relay-core identifies people by ACI; a PNI-only contact's messages can't
+    /// be attributed, so they're skipped and counted rather than misfiled.
+    #[tokio::test]
+    async fn messages_from_a_contact_without_an_aci_are_skipped_and_counted() {
+        let pni_only = recipient(
+            ALICE_ID,
+            pb::recipient::Destination::Contact(pb::Contact {
+                pni: Some(vec![5; 16]),
+                ..Default::default()
+            }),
+        );
+        let (store, summary) = import(vec![
+            self_recipient(),
+            pni_only,
+            chat(ALICE_CHAT, ALICE_ID),
+            item(incoming_text(ALICE_CHAT, ALICE_ID, 1_000, "who am i")),
+        ])
+        .await;
+        assert_eq!(
+            summary,
+            ImportSummary {
+                imported: 0,
+                skipped: 1
+            }
+        );
+        let stored = all_messages(&store).await;
+        assert!(
+            stored.is_empty(),
+            "stored unattributable messages: {stored:?}"
+        );
+    }
+
+    /// A fresh link must not report years of history the phone already read as
+    /// unread; only what was unread on the phone stays unread.
+    #[tokio::test]
+    async fn messages_read_on_the_phone_import_as_read() {
+        let mut read = incoming_text(ALICE_CHAT, ALICE_ID, 1_000, "seen");
+        if let Some(pb::chat_item::DirectionalDetails::Incoming(d)) = &mut read.directionalDetails {
+            d.read = true;
+        }
+        let (store, _) = import(vec![
+            self_recipient(),
+            contact(ALICE_ID, ALICE_ACI),
+            chat(ALICE_CHAT, ALICE_ID),
+            item(read),
+            item(incoming_text(ALICE_CHAT, ALICE_ID, 2_000, "not yet seen")),
+        ])
+        .await;
+        let unread = store.unread().await.expect("unread");
+        let bodies: Vec<_> = unread.iter().filter_map(|m| m.body.as_deref()).collect();
+        assert_eq!(bodies, vec!["not yet seen"]);
     }
 }
