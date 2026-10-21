@@ -145,35 +145,39 @@ impl Importer<'_> {
                 let Some(aci) = c.aci.as_deref().and_then(service_id) else {
                     return;
                 };
-                self.title(recipient.id, [c.profileGivenName, c.profileFamilyName]);
+                let nickname = c
+                    .nickname
+                    .as_ref()
+                    .map(|n| [n.given.as_str(), n.family.as_str()]);
+                let system = [c.systemGivenName.as_str(), c.systemFamilyName.as_str()];
+                let profile = [
+                    c.profileGivenName.as_deref().unwrap_or_default(),
+                    c.profileFamilyName.as_deref().unwrap_or_default(),
+                ];
+                if let Some(name) = [nickname, Some(system), Some(profile)]
+                    .into_iter()
+                    .flatten()
+                    .find_map(full_name)
+                {
+                    self.titles.insert(recipient.id, name);
+                }
                 Peer::Contact(aci)
             }
             Some(pb::recipient::Destination::Group(g)) => {
                 let Ok(master_key) = <[u8; 32]>::try_from(g.masterKey.as_slice()) else {
                     return;
                 };
-                let title = g.snapshot.title.as_ref().and_then(|t| match &t.content {
-                    Some(pb::group::group_attribute_blob::Content::Title(t)) => Some(t.clone()),
-                    _ => None,
-                });
-                self.title(recipient.id, [title]);
+                if let Some(pb::group::group_attribute_blob::Content::Title(title)) =
+                    g.snapshot.title.as_ref().and_then(|t| t.content.as_ref())
+                    && !title.is_empty()
+                {
+                    self.titles.insert(recipient.id, title.clone());
+                }
                 Peer::Group(group_id(master_key))
             }
             _ => return,
         };
         self.recipients.insert(recipient.id, peer);
-    }
-
-    /// Joins the non-empty name parts, if any, as the recipient's title.
-    fn title<const N: usize>(&mut self, recipient_id: u64, parts: [Option<String>; N]) {
-        let parts: Vec<_> = parts
-            .into_iter()
-            .flatten()
-            .filter(|p| !p.is_empty())
-            .collect();
-        if !parts.is_empty() {
-            self.titles.insert(recipient_id, parts.join(" "));
-        }
     }
 
     async fn chat(&mut self, chat: pb::Chat) -> anyhow::Result<()> {
@@ -259,6 +263,12 @@ impl Importer<'_> {
         self.summary.imported += 1;
         Ok(())
     }
+}
+
+/// Given and family name joined, or None if both are empty.
+fn full_name(parts: [&str; 2]) -> Option<String> {
+    let parts: Vec<_> = parts.into_iter().filter(|p| !p.is_empty()).collect();
+    (!parts.is_empty()).then(|| parts.join(" "))
 }
 
 /// When a chat item arrived and whether it had been read.
@@ -816,5 +826,48 @@ mod tests {
             .collect();
         titles.sort();
         assert_eq!(titles, vec!["Alice Liddell", "Book club"]);
+    }
+
+    /// The name the user gave a contact (a nickname, or their address book
+    /// entry) beats the name the contact chose, as in Signal's own apps, so
+    /// "message Mom" finds the right chat.
+    #[tokio::test]
+    async fn names_the_user_chose_beat_profile_names() {
+        let named = |id: u64, aci: u128, nickname: &str, system: &str| {
+            recipient(
+                id,
+                pb::recipient::Destination::Contact(pb::Contact {
+                    aci: Some(uuid::Uuid::from_u128(aci).as_bytes().to_vec()),
+                    profileGivenName: Some("Profile".to_owned()),
+                    systemGivenName: system.to_owned(),
+                    nickname: (!nickname.is_empty())
+                        .then(|| pb::contact::Name {
+                            given: nickname.to_owned(),
+                            ..Default::default()
+                        })
+                        .into(),
+                    ..Default::default()
+                }),
+            )
+        };
+        let (store, _) = import(vec![
+            self_recipient(),
+            named(2, 0xB1, "Mom", "Jane"),
+            named(3, 0xB2, "", "Dad"),
+            chat(12, 2),
+            chat(13, 3),
+            item(incoming_text(12, 2, 1_000, "call me")),
+            item(incoming_text(13, 3, 2_000, "call your mother")),
+        ])
+        .await;
+        let mut titles: Vec<_> = store
+            .conversations()
+            .await
+            .expect("conversations")
+            .into_iter()
+            .map(|c| c.title)
+            .collect();
+        titles.sort();
+        assert_eq!(titles, vec!["Dad", "Mom"]);
     }
 }
