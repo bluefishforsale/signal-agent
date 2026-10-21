@@ -19,7 +19,7 @@ use relay_core::prelude::*;
 use relay_store::MessageStore;
 use zkgroup::groups::{GroupMasterKey, GroupSecretParams};
 
-use crate::ImportProgress;
+use crate::{ImportProgress, ImportSummary};
 
 /// The 32-byte key the phone sends in the provisioning message when it offers
 /// to transfer history. Single-use; never persist it.
@@ -35,14 +35,6 @@ impl fmt::Debug for LinkAndSyncKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("LinkAndSyncKey(..)")
     }
-}
-
-/// What an import wrote and what it had to leave out.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ImportSummary {
-    pub imported: u64,
-    pub skipped: u64,
-    pub already_stored: u64,
 }
 
 /// Imports a downloaded link-and-sync archive into `store`.

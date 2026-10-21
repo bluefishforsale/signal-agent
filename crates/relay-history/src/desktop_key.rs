@@ -4,6 +4,8 @@
 
 use aes::cipher::{BlockModeDecrypt as _, KeyIvInit as _, block_padding::Pkcs7};
 use aes_gcm::{Aes256Gcm, KeyInit as _, aead::Aead as _};
+use std::path::Path;
+
 use anyhow::{Context, bail};
 use base64::Engine as _;
 
@@ -12,6 +14,12 @@ use base64::Engine as _;
 pub(crate) struct DatabaseKey(String);
 
 impl DatabaseKey {
+    /// The value for `PRAGMA key`, in SQLCipher's raw-key form as Desktop
+    /// itself keys the database.
+    pub(crate) fn pragma_value(&self) -> String {
+        format!("\"x'{}'\"", self.0)
+    }
+
     // NOTE: the decrypted bytes already are the hex text SQLCipher wants.
     // Hex-encoding them again gives a 128-character key that opens nothing,
     // which is how earlier importers broke; the length check refuses that.
@@ -29,6 +37,139 @@ impl DatabaseKey {
 impl std::fmt::Debug for DatabaseKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("DatabaseKey(..)")
+    }
+}
+
+/// Recovers the key from `config.json` in Signal Desktop's data directory,
+/// asking the OS keystore where Desktop's safeStorage put its secret.
+pub(crate) fn database_key(signal_dir: &Path) -> anyhow::Result<DatabaseKey> {
+    let config_path = signal_dir.join("config.json");
+    let config = std::fs::read_to_string(&config_path)
+        .with_context(|| format!("unable to read \"{}\"", config_path.display()))?;
+    let config: serde_json::Value = serde_json::from_str(&config)
+        .with_context(|| format!("\"{}\" is not JSON", config_path.display()))?;
+    if let Some(encrypted) = config.get("encryptedKey").and_then(|v| v.as_str()) {
+        let encrypted = hex::decode(encrypted).context("config.json's encryptedKey is not hex")?;
+        return decrypt_for_this_os(signal_dir, &encrypted);
+    }
+    let Some(plain) = config.get("key").and_then(|v| v.as_str()) else {
+        bail!(
+            "\"{}\" has neither encryptedKey nor key",
+            config_path.display()
+        );
+    };
+    DatabaseKey::new(plain.as_bytes())
+}
+
+#[cfg(target_os = "macos")]
+fn decrypt_for_this_os(_signal_dir: &Path, encrypted: &[u8]) -> anyhow::Result<DatabaseKey> {
+    // macOS asks the user to allow this Keychain read, which is the consent
+    // step for an opt-in import.
+    let password = command_output(
+        "security",
+        &["find-generic-password", "-w", "-s", "Signal Safe Storage"],
+    )
+    .context("reading \"Signal Safe Storage\" from the Keychain")?;
+    decrypt_macos(encrypted, &password)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn decrypt_for_this_os(_signal_dir: &Path, encrypted: &[u8]) -> anyhow::Result<DatabaseKey> {
+    decrypt_linux(encrypted, || {
+        // NOTE: Chromium's libsecret store looks the password up by the
+        // "application" attribute, set from the Electron app name. That's
+        // "Signal" by Desktop's productName, but it wasn't checked against a
+        // live keyring, so the lowercase form is tried as well. KWallet
+        // (`--password-store=kwallet`) isn't supported.
+        command_output("secret-tool", &["lookup", "application", "Signal"])
+            .or_else(|_| command_output("secret-tool", &["lookup", "application", "signal"]))
+            .context("reading Signal's safe-storage password with secret-tool (libsecret-tools)")
+    })
+}
+
+#[cfg(windows)]
+fn decrypt_for_this_os(signal_dir: &Path, encrypted: &[u8]) -> anyhow::Result<DatabaseKey> {
+    let local_state_path = signal_dir.join("Local State");
+    let local_state = match std::fs::read_to_string(&local_state_path) {
+        Ok(s) => Some(s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("unable to read \"{}\"", local_state_path.display()));
+        }
+    };
+    decrypt_windows(encrypted, local_state.as_deref(), dpapi::unprotect)
+}
+
+/// Runs a keystore CLI and returns its stdout without the trailing newline.
+#[cfg(unix)]
+fn command_output(program: &str, args: &[&str]) -> anyhow::Result<Vec<u8>> {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .with_context(|| format!("unable to run {program}"))?;
+    if !output.status.success() {
+        bail!(
+            "{program} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let mut out = output.stdout;
+    while out.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
+        out.pop();
+    }
+    Ok(out)
+}
+
+#[cfg(windows)]
+mod dpapi {
+    //! CryptUnprotectData for the current user, the only Windows-specific call.
+
+    use anyhow::bail;
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::Cryptography::{CRYPT_INTEGER_BLOB, CryptUnprotectData},
+    };
+
+    pub(super) fn unprotect(blob: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let Ok(len) = u32::try_from(blob.len()) else {
+            bail!("DPAPI blob of {} bytes is too large", blob.len());
+        };
+        let input = CRYPT_INTEGER_BLOB {
+            cbData: len,
+            pbData: blob.as_ptr().cast_mut(),
+        };
+        let mut output = CRYPT_INTEGER_BLOB {
+            cbData: 0,
+            pbData: std::ptr::null_mut(),
+        };
+        // SAFETY: input points at `blob`, which outlives the call; DPAPI only
+        // reads it. On success output owns a LocalAlloc'd buffer of cbData
+        // bytes, copied out and then freed exactly once below.
+        let ok = unsafe {
+            CryptUnprotectData(
+                &input,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                &mut output,
+            )
+        };
+        if ok == 0 {
+            bail!(
+                "DPAPI couldn't unprotect Signal Desktop's key (run as the Windows user who uses Signal Desktop): {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        // SAFETY: as above, output.pbData is valid for output.cbData bytes.
+        let plaintext = unsafe {
+            let bytes = std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec();
+            LocalFree(output.pbData.cast());
+            bytes
+        };
+        Ok(plaintext)
     }
 }
 
@@ -227,5 +368,19 @@ mod tests {
         let local_state = local_state_with(&hex(WINDOWS_GCM_KEY));
         let result = decrypt_windows(&hex(WINDOWS_GCM_VECTOR), Some(&local_state), no_dpapi);
         assert!(result.is_err(), "accepted an unmarked key: {result:?}");
+    }
+
+    /// Before safeStorage, and still where no keystore works, Desktop keeps the
+    /// key in plain text under "key"; that needs no keystore at all.
+    #[test]
+    fn a_plaintext_config_key_is_used_as_is() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.json"),
+            format!(r#"{{"key":"{DB_KEY}"}}"#),
+        )
+        .expect("write config");
+        let key = database_key(dir.path()).expect("key");
+        assert_eq!(key.0, DB_KEY);
     }
 }
