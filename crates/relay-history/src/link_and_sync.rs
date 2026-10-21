@@ -159,12 +159,17 @@ impl Importer<'_> {
         self.chats.insert(chat.id, conversation);
     }
 
+    /// The ACI behind a recipient id, if it's a person we can attribute to.
+    fn person(&self, recipient_id: u64) -> Option<ServiceId> {
+        match self.recipients.get(&recipient_id)? {
+            Peer::Me => Some(self.our_aci),
+            Peer::Contact(aci) => Some(*aci),
+            Peer::Group(_) => None,
+        }
+    }
+
     async fn chat_item(&mut self, item: pb::ChatItem) -> anyhow::Result<()> {
-        let author = match self.recipients.get(&item.authorId) {
-            Some(Peer::Me) => Some(self.our_aci),
-            Some(Peer::Contact(aci)) => Some(*aci),
-            Some(Peer::Group(_)) | None => None,
-        };
+        let author = self.person(item.authorId);
         let (Some(author), Some(&conversation)) = (author, self.chats.get(&item.chatId)) else {
             self.summary.skipped += 1;
             return Ok(());
@@ -172,12 +177,19 @@ impl Importer<'_> {
         let (_, read) = arrival(&item);
         let original = item.revisions.first().unwrap_or(&item);
         let (received_at_ms, _) = arrival(original);
-        let body = match &item.item {
-            Some(pb::chat_item::Item::StandardMessage(m)) => {
-                m.text.as_ref().map(|t| t.body.clone())
-            }
+        let standard = match &item.item {
+            Some(pb::chat_item::Item::StandardMessage(m)) => Some(m),
             _ => None,
         };
+        let body = standard
+            .and_then(|m| m.text.as_ref())
+            .map(|t| t.body.clone());
+        let quote = standard.and_then(|m| m.quote.as_ref()).and_then(|q| {
+            Some(MessageId {
+                author: self.person(q.authorId)?,
+                sent_at_ms: q.targetSentTimestamp?,
+            })
+        });
         let message = Message {
             id: MessageId {
                 author,
@@ -189,7 +201,7 @@ impl Importer<'_> {
             received_at_ms,
             body,
             attachments: vec![],
-            quote: None,
+            quote,
             edited: !item.revisions.is_empty(),
             deleted: matches!(
                 item.item,
@@ -631,6 +643,38 @@ mod tests {
             (m.body.as_deref(), m.edited),
             (Some("first"), true),
             "{m:?}"
+        );
+    }
+
+    /// A reply must still point at the message it quoted, by that message's
+    /// author and send time.
+    #[tokio::test]
+    async fn a_reply_keeps_a_reference_to_the_quoted_message() {
+        let mut reply = outgoing_text(ALICE_CHAT, 2_000, "agreed");
+        if let Some(pb::chat_item::Item::StandardMessage(m)) = &mut reply.item {
+            m.quote = Some(pb::Quote {
+                targetSentTimestamp: Some(1_000),
+                authorId: ALICE_ID,
+                ..Default::default()
+            })
+            .into();
+        }
+        let (store, _) = import(vec![
+            self_recipient(),
+            contact(ALICE_ID, ALICE_ACI),
+            chat(ALICE_CHAT, ALICE_ID),
+            item(incoming_text(ALICE_CHAT, ALICE_ID, 1_000, "pizza?")),
+            item(reply),
+        ])
+        .await;
+        let stored = all_messages(&store).await;
+        let quotes: Vec<_> = stored.iter().filter_map(|m| m.quote).collect();
+        assert_eq!(
+            quotes,
+            vec![MessageId {
+                author: aci(ALICE_ACI),
+                sent_at_ms: 1_000
+            }]
         );
     }
 }
