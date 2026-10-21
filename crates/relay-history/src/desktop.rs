@@ -91,10 +91,14 @@ pub async fn import_signal_desktop(
         if json.get("readStatus").and_then(Value::as_u64) != Some(UNREAD) {
             read.push(message.id);
         }
-        store
+        let new = store
             .insert(&message)
             .await
             .with_context(|| format!("storing imported message {:?}", message.id))?;
+        if !new {
+            summary.already_stored += 1;
+            continue;
+        }
         summary.imported += 1;
         progress(ImportProgress {
             imported: summary.imported,
@@ -646,5 +650,47 @@ mod tests {
             .await
             .expect("import");
         assert_eq!(seen, vec![1, 2]);
+    }
+
+    /// Running the Desktop import again (or after link-and-sync brought the
+    /// same messages) must not count them as new.
+    #[tokio::test]
+    async fn importing_twice_counts_the_second_pass_as_already_stored() {
+        let mut desktop = with_alice().await;
+        desktop
+            .message(
+                "m1",
+                "c-alice",
+                json!({ "type": "incoming", "sent_at": 1_000, "sourceServiceId": ALICE_ACI, "body": "once" }),
+            )
+            .await;
+        desktop.conn.close().await.expect("close");
+        let store = MemoryStore::default();
+        let mut summaries = vec![];
+        for _ in 0..2 {
+            summaries.push(
+                import_signal_desktop(desktop.dir.path(), &store, &mut |_| {})
+                    .await
+                    .expect("import"),
+            );
+        }
+        assert_eq!(
+            summaries[1],
+            ImportSummary {
+                imported: 0,
+                skipped: 0,
+                already_stored: 1
+            }
+        );
+    }
+
+    /// The agent runs imports on a multithreaded runtime, so the future must
+    /// be Send.
+    #[test]
+    fn the_import_future_is_send() {
+        fn assert_send<T: Send>(_: T) {}
+        let store = MemoryStore::default();
+        let mut progress = |_| {};
+        assert_send(import_signal_desktop(Path::new("."), &store, &mut progress));
     }
 }

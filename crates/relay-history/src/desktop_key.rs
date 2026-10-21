@@ -175,6 +175,10 @@ mod dpapi {
 
 /// Decrypts macOS safeStorage's value with the Keychain's "Signal Safe
 /// Storage" password.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "tested on every OS, used on macOS")
+)]
 pub(crate) fn decrypt_macos(
     encrypted: &[u8],
     keychain_password: &[u8],
@@ -185,6 +189,10 @@ pub(crate) fn decrypt_macos(
 /// Decrypts Linux safeStorage's value. "v10" uses Chromium's hardcoded
 /// password; "v11" uses the one in the keyring, which `keyring_password` fetches
 /// only when needed.
+#[cfg_attr(
+    any(windows, target_os = "macos"),
+    allow(dead_code, reason = "tested on every OS, used on Linux")
+)]
 pub(crate) fn decrypt_linux(
     encrypted: &[u8],
     keyring_password: impl FnOnce() -> anyhow::Result<Vec<u8>>,
@@ -201,6 +209,10 @@ pub(crate) fn decrypt_linux(
 /// AES-256-GCM under a key kept DPAPI-protected in `Local State`; older builds
 /// DPAPI-protected the value itself. `unprotect` is DPAPI's CryptUnprotectData
 /// for the current user.
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "tested on every OS, used on Windows")
+)]
 pub(crate) fn decrypt_windows(
     encrypted: &[u8],
     local_state: Option<&str>,
@@ -227,6 +239,10 @@ pub(crate) fn decrypt_windows(
     DatabaseKey::new(&plaintext)
 }
 
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "tested on every OS, used on Windows")
+)]
 /// The DPAPI-wrapped key in Local State's `os_crypt.encrypted_key`, if any.
 fn local_state_key(local_state: &str) -> anyhow::Result<Option<Vec<u8>>> {
     let json: serde_json::Value =
