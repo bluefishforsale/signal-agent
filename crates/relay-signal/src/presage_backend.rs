@@ -24,14 +24,16 @@ use presage::{
         configuration::SignalServers, prelude::phonenumber::PhoneNumber,
         provisioning::ProvisioningError,
     },
+    libsignal_service::{content::Content, protocol::ServiceId as SignalServiceId},
     manager::{Confirmation, Registered, RegistrationOptions},
     model::messages::Received,
     proto::GroupContextV2,
-    store::{ContentsStore, StateStore},
+    store::{ContentsStore, StateStore, Thread},
 };
 use presage_store_sqlite::{OnNewIdentity, SqliteConnectOptions, SqliteStore};
 use relay_core::prelude::*;
 use tokio::sync::{mpsc, oneshot};
+use tracing::warn;
 
 use crate::{
     Account, Contact, Group, Incoming, LinkEvent, Outgoing, Provisioner, RegistrationStep,
@@ -459,6 +461,42 @@ fn now_ms() -> anyhow::Result<u64> {
     u64::try_from(since_epoch.as_millis()).context("system clock is past the year 500 million")
 }
 
+/// Whether `content` may be kept: anything outside a group, or group traffic
+/// from a current member.
+// NOTE: presage refreshes a group from the server before yielding content when
+// the group is uncached or the message claims a newer revision, so the cache
+// checked here is already as fresh as the sender can force it to be. presage
+// has no public call to force a fetch otherwise.
+async fn admitted(store: &SqliteStore, content: &Content) -> bool {
+    let Ok(Thread::Group(master_key)) = Thread::try_from(content) else {
+        return true;
+    };
+    let sender = content.metadata.sender;
+    let group = match store.group(master_key).await {
+        Ok(Some(group)) => group,
+        Ok(None) => {
+            warn!(group = %convert::group_id(master_key), "dropping traffic for an unknown group");
+            return false;
+        }
+        Err(error) => {
+            warn!(%error, "dropping group traffic: unable to read the group");
+            return false;
+        }
+    };
+    let is_member = group
+        .members
+        .iter()
+        .any(|m| SignalServiceId::from(m.aci) == sender);
+    if !is_member {
+        warn!(
+            group = %convert::group_id(master_key),
+            sender = %sender.service_id_string(),
+            "dropping group traffic from a non-member"
+        );
+    }
+    is_member
+}
+
 /// Receives from Signal for as long as anyone holds the other end of `tx`,
 /// reconnecting with backoff whenever the connection drops.
 async fn receive(
@@ -476,6 +514,9 @@ async fn receive(
                     let Received::Content(content) = received else {
                         continue;
                     };
+                    if !admitted(manager.store(), &content).await {
+                        continue;
+                    }
                     let Some(event) = convert::incoming(&content, me) else {
                         continue;
                     };
@@ -518,7 +559,10 @@ async fn open_store(path: &Path, key: &[u8; 32]) -> anyhow::Result<SqliteStore> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use presage::manager::RegistrationData;
+    use presage::{
+        libsignal_service::content::{Content, ContentBody, Metadata},
+        manager::RegistrationData,
+    };
 
     fn temp_store() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -836,6 +880,70 @@ mod tests {
         assert!(
             first < second && second < earlier_clock,
             "timestamps repeated or went backwards: {first}, {second}, {earlier_clock}"
+        );
+    }
+
+    fn group_message_from(sender: uuid::Uuid, master_key: [u8; 32]) -> Content {
+        let at = chrono::Utc::now();
+        Content {
+            metadata: Metadata {
+                sender: convert::aci(ServiceId::new(sender)).into(),
+                destination: convert::aci(ServiceId::parse(ME).expect("uuid")).into(),
+                sender_device: presage::libsignal_service::protocol::DeviceId::new(1)
+                    .expect("device 1"),
+                pni_verified: None,
+                client_timestamp: at,
+                server_timestamp: at,
+                needs_receipt: false,
+                unidentified_sender: true,
+                was_plaintext: false,
+                server_guid: None,
+            },
+            body: ContentBody::DataMessage(presage::proto::DataMessage {
+                body: Some("hello group".into()),
+                timestamp: Some(1),
+                group_v2: Some(GroupContextV2 {
+                    master_key: Some(master_key.to_vec()),
+                    revision: Some(1),
+                    group_change: None,
+                }),
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// Someone removed from a group still knows its master key. A message from
+    /// a non-member of a group is dropped, not stored as group traffic, or a
+    /// former member could put words in the group's mouth.
+    #[tokio::test]
+    async fn message_from_a_non_member_of_a_group_is_dropped() {
+        let (_dir, path) = temp_store();
+        register_linked(&path).await;
+        let me = uuid::Uuid::parse_str(ME).expect("uuid");
+        let (member, outsider) = (uuid::Uuid::from_u128(0xa11ce), uuid::Uuid::from_u128(0xbad));
+        seed(&path, move |store| async move {
+            store
+                .save_group([4; 32], cached_group("cats", &[me, member]))
+                .await
+                .expect("saved");
+        })
+        .await;
+        let signal = PresageSignal::open(&path, &KEY).await.expect("opens");
+        let store = signal.manager.store().clone();
+        let (from_member, from_outsider) = signal
+            .worker
+            .run(move || async move {
+                (
+                    admitted(&store, &group_message_from(member, [4; 32])).await,
+                    admitted(&store, &group_message_from(outsider, [4; 32])).await,
+                )
+            })
+            .await
+            .expect("worker ran");
+        assert!(from_member, "a member's group message was dropped");
+        assert!(
+            !from_outsider,
+            "a non-member's message was admitted as group traffic"
         );
     }
 

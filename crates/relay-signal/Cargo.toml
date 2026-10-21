@@ -13,6 +13,7 @@ relay-core.workspace = true
 serde.workspace = true
 uuid.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 url = "2.5.8"
 # NOTE: pinned to an exact rev (PRD anti-goal 7: no fork, pin a revision). presage's
 # sqlite store brings the bundled SQLCipher the whole binary shares; see the root
