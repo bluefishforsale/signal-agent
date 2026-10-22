@@ -66,12 +66,25 @@ pub struct Services {
 /// driver until it ends, which can be an hour, so a Skip click queued behind it
 /// would never be seen.
 #[derive(Clone)]
-pub struct HistorySkip(Arc<watch::Sender<bool>>);
+pub struct HistorySkip(Arc<watch::Sender<Import>>);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Import {
+    Idle,
+    Running,
+    Skipped,
+}
 
 impl HistorySkip {
-    /// Abandons the history import running now, or the next one to start.
-    pub fn skip(&self) {
-        self.0.send_replace(true);
+    /// Abandons the history import running now. Returns whether one was.
+    pub fn skip(&self) -> bool {
+        self.0.send_if_modified(|import| {
+            let running = *import == Import::Running;
+            if running {
+                *import = Import::Skipped;
+            }
+            running
+        })
     }
 }
 
@@ -111,7 +124,7 @@ impl Driver {
             provisioner: None,
             called: false,
             clock: Arc::new(SystemClock),
-            skip: HistorySkip(Arc::new(watch::Sender::new(false))),
+            skip: HistorySkip(Arc::new(watch::Sender::new(Import::Idle))),
         }
     }
 
@@ -237,14 +250,13 @@ impl Driver {
                     let event = SetupEvent::HistoryProgress { imported, total };
                     pending.extend(apply(state, event, show));
                 };
+                self.skip.0.send_replace(Import::Running);
                 let mut skipped = self.skip.0.subscribe();
                 let outcome = tokio::select! {
                     outcome = self.services.history.import(&mut progress) => Some(outcome),
-                    _ = skipped.wait_for(|skip| *skip) => None,
+                    _ = skipped.wait_for(|import| *import == Import::Skipped) => None,
                 };
-                // Cleared only once the import ends, so a click that lands just
-                // before it starts still counts, and a late one can't cancel a retry.
-                self.skip.0.send_replace(false);
+                self.skip.0.send_replace(Import::Idle);
                 match outcome {
                     None => SetupEvent::SkipHistory,
                     Some(outcome) => match outcome? {
@@ -964,6 +976,32 @@ mod tests {
         );
     }
 
+    /// Skip only stops an import in progress. Pressed at any other time (a
+    /// terminal's Ctrl-C at a prompt, a late click) it must report that it did
+    /// nothing, and must not cancel an import that starts later.
+    #[tokio::test]
+    async fn a_skip_with_no_import_running_does_nothing() {
+        let world = World::new()
+            .link(vec![linked()])
+            .import(Ok(vec![(1, Some(1))]));
+        let mut h = Harness::new(&world);
+        h.send(LINK).await;
+        assert!(!h.driver.history_skip().skip(), "claimed to skip nothing");
+        h.send(SetupEvent::AccessChosen {
+            access: AccessMode::Full,
+        })
+        .await;
+        assert!(
+            h.shown.contains(&SetupState::ImportingHistory {
+                imported: 1,
+                total: Some(1),
+                access: AccessMode::Full
+            }),
+            "a stale skip cut the import short: {:?}",
+            h.shown
+        );
+    }
+
     /// The phone may take up to an hour to send history, or never send it.
     /// Skip must stop waiting at once and finish setup, from the moment the
     /// history screen shows.
@@ -977,8 +1015,9 @@ mod tests {
             access: AccessMode::Full,
         };
         let press = async {
-            tokio::task::yield_now().await;
-            skip.skip();
+            while !skip.skip() {
+                tokio::task::yield_now().await;
+            }
         };
         let (done, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             tokio::join!(h.send(access), press)
