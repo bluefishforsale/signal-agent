@@ -46,6 +46,7 @@ impl Registry {
             .with(local::MarkAsUnread)
             .with(local::ClearLocalStore)
             .with(local::PruneStore)
+            .with(local::DeleteLocalMessages)
             .with(pins::PinMessage)
             .with(pins::UnpinMessage)
             .with(polls::CreatePoll)
