@@ -2,9 +2,12 @@
 //! and run. Access rules live in the registry, not in each tool, so a new tool
 //! can't forget them.
 
+mod directory;
 mod input;
+mod mutate;
 mod read;
 mod registry;
+mod send;
 #[cfg(test)]
 mod testing;
 mod tool;

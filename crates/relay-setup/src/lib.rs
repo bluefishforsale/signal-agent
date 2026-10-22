@@ -3,6 +3,7 @@
 //! setup is tested without either.
 
 pub mod claude;
+pub mod driver;
 mod machine;
 mod uninstall;
 

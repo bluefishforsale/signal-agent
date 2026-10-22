@@ -5,7 +5,7 @@ use std::sync::Arc;
 use relay_core::prelude::*;
 use serde_json::Value;
 
-use crate::{Tool, ToolContext, ToolError, read};
+use crate::{Tool, ToolContext, ToolError, directory, mutate, read, send};
 
 /// The set of tools a profile serves.
 #[derive(Clone, Default)]
@@ -24,6 +24,19 @@ impl Registry {
             .with(read::GetUnread)
             .with(read::GetConversation)
             .with(read::SearchMessages)
+            .with(send::SendMessage)
+            .with(send::SendGroupMessage)
+            .with(send::SendNoteToSelf)
+            .with(send::SetTyping)
+            .with(send::SendReadReceipt)
+            .with(mutate::ReactToMessage)
+            .with(mutate::EditMessage)
+            .with(mutate::DeleteMessage)
+            .with(mutate::DeleteGroupMessage)
+            .with(directory::ListContacts)
+            .with(directory::ListGroups)
+            .with(directory::ListAttachments)
+            .with(directory::GetAttachment)
     }
 
     pub fn with(mut self, tool: impl Tool + 'static) -> Self {
@@ -186,12 +199,14 @@ mod tests {
     fn sample(name: &str, prop: &Value) -> Value {
         match prop["format"].as_str() {
             Some("signal-recipient" | "signal-service-id") => json!(sid(2).to_string()),
+            Some("signal-group-id") => json!("ab".repeat(32)),
             Some("iso-datetime") => json!("2024-01-01T00:00:00Z"),
             Some(other) => panic!("{name}: no sample for format \"{other}\"; add one here"),
             None => match prop["type"].as_str() {
                 Some("string") => json!("x"),
                 Some("integer") => prop["minimum"].clone(),
                 Some("boolean") => json!(true),
+                Some("array") => json!([sample(name, &prop["items"])]),
                 other => panic!("{name}: no sample for type {other:?}; add one here"),
             },
         }
@@ -220,6 +235,11 @@ mod tests {
                         bad.extend(malformed_ids);
                         bad.push(json!("ab".repeat(32)));
                     }
+                    // A group-only field must also refuse a well-formed person.
+                    Some("signal-group-id") => {
+                        bad.extend(malformed_ids);
+                        bad.push(json!(sid(2).to_string()));
+                    }
                     Some("iso-datetime") => bad.extend([
                         json!("yesterday"),
                         json!("2024-13-01"),
@@ -247,9 +267,53 @@ mod tests {
                 ]);
             }
             Some("boolean") => bad.extend([json!("true"), json!(1)]),
+            // An empty array is already refused above, so arrays must not be empty.
+            Some("array") => {
+                let (Some(1..), Some(max)) = (prop["minItems"].as_u64(), prop["maxItems"].as_u64())
+                else {
+                    panic!(
+                        "{name}: array properties must declare minItems >= 1 and maxItems: {prop}"
+                    );
+                };
+                let item = sample(name, &prop["items"]);
+                let too_many = vec![item; max as usize + 1];
+                bad.extend([json!("x"), json!(1), json!(true), json!(too_many)]);
+                bad.extend(
+                    bad_values(name, &prop["items"])
+                        .into_iter()
+                        .map(|v| json!([v])),
+                );
+            }
             other => panic!("{name}: no bad values for type {other:?}; add some here"),
         }
         bad
+    }
+
+    /// Stores the messages a tool's sample input can name, so tools that act
+    /// on a stored message (react, edit, delete) take their valid path on the
+    /// sample: one from this account and one from the sample contact, both at
+    /// the smallest timestamp, in the sample's conversation.
+    // NOTE: the conversation must follow the sample. This account's message at
+    // that timestamp can exist only once, and a group tool needs it in the
+    // group while a DM tool needs it in the DM.
+    async fn seed(ctx: &ToolContext, sample: &serde_json::Map<String, Value>) {
+        let conversation = match sample.get("group_id").and_then(Value::as_str) {
+            Some(g) => Recipient::Group(GroupId::parse(g).expect("sample group id")),
+            None => Recipient::Contact(sid(2)),
+        };
+        for (author, from_me) in [(sid(ME), true), (sid(2), false)] {
+            let message = Message {
+                id: MessageId {
+                    author,
+                    sent_at_ms: 1,
+                },
+                conversation,
+                sender: author,
+                from_me,
+                ..incoming(2, 1, "sample target")
+            };
+            ctx.store.insert(&message).await.expect("seed store");
+        }
     }
 
     /// Calls `tool` on a fresh full-access primary profile in its own task, so
@@ -257,9 +321,11 @@ mod tests {
     async fn probe(
         registry: &Registry,
         tool: &str,
+        sample: &serde_json::Map<String, Value>,
         input: Value,
     ) -> (Result<Value, ToolError>, usize) {
         let (ctx, signal) = ctx(AccessMode::Full, ProfileKind::Primary);
+        seed(&ctx, sample).await;
         let (registry, name, sent_input) = (registry.clone(), tool.to_owned(), input.clone());
         let task = tokio::spawn(async move { registry.call(&ctx, &name, sent_input).await });
         match task.await {
@@ -297,7 +363,7 @@ mod tests {
                 .map(|(k, p)| (k.clone(), sample(&format!("{name}.{k}"), p)))
                 .collect();
 
-            let (result, _) = probe(&registry, name, Value::Object(valid.clone())).await;
+            let (result, _) = probe(&registry, name, &valid, Value::Object(valid.clone())).await;
             assert!(
                 !matches!(result, Err(ToolError::InvalidInput(_))),
                 "{name} refused its own schema's sample input {valid:?}: {result:?}"
@@ -324,7 +390,7 @@ mod tests {
             }
             for input in probes {
                 let input = Value::Object(input);
-                let (result, sent) = probe(&registry, name, input.clone()).await;
+                let (result, sent) = probe(&registry, name, &valid, input.clone()).await;
                 assert!(
                     matches!(result, Err(ToolError::InvalidInput(_))),
                     "{name} did not refuse {input} as invalid: {result:?}"
