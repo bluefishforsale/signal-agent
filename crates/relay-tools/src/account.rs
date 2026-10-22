@@ -102,4 +102,19 @@ mod tests {
             }]
         );
     }
+
+    /// An update naming no field would still spend a day's budget and upload
+    /// an unchanged profile, so it must be refused before either.
+    #[tokio::test]
+    async fn update_profile_with_no_fields_is_refused_as_invalid() {
+        let (ctx, signal) = ctx(AccessMode::Full, ProfileKind::Primary);
+        let result = Registry::standard()
+            .call(&ctx, "update_profile", json!({}))
+            .await;
+        assert!(
+            matches!(result, Err(crate::ToolError::InvalidInput(_))),
+            "{result:?}"
+        );
+        assert!(signal.profile_updates().is_empty());
+    }
 }

@@ -235,6 +235,44 @@ mod tests {
         assert!(signal.sent().is_empty(), "a read-only sweep reached Signal");
     }
 
+    /// Sweep every shipped tool: on a linked profile a primary-only tool must
+    /// be neither listed nor run, even with full access and an input its own
+    /// schema accepts, and nothing may reach Signal. Linked profiles are the
+    /// owner's own identity, so this is the gate that keeps a client from
+    /// renaming them. New tools are covered by being registered.
+    #[tokio::test]
+    async fn every_primary_only_standard_tool_is_hidden_and_refused_on_linked_profiles() {
+        let registry = Registry::standard();
+        let (linked, signal) = ctx(AccessMode::Full, ProfileKind::Linked);
+        let primary_only: Vec<_> = registry
+            .all()
+            .filter(|t| t.needs_primary() && !EXCLUDED.contains(&t.name()))
+            .collect();
+        assert!(
+            !primary_only.is_empty(),
+            "no primary-only tool is registered, so this sweep checks nothing"
+        );
+        for tool in primary_only {
+            let name = tool.name();
+            let listed = registry.visible(&linked).any(|t| t.name() == name);
+            assert!(
+                !listed,
+                "primary-only tool {name} visible on a linked profile"
+            );
+            let (valid, _) = object_probes(name, &tool.input_schema());
+            let result = registry.call(&linked, name, Value::Object(valid)).await;
+            assert!(
+                matches!(result, Err(ToolError::NeedsPrimary(_))),
+                "{name} on a linked profile returned {result:?}"
+            );
+        }
+        assert!(signal.sent().is_empty(), "a linked sweep reached Signal");
+        assert!(
+            signal.profile_updates().is_empty(),
+            "a linked sweep changed the profile"
+        );
+    }
+
     /// A value the property's schema accepts, so each probe below breaks
     /// exactly one field of an otherwise valid input.
     fn sample(name: &str, prop: &Value) -> Value {
