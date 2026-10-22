@@ -13,6 +13,8 @@ use url::Url;
 #[derive(Debug, PartialEq, Eq)]
 enum Waited {
     Ready { cdn: u32, key: String },
+    Relink,
+    NoUpload,
 }
 
 /// The new device's view of Signal's servers, enough to fetch one archive.
@@ -37,6 +39,7 @@ struct Patience {
 #[serde(untagged)]
 enum ArchiveResponse {
     Ready { cdn: u32, key: String },
+    Failed { error: String },
 }
 
 /// A client for Signal's hosts, configured by `builder`.
@@ -84,11 +87,18 @@ impl ArchiveSource {
                     response.status()
                 );
             }
-            let ArchiveResponse::Ready { cdn, key } = response
+            let answer = response
                 .json()
                 .await
                 .context("Signal's answer about the history archive is unreadable")?;
-            return Ok(Waited::Ready { cdn, key });
+            return match answer {
+                ArchiveResponse::Ready { cdn, key } => Ok(Waited::Ready { cdn, key }),
+                ArchiveResponse::Failed { error } => match error.as_str() {
+                    "RELINK_REQUESTED" => Ok(Waited::Relink),
+                    "CONTINUE_WITHOUT_UPLOAD" => Ok(Waited::NoUpload),
+                    _ => bail!("the phone failed to send its history: {error}"),
+                },
+            };
         }
     }
 }
@@ -219,5 +229,19 @@ mod tests {
             }
         );
         assert_eq!(server.requests().len(), 3, "{:?}", server.requests());
+    }
+
+    /// The phone's two failure answers mean different things to the user:
+    /// link again, or carry on without history. Neither is an error.
+    #[tokio::test]
+    async fn the_phones_error_answers_say_relink_or_carry_on() {
+        for (body, expected) in [
+            (r#"{"error":"RELINK_REQUESTED"}"#, Waited::Relink),
+            (r#"{"error":"CONTINUE_WITHOUT_UPLOAD"}"#, Waited::NoUpload),
+        ] {
+            let server = FakeServer::start(vec![json("200 OK", body)]).await;
+            let waited = source(&server).wait_for_archive().await.expect(body);
+            assert_eq!(waited, expected, "{body}");
+        }
     }
 }
