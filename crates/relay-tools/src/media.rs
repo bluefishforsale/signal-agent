@@ -148,7 +148,7 @@ fn path_schema() -> Value {
     })
 }
 
-fn paths_schema() -> Value {
+pub(crate) fn paths_schema() -> Value {
     json!({
         "type": "array",
         "items": path_schema(),
@@ -160,10 +160,13 @@ fn paths_schema() -> Value {
 
 /// The files named by `path` and `paths` together: at least one, at most
 /// MAX_FILES, none blank.
-fn files(path: Option<String>, paths: Option<Vec<String>>) -> Result<Vec<String>, ToolError> {
+pub(crate) fn files(
+    path: Option<String>,
+    paths: Option<Vec<String>>,
+) -> Result<Vec<String>, ToolError> {
     if paths.as_ref().is_some_and(Vec::is_empty) {
         return Err(ToolError::InvalidInput(
-            "paths must name at least one file".into(),
+            "a file list must name at least one file".into(),
         ));
     }
     let all: Vec<_> = path
@@ -172,7 +175,7 @@ fn files(path: Option<String>, paths: Option<Vec<String>>) -> Result<Vec<String>
         .collect();
     if !(1..=MAX_FILES).contains(&all.len()) {
         return Err(ToolError::InvalidInput(format!(
-            "send 1 to {MAX_FILES} files, given as path or paths; got {}",
+            "send 1 to {MAX_FILES} files at a time, got {}",
             all.len()
         )));
     }
@@ -298,9 +301,19 @@ mod tests {
     /// Asserts `input` to send_attachment was refused with a message
     /// containing `why`, and that no file was uploaded and nothing sent.
     async fn refused(ctx: &ToolContext, signal: &FakeSignal, input: serde_json::Value, why: &str) {
-        let result = Registry::standard()
-            .call(ctx, "send_attachment", input.clone())
-            .await;
+        refused_by(ctx, signal, "send_attachment", input, why).await;
+    }
+
+    /// Asserts `tool` refused `input` with a message containing `why`, and
+    /// that no file was uploaded and nothing sent.
+    async fn refused_by(
+        ctx: &ToolContext,
+        signal: &FakeSignal,
+        tool: &str,
+        input: serde_json::Value,
+        why: &str,
+    ) {
+        let result = Registry::standard().call(ctx, tool, input.clone()).await;
         assert!(
             matches!(&result, Err(e) if e.to_string().contains(why)),
             "{input} was not refused for \"{why}\": {result:?}"
@@ -405,6 +418,40 @@ mod tests {
             panic!("expected one text with files, sent {sent:?}");
         };
         assert_eq!(*to, Recipient::Group(group));
+        assert_eq!(attachments.len(), 1, "{attachments:?}");
+    }
+
+    /// Note to Self takes files too, through the same send folders: it syncs
+    /// to every linked device, so it is still a way off this machine.
+    #[tokio::test]
+    async fn send_note_to_self_attaches_files_only_from_a_send_root() {
+        let dir = tree();
+        let (ctx, signal) = ctx_with_roots(&[&dir.path().join("outbox")]);
+        let secret = dir.path().join("secret");
+        let input = json!({"message": "keys", "attachments": [secret.to_str().unwrap()]});
+        refused_by(
+            &ctx,
+            &signal,
+            "send_note_to_self",
+            input,
+            "outside the folders",
+        )
+        .await;
+
+        let cat = dir.path().join("outbox/cat.png");
+        Registry::standard()
+            .call(
+                &ctx,
+                "send_note_to_self",
+                json!({"message": "cat", "attachments": [cat.to_str().unwrap()]}),
+            )
+            .await
+            .unwrap();
+        let sent = signal.sent();
+        let [(to, Outgoing::Text { attachments, .. })] = sent.as_slice() else {
+            panic!("expected one note with files, sent {sent:?}");
+        };
+        assert_eq!(*to, Recipient::Contact(sid(ME)));
         assert_eq!(attachments.len(), 1, "{attachments:?}");
     }
 }

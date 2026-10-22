@@ -12,6 +12,7 @@ use crate::{
         Timestamp, contact, contact_schema, group, group_schema, non_blank, parse, recipient,
         recipient_schema,
     },
+    media,
 };
 
 pub struct SendMessage;
@@ -119,6 +120,7 @@ pub struct SendNoteToSelf;
 struct SendNoteToSelfInput {
     message: String,
     quote_timestamp: Option<Timestamp>,
+    attachments: Option<Vec<String>>,
 }
 
 #[async_trait]
@@ -130,7 +132,9 @@ impl Tool for SendNoteToSelf {
         "Send a message to your own Note to Self chat, which syncs to all your Signal \
          devices. Use for reminders, bookmarks or drafts; use send_message to message anyone \
          else. message is the text. To thread a follow-up under an earlier note, pass \
-         quote_timestamp (that note's sent_at_ms). Not idempotent. Saved to the local store. \
+         quote_timestamp (that note's sent_at_ms). attachments are local files to attach (at \
+         most 32), which must be inside a send folder the user chose under Advanced settings; \
+         with none chosen no file can be sent. Not idempotent. Saved to the local store. \
          Returns the new message's id."
     }
     fn input_schema(&self) -> Value {
@@ -139,6 +143,7 @@ impl Tool for SendNoteToSelf {
             "properties": {
                 "message": {"type": "string", "minLength": 1, "description": "Note text to save"},
                 "quote_timestamp": Timestamp::schema("Send time of the note being followed up on"),
+                "attachments": media::paths_schema(),
             },
             "required": ["message"],
             "additionalProperties": false,
@@ -155,7 +160,11 @@ impl Tool for SendNoteToSelf {
             author: me,
             sent_at_ms: t.ms(),
         });
-        send_text(ctx, Recipient::Contact(me), body, quote, vec![]).await
+        let attachments = match input.attachments {
+            Some(paths) => media::upload(ctx, &media::files(None, Some(paths))?).await?,
+            None => vec![],
+        };
+        send_text(ctx, Recipient::Contact(me), body, quote, attachments).await
     }
 }
 
