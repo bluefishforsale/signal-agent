@@ -84,7 +84,8 @@ pub struct Limiter {
     state: Mutex<State>,
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
 struct State {
     minute: Bucket,
     hour: Bucket,
@@ -95,7 +96,7 @@ struct State {
 /// A token bucket in exact integer units: one token is `window_ms` units, and
 /// it refills `capacity` units per millisecond, so a full bucket takes one
 /// window to refill from empty.
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct Bucket {
     level: u64,
     last_ms: Option<u64>,
@@ -131,13 +132,13 @@ impl Limiter {
         }
     }
 
-    /// Keeps the new-recipient count in `path`, so a restart doesn't reset it.
+    /// Keeps the send budget and new-recipient count in `path`, so a restart
+    /// doesn't reset them.
     pub fn persisted(mut self, path: PathBuf) -> anyhow::Result<Self> {
         match std::fs::read(&path) {
             Ok(bytes) => {
-                self.state.get_mut().expect("limiter state").first_contacts =
-                    serde_json::from_slice(&bytes)
-                        .with_context(|| format!("unreadable limits file {}", path.display()))?;
+                *self.state.get_mut().expect("limiter state") = serde_json::from_slice(&bytes)
+                    .with_context(|| format!("unreadable limits file {}", path.display()))?;
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
@@ -192,9 +193,11 @@ impl Limiter {
         state.hour.take(HOUR_MS);
         if first {
             state.first_contacts.push((to, now));
-            if let Some(path) = &self.path {
-                write_atomically(path, &serde_json::to_vec(&state.first_contacts)?)?;
-            }
+        }
+        // NOTE: saved before the send, so a crash mid-send costs a token
+        // rather than handing one back.
+        if let Some(path) = &self.path {
+            write_atomically(path, &serde_json::to_vec(&*state)?)?;
         }
         Ok(())
     }
@@ -503,6 +506,36 @@ mod tests {
             result.is_ok(),
             "the cap did not reset after a day: {result:?}"
         );
+    }
+
+    /// Restarting the agent must not refill the send buckets, or a client that
+    /// can crash the agent gets a fresh burst each time.
+    #[tokio::test]
+    async fn the_send_buckets_survive_a_restart() {
+        let dir = std::env::temp_dir().join(format!("relay-limits-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("limits.json");
+        let clock = Arc::new(FakeClock::default());
+        let start = || {
+            Limiter::new(Limits::default(), clock.clone())
+                .persisted(path.clone())
+                .expect("load limiter state")
+        };
+        let (ctx, signal) = ctx();
+        let input = json!({"recipient": sid(2).to_string(), "message": "hi"});
+        let registry = Registry::standard().with_limiter(start());
+        for i in 0..20 {
+            let result = registry.call(&ctx, "send_message", input.clone()).await;
+            assert!(result.is_ok(), "send {i} refused: {result:?}");
+        }
+        let registry = Registry::standard().with_limiter(start());
+        let result = registry.call(&ctx, "send_message", input).await;
+        assert!(
+            refused(&result).is_some(),
+            "a restart refilled the minute bucket: {result:?}"
+        );
+        assert_eq!(signal.sent().len(), 20, "a refused send reached Signal");
+        std::fs::remove_dir_all(&dir).expect("clean temp dir");
     }
 
     /// Restarting the agent must not hand out a fresh day of first contacts.
