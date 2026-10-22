@@ -1,13 +1,18 @@
 //! The local message history every read tool answers from. The agent writes
 //! everything it receives here, so history survives while no Claude app runs.
 
+#[cfg(test)]
+mod contract;
 mod memory;
+mod sqlcipher;
 
+use anyhow::bail;
 use async_trait::async_trait;
 use relay_core::prelude::*;
 use serde::{Deserialize, Serialize};
 
 pub use memory::MemoryStore;
+pub use sqlcipher::SqlCipherStore;
 
 /// A full-text search with optional filters.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,4 +96,19 @@ pub trait MessageStore: Send + Sync {
     async fn close(&self) -> anyhow::Result<()> {
         Ok(())
     }
+}
+
+/// Signal only lets a message's author edit or delete it.
+pub(crate) fn ensure_author(
+    target: MessageId,
+    actor: ServiceId,
+    action: &str,
+) -> anyhow::Result<()> {
+    if actor != target.author {
+        bail!(
+            "{actor} tried to {action} a message written by {}",
+            target.author
+        );
+    }
+    Ok(())
 }
