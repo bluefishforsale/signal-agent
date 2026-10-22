@@ -34,8 +34,13 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # A crates.io fetch dropped mid-TLS once inside the focal container; retry harder.
+  # crates.io and git fetches flake on hosted runners ("curl failed", HTTP2
+  # framing errors); retry harder, wait longer, skip HTTP2 multiplexing, and let
+  # the git CLI fetch git dependencies.
   CARGO_NET_RETRY: 10
+  CARGO_HTTP_TIMEOUT: 60
+  CARGO_HTTP_MULTIPLEXING: false
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
   TAURI_CLI: npx --yes @tauri-apps/cli@2.12.4
 
 defaults:
