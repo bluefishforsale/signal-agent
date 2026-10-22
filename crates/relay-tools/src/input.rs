@@ -85,6 +85,39 @@ impl TryFrom<u64> for Offset {
     }
 }
 
+/// A message's send time in epoch milliseconds, as Signal identifies it:
+/// 1 to 2^53 - 1, the integers a JSON client can carry exactly.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(try_from = "u64")]
+pub struct Timestamp(u64);
+
+impl Timestamp {
+    const MAX: u64 = (1 << 53) - 1;
+
+    pub fn schema(description: &str) -> Value {
+        json!({
+            "type": "integer",
+            "minimum": 1,
+            "maximum": Self::MAX,
+            "description": format!("{description}: epoch milliseconds, the timestamp in a message id"),
+        })
+    }
+
+    pub fn ms(self) -> u64 {
+        self.0
+    }
+}
+
+impl TryFrom<u64> for Timestamp {
+    type Error = String;
+    fn try_from(n: u64) -> Result<Self, String> {
+        match n {
+            1..=Self::MAX => Ok(Self(n)),
+            _ => Err(format!("timestamp must be 1 to {}, got {n}", Self::MAX)),
+        }
+    }
+}
+
 pub fn recipient_schema() -> Value {
     json!({
         "type": "string",
@@ -137,6 +170,19 @@ pub async fn contact(ctx: &ToolContext, s: &str) -> Result<ServiceId, ToolError>
             "\"{s}\" is a group id; this needs a person"
         ))),
     }
+}
+
+pub fn group_schema() -> Value {
+    json!({
+        "type": "string",
+        "format": "signal-group-id",
+        "description": "A group id (64 hex characters), as list_conversations returns it",
+    })
+}
+
+/// A group, by id; a person is refused.
+pub fn group(s: &str) -> Result<GroupId, ToolError> {
+    GroupId::parse(s).map_err(|e| ToolError::InvalidInput(e.to_string()))
 }
 
 /// Text that must say something: refused when empty or only whitespace.
