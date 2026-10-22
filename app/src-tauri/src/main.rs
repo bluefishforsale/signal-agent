@@ -124,6 +124,20 @@ fn main() {
                 }
             };
             app.manage(Session::new(start_state(), driver(), Box::new(redraw)));
+            // Screenshot mode for development builds: a fixed theme, kept on top.
+            #[cfg(feature = "mock-driver")]
+            if let (Ok(theme), Some(window)) = (
+                std::env::var("RELAY_SCREENSHOT"),
+                app.get_webview_window("main"),
+            ) {
+                let light = theme == "light";
+                window.set_theme(Some(if light {
+                    tauri::Theme::Light
+                } else {
+                    tauri::Theme::Dark
+                }))?;
+                window.set_always_on_top(true)?;
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

@@ -196,8 +196,10 @@ mod tests {
         ]
     }
 
+    const PAGE: &str = include_str!("../../ui/index.html");
+
     /// The page picks its screen by the state's name, so every state needs a
-    /// screen of the same name or the window goes blank.
+    /// screen of the same name, and a section for it, or the window goes blank.
     #[test]
     fn every_state_has_a_screen_of_the_same_name() {
         for state in every_state() {
@@ -206,6 +208,8 @@ mod tests {
             let screen_name = tag(serde_json::to_value(view(&state)).unwrap(), "screen");
             assert!(state_name.is_some(), "untagged state {state:?}");
             assert_eq!(screen_name, state_name, "for {state:?}");
+            let section = format!(r#"data-screen="{}""#, screen_name.unwrap_or_default());
+            assert!(PAGE.contains(&section), "index.html has no {section}");
         }
     }
 

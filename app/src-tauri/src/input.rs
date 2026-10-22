@@ -120,4 +120,62 @@ mod tests {
             );
         }
     }
+
+    /// app.js builds these payloads by hand; if one stops matching setup's
+    /// event shape, its button silently does nothing.
+    #[test]
+    fn every_payload_the_page_sends_is_a_setup_event_it_may_send() {
+        let page = include_str!("../../ui/app.js");
+        let sent = [
+            (
+                r#"event: "account_chosen", choice: "#,
+                r#"{"event":"account_chosen","choice":"link_existing"}"#,
+            ),
+            (
+                r#"event: "account_chosen", choice: "#,
+                r#"{"event":"account_chosen","choice":"own_number"}"#,
+            ),
+            (
+                r#"event: "access_chosen", access: "#,
+                r#"{"event":"access_chosen","access":"full"}"#,
+            ),
+            (
+                r#"event: "access_chosen", access: "#,
+                r#"{"event":"access_chosen","access":"read_only"}"#,
+            ),
+            (
+                r#"event: "restart_desktop""#,
+                r#"{"event":"restart_desktop"}"#,
+            ),
+            (r#"event: "retry""#, r#"{"event":"retry"}"#),
+            (
+                r#"event: "number_entered", number: "#,
+                r#"{"event":"number_entered","number":"+15555550123"}"#,
+            ),
+            (
+                r#"event: "captcha_solved", token: "#,
+                r#"{"event":"captcha_solved","token":"t"}"#,
+            ),
+            (
+                r#"event: "code_entered", code: "#,
+                r#"{"event":"code_entered","code":"123456"}"#,
+            ),
+        ];
+        for (in_page, json) in sent {
+            assert!(page.contains(in_page), "app.js no longer sends {in_page}");
+            let event: SetupEvent = serde_json::from_str(json)
+                .unwrap_or_else(|e| panic!("{json} is not a setup event: {e}"));
+            assert!(
+                from_page(event).is_some(),
+                "{json} is refused from the page"
+            );
+        }
+        let html = include_str!("../../ui/index.html");
+        for value in ["link_existing", "own_number", "full", "read_only"] {
+            assert!(
+                html.contains(&format!(r#"value="{value}""#)),
+                "no {value} choice in index.html"
+            );
+        }
+    }
 }
