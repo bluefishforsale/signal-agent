@@ -569,7 +569,7 @@ async fn link(
             async move {
                 if let Ok(uri) = uri_rx.await {
                     let _ = tx.send(Ok(LinkEvent::Uri {
-                        uri: uri.to_string(),
+                        uri: offering_history(uri).to_string(),
                     }));
                 }
             }
@@ -592,6 +592,16 @@ async fn link(
         let _ = tx.send(event);
         return;
     }
+}
+
+/// `uri` with the capabilities Signal Desktop advertises, so the phone offers
+/// to transfer its message history.
+// NOTE: libsignal-service builds the URI without them; Android skips the offer
+// unless `backup5` is here (docs/link-and-sync.md).
+fn offering_history(mut uri: url::Url) -> url::Url {
+    uri.query_pairs_mut()
+        .append_pair("capabilities", "nopni,nopni2,backup5");
+    uri
 }
 
 async fn send(
@@ -1705,6 +1715,31 @@ mod tests {
         assert!(
             err.to_string().contains("request a code first"),
             "unclear error: {err:#}"
+        );
+    }
+
+    /// Android only offers to transfer history when the QR code's URI
+    /// advertises backup5 (and checks nopni2); without it the phone links
+    /// silently without history and never sends a key.
+    #[test]
+    fn the_link_uri_asks_the_phone_to_offer_history() {
+        let uri = url::Url::parse("sgnl://linkdevice?uuid=abc&pub_key=xyz").expect("uri");
+        let offered = offering_history(uri);
+        let query: HashMap<_, _> = offered.query_pairs().into_owned().collect();
+        assert_eq!(
+            query.get("capabilities").map(String::as_str),
+            Some("nopni,nopni2,backup5"),
+            "{offered}"
+        );
+        assert_eq!(
+            query.get("uuid").map(String::as_str),
+            Some("abc"),
+            "{offered}"
+        );
+        assert_eq!(
+            query.get("pub_key").map(String::as_str),
+            Some("xyz"),
+            "{offered}"
         );
     }
 
