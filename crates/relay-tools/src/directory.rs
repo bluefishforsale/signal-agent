@@ -227,6 +227,7 @@ impl Tool for GetAttachment {
             })?;
         too_big(&id, attachment.size)?;
         let bytes = ctx.signal.attachment(&attachment).await?;
+        too_big(&id, bytes.len() as u64)?;
         Ok(json!({
             "id": attachment.id,
             "content_type": attachment.content_type,
@@ -506,6 +507,26 @@ mod tests {
         assert!(
             matches!(&result, Err(ToolError::InvalidInput(e)) if e.contains("5 MiB")),
             "got {result:?}"
+        );
+    }
+
+    /// The declared size comes from the sender, so a file that claims to be
+    /// small but isn't must still be refused once its real size is known.
+    #[tokio::test]
+    async fn get_attachment_refuses_a_file_whose_real_size_exceeds_the_cap() {
+        let real = usize::try_from(super::MAX_ATTACHMENT_BYTES).unwrap() + 1;
+        let ctx = ctx_of(|s| s.with_attachment("liar", vec![0; real]));
+        ctx.store
+            .insert(&with_attachments(2, 100, &["liar"]))
+            .await
+            .unwrap();
+        let result = Registry::standard()
+            .call(&ctx, "get_attachment", json!({"filename": "liar"}))
+            .await;
+        assert!(
+            matches!(&result, Err(ToolError::InvalidInput(e)) if e.contains("5 MiB")),
+            "got {:?}",
+            result.map(|_| "a file over the cap")
         );
     }
 }
