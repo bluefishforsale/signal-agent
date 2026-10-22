@@ -2,14 +2,19 @@
 //! commands they return against injected services, and feeds the results back
 //! in, so each front end only renders states and reports what the user did.
 
-use std::{collections::VecDeque, fs, path::Path, sync::Arc};
+use std::{
+    collections::VecDeque,
+    fs, io,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::{Context, bail};
 use async_trait::async_trait;
 use futures::StreamExt;
-use relay_core::prelude::*;
+use relay_core::{LinkAndSyncKey, prelude::*};
 use relay_secrets::{SecretStore, StoreKey};
-use relay_signal::{LinkEvent, Provisioner, RateLimited, RegistrationStep};
+use relay_signal::{HistoryTransfer, LinkEvent, Provisioner, RateLimited, RegistrationStep};
 use relay_tools::{Clock, Limits, Settings, SystemClock};
 use tokio::sync::watch;
 
@@ -26,15 +31,19 @@ pub trait OpenProvisioner: Send + Sync {
     async fn open(&self, path: &Path, key: &StoreKey) -> anyhow::Result<Box<dyn Provisioner>>;
 }
 
-/// Brings a newly linked device's earlier messages into its store.
+/// Writes the history archive a phone sent a newly linked device into its
+/// store.
 #[async_trait]
 pub trait HistoryImport: Send + Sync {
-    /// Imports everything available, reporting messages imported so far and
-    /// the total when known. Returns why there was nothing to import, if so.
+    /// Imports `archive`, encrypted under `key` for the account `our_aci`,
+    /// reporting messages imported so far and the total when known.
     async fn import(
         &self,
+        archive: &Path,
+        key: &LinkAndSyncKey,
+        our_aci: ServiceId,
         progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
-    ) -> anyhow::Result<Option<HistoryGap>>;
+    ) -> anyhow::Result<()>;
 }
 
 /// Signal Desktop's own history on this computer, read only if the user opts in.
@@ -99,6 +108,8 @@ pub struct Driver {
     server: ServerEntry,
     services: Services,
     provisioner: Option<Box<dyn Provisioner>>,
+    /// The account the link created, whose ACI the phone's archive is bound to.
+    linked: Option<ServiceId>,
     clock: Arc<dyn Clock>,
     skip: HistorySkip,
     /// Whether this registration attempt already asked for a call.
@@ -122,6 +133,7 @@ impl Driver {
             server,
             services,
             provisioner: None,
+            linked: None,
             called: false,
             clock: Arc::new(SystemClock),
             skip: HistorySkip(Arc::new(watch::Sender::new(Import::Idle))),
@@ -190,10 +202,15 @@ impl Driver {
                             SetupEvent::LinkUri { uri },
                             show,
                         )),
-                        LinkEvent::Linked { .. } => break,
+                        LinkEvent::Linked { account } => {
+                            self.linked = Some(account.service_id);
+                            break;
+                        }
                     }
                 }
-                self.close_signal_store();
+                // NOTE: the store stays open until the history step ends. The
+                // phone's history key lives only in this provisioner; closing
+                // it here would lose the transfer.
                 SetupEvent::Linked
             }
             Command::RequestCode {
@@ -245,18 +262,45 @@ impl Driver {
                 return Ok(());
             }
             Command::ImportHistory => {
-                let state = &mut self.state;
+                let Self {
+                    state,
+                    provisioner,
+                    linked,
+                    paths,
+                    services,
+                    skip,
+                    ..
+                } = self;
                 let mut progress = |imported, total| {
                     let event = SetupEvent::HistoryProgress { imported, total };
                     pending.extend(apply(state, event, show));
                 };
-                self.skip.0.send_replace(Import::Running);
-                let mut skipped = self.skip.0.subscribe();
+                let history = async {
+                    let (Some(provisioner), Some(aci)) = (provisioner.as_deref(), *linked) else {
+                        return Ok(Some(HistoryGap::NotSent));
+                    };
+                    let (path, key) = match provisioner.transfer_history(&paths.root).await? {
+                        HistoryTransfer::Archive { path, key } => (path, key),
+                        HistoryTransfer::NotOffered | HistoryTransfer::NoUpload => {
+                            return Ok(Some(HistoryGap::NotSent));
+                        }
+                        HistoryTransfer::Relink => return Ok(Some(HistoryGap::RelinkRequested)),
+                        HistoryTransfer::TimedOut => return Ok(Some(HistoryGap::TimedOut)),
+                    };
+                    let archive = Downloaded(path);
+                    services
+                        .history
+                        .import(&archive.0, &key, aci, &mut progress)
+                        .await?;
+                    anyhow::Ok(None)
+                };
+                skip.0.send_replace(Import::Running);
+                let mut skipped = skip.0.subscribe();
                 let outcome = tokio::select! {
-                    outcome = self.services.history.import(&mut progress) => Some(outcome),
+                    outcome = history => Some(outcome),
                     _ = skipped.wait_for(|import| *import == Import::Skipped) => None,
                 };
-                self.skip.0.send_replace(Import::Idle);
+                skip.0.send_replace(Import::Idle);
                 match outcome {
                     None => SetupEvent::SkipHistory,
                     Some(outcome) => match outcome? {
@@ -276,6 +320,7 @@ impl Driver {
                 SetupEvent::DesktopImportDone
             }
             Command::ConnectClients => {
+                self.close_signal_store();
                 self.services.login.register(&self.profile)?;
                 SetupEvent::ClientsConnected {
                     clients: self.services.clients.reregister_missing(&self.server),
@@ -351,6 +396,21 @@ impl Driver {
     }
 }
 
+/// A downloaded history archive, deleted once setup is done with it, however
+/// the import ends.
+struct Downloaded(PathBuf);
+
+impl Drop for Downloaded {
+    fn drop(&mut self) {
+        match fs::remove_file(&self.0) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                tracing::warn!("unable to delete \"{}\": {e}", self.0.display());
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Moves `state` on by `event`, showing it if it changed.
 fn apply(state: &mut SetupState, event: SetupEvent, show: Show<'_>) -> Vec<Command> {
     let (next, commands) = transition(state, event);
@@ -391,7 +451,18 @@ mod tests {
         }
     }
 
-    type Imports = VecDeque<anyhow::Result<(Vec<(u64, Option<u64>)>, Option<HistoryGap>)>>;
+    /// What the phone does about history after a link.
+    enum Sent {
+        /// An archive whose import reports these steps.
+        Archive(Vec<(u64, Option<u64>)>),
+        /// An archive that fails to import.
+        Corrupt,
+        Nothing(HistoryGap),
+        Fails(anyhow::Error),
+        Stalls,
+    }
+
+    const ARCHIVE: &str = "history.archive";
 
     /// The fakes' shared state: what Signal and the OS will do, and everything
     /// every fake did, in order. Clones share it, so two setup runs can see one
@@ -402,8 +473,7 @@ mod tests {
         log: Arc<Mutex<Vec<String>>>,
         links: Arc<Mutex<VecDeque<Vec<anyhow::Result<LinkEvent>>>>>,
         codes: Arc<Mutex<VecDeque<anyhow::Result<RegistrationStep>>>>,
-        imports: Arc<Mutex<Imports>>,
-        stalled: Arc<std::sync::atomic::AtomicBool>,
+        phone: Arc<Mutex<VecDeque<Sent>>>,
         desktop: Arc<Mutex<Option<Vec<u64>>>>,
         failures: Arc<Mutex<Vec<&'static str>>>,
         opened_with: Arc<Mutex<Vec<StoreKey>>>,
@@ -437,8 +507,7 @@ mod tests {
                 log: Arc::default(),
                 links: Arc::default(),
                 codes: Arc::default(),
-                imports: Arc::default(),
-                stalled: Arc::default(),
+                phone: Arc::default(),
                 desktop: Arc::default(),
                 failures: Arc::default(),
                 opened_with: Arc::default(),
@@ -471,25 +540,25 @@ mod tests {
             self
         }
 
-        /// The next history import reports `progress`, or fails.
+        fn sends(self, sent: Sent) -> Self {
+            self.phone.lock().expect("phone").push_back(sent);
+            self
+        }
+
+        /// The phone next sends an archive whose import reports `progress`, or
+        /// fetching it fails.
         fn import(self, progress: anyhow::Result<Vec<(u64, Option<u64>)>>) -> Self {
-            let import = progress.map(|steps| (steps, None));
-            self.imports.lock().expect("imports").push_back(import);
-            self
+            self.sends(progress.map_or_else(Sent::Fails, Sent::Archive))
         }
 
-        /// History imports wait on the phone forever, as a long-poll the phone
-        /// never answers does.
+        /// The phone next keeps the history long-poll waiting forever.
         fn stalled_history(self) -> Self {
-            self.stalled.store(true, Ordering::SeqCst);
-            self
+            self.sends(Sent::Stalls)
         }
 
-        /// The next history import finds nothing to import, for `reason`.
+        /// The phone next sends no history, for `reason`.
         fn no_history(self, reason: HistoryGap) -> Self {
-            let import = Ok((Vec::new(), Some(reason)));
-            self.imports.lock().expect("imports").push_back(import);
-            self
+            self.sends(Sent::Nothing(reason))
         }
 
         /// Signal Desktop is on this computer, and importing it reports `progress`.
@@ -585,6 +654,29 @@ mod tests {
             self.0.push(format!("verify {code}"));
             self.0.next_code()
         }
+
+        async fn transfer_history(&self, dir: &Path) -> anyhow::Result<HistoryTransfer> {
+            self.0.push("transfer history");
+            let sent = self.0.phone.lock().expect("phone").pop_front();
+            let content = match sent.unwrap_or(Sent::Archive(Vec::new())) {
+                Sent::Archive(steps) => serde_json::to_string(&steps)?,
+                Sent::Corrupt => "corrupt".to_owned(),
+                Sent::Nothing(HistoryGap::NotSent) => return Ok(HistoryTransfer::NotOffered),
+                Sent::Nothing(HistoryGap::RelinkRequested) => return Ok(HistoryTransfer::Relink),
+                Sent::Nothing(HistoryGap::TimedOut) => return Ok(HistoryTransfer::TimedOut),
+                Sent::Fails(e) => return Err(e),
+                Sent::Stalls => {
+                    let _waiting = Waiting(self.0.clone());
+                    return futures::future::pending().await;
+                }
+            };
+            let path = dir.join(ARCHIVE);
+            fs::write(&path, content)?;
+            Ok(HistoryTransfer::Archive {
+                path,
+                key: LinkAndSyncKey::new([7; 32]),
+            })
+        }
     }
 
     #[async_trait]
@@ -613,23 +705,17 @@ mod tests {
     impl HistoryImport for World {
         async fn import(
             &self,
+            archive: &Path,
+            _: &LinkAndSyncKey,
+            our_aci: ServiceId,
             progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
-        ) -> anyhow::Result<Option<HistoryGap>> {
-            self.push("import history");
-            if self.stalled.load(Ordering::SeqCst) {
-                let _waiting = Waiting(self.clone());
-                futures::future::pending::<()>().await;
-            }
-            let (steps, gap) = self
-                .imports
-                .lock()
-                .expect("imports")
-                .pop_front()
-                .unwrap_or_else(|| Ok((vec![], None)))?;
+        ) -> anyhow::Result<()> {
+            self.push(format!("import history as {our_aci}"));
+            let steps: Vec<(u64, Option<u64>)> = serde_json::from_slice(&fs::read(archive)?)?;
             for (imported, total) in steps {
                 progress(imported, total);
             }
-            Ok(gap)
+            Ok(())
         }
     }
 
@@ -867,8 +953,9 @@ mod tests {
         assert_eq!(
             after_link,
             [
+                "transfer history",
+                "import history as 00000000-0000-0000-0000-000000000007",
                 "close store",
-                "import history",
                 "start agent personal, access ReadOnly",
                 "claude mcp add -s user signal-personal -- \
                  /tmp/signal-agent mcp, access ReadOnly",
@@ -1031,6 +1118,64 @@ mod tests {
         assert!(
             stopped.is_some() && stopped < started,
             "the wait outlived the skip: {log:?}"
+        );
+    }
+
+    /// The phone's archive is imported as the account just linked, since its
+    /// key is bound to that ACI, and then deleted, all while the link's Signal
+    /// store still holds the transfer; the store closes before the agent opens it.
+    #[tokio::test]
+    async fn the_phones_archive_is_imported_as_the_linked_account_then_deleted() {
+        let world = World::new()
+            .link(vec![linked()])
+            .import(Ok(vec![(5, None)]));
+        let mut h = Harness::new(&world);
+        h.send(LINK).await;
+        h.send(SetupEvent::AccessChosen {
+            access: AccessMode::Full,
+        })
+        .await;
+        let aci = account(ProfileKind::Linked).service_id;
+        let log = world.log();
+        let after_link: Vec<_> = log
+            .iter()
+            .skip_while(|e| !e.starts_with("link as"))
+            .skip(1)
+            .take(4)
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            after_link,
+            [
+                "transfer history",
+                &format!("import history as {aci}"),
+                "close store",
+                "start agent personal, access Full",
+            ],
+            "{log:?}"
+        );
+        assert!(
+            !world.paths().root.join(ARCHIVE).exists(),
+            "the downloaded archive was left behind"
+        );
+    }
+
+    /// An archive that fails to import is deleted all the same; nothing can
+    /// import it later, since the phone's key for it is single-use.
+    #[tokio::test]
+    async fn an_archive_that_fails_to_import_is_still_deleted() {
+        let world = World::new().link(vec![linked()]).sends(Sent::Corrupt);
+        let mut h = Harness::new(&world);
+        h.send(LINK).await;
+        let failed = h
+            .send(SetupEvent::AccessChosen {
+                access: AccessMode::Full,
+            })
+            .await;
+        assert_failed(&failed, "history import");
+        assert!(
+            !world.paths().root.join(ARCHIVE).exists(),
+            "a failed archive was left behind"
         );
     }
 
