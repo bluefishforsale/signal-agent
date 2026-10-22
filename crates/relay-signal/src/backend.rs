@@ -97,6 +97,18 @@ pub struct StickerImage {
     pub bytes: Vec<u8>,
 }
 
+/// Changes to this account's own profile; a `None` field stays as it is.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileUpdate {
+    pub given_name: Option<String>,
+    /// `Some("")` removes the family name.
+    pub family_name: Option<String>,
+    /// `Some("")` removes the about text.
+    pub about: Option<String>,
+    /// `Some("")` removes the about emoji.
+    pub about_emoji: Option<String>,
+}
+
 /// Something to send. Reactions, edits and deletes reference the target by its
 /// `MessageId`, as Signal does.
 // NOTE: every variant here must be classified in relay-tools' limits.rs
@@ -172,6 +184,22 @@ pub enum Outgoing {
     ExpirationTimer {
         seconds: u32,
     },
+    /// Answers a message request from a contact this account hasn't talked
+    /// to. Accepting shares this account's profile with them and tells its
+    /// own devices; deleting only tells its own devices. Only sendable to a
+    /// contact.
+    MessageRequestResponse {
+        response: RequestResponse,
+    },
+}
+
+/// An answer to a message request. Blocking is a storage-service contact
+/// edit, so it isn't one of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestResponse {
+    Accept,
+    Delete,
 }
 
 /// Something that arrived, from another person or synced from the account's
@@ -293,6 +321,13 @@ pub trait SignalBackend: Send + Sync {
         pack: StickerPackId,
         sticker_id: u32,
     ) -> anyhow::Result<Option<StickerImage>>;
+    /// Downloads sticker pack `pack`, decrypted with its 32-byte `key`, from
+    /// Signal's CDN into the local store, and tells this account's other
+    /// devices it was installed.
+    async fn install_sticker_pack(&self, pack: StickerPackId, key: [u8; 32]) -> anyhow::Result<()>;
+    /// Changes this account's name, about text or about emoji as every
+    /// contact sees them, keeping the avatar.
+    async fn update_profile(&self, update: ProfileUpdate) -> anyhow::Result<()>;
 }
 
 /// Progress while linking as a secondary device.

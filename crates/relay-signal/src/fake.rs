@@ -17,7 +17,8 @@ use tokio::sync::mpsc;
 
 use crate::{
     Account, Contact, Device, DiscoveryUnsupported, Group, Identity, Incoming, Outgoing,
-    RateLimited, SendableFile, SignalBackend, StickerImage, StickerInfo, StickerPack,
+    ProfileUpdate, RateLimited, SendableFile, SignalBackend, StickerImage, StickerInfo,
+    StickerPack,
 };
 
 /// A fake registered account. Build one with `FakeSignal::new`, seed it with
@@ -44,6 +45,7 @@ struct State {
     devices: Vec<Device>,
     sticker_packs: HashMap<StickerPackId, Vec<u32>>,
     uploads: u64,
+    profile_updates: Vec<ProfileUpdate>,
 }
 
 impl FakeSignal {
@@ -111,6 +113,11 @@ impl FakeSignal {
         self.state().sent.clone()
     }
 
+    /// Every profile change asked for so far, in order.
+    pub fn profile_updates(&self) -> Vec<ProfileUpdate> {
+        self.state().profile_updates.clone()
+    }
+
     /// Sends that reached Signal so far, whether it accepted them or not.
     pub fn attempts(&self) -> usize {
         self.state().attempts
@@ -150,8 +157,10 @@ impl FakeSignal {
             Outgoing::AdminDelete { .. } if matches!(to, Recipient::Contact(_)) => {
                 bail!("an admin delete only goes to a group");
             }
-            Outgoing::ExpirationTimer { .. } if matches!(to, Recipient::Group(_)) => {
-                bail!("a timer update only goes to a contact");
+            Outgoing::ExpirationTimer { .. } | Outgoing::MessageRequestResponse { .. }
+                if matches!(to, Recipient::Group(_)) =>
+            {
+                bail!("{message:?} only goes to a contact");
             }
             // The wire form names only the poll's timestamp, so it can only
             // ever close one of this account's own polls.
@@ -298,6 +307,20 @@ impl SignalBackend for FakeSignal {
             bytes: format!("{pack}/{sticker_id}").into_bytes(),
         }))
     }
+
+    async fn install_sticker_pack(
+        &self,
+        pack: StickerPackId,
+        _key: [u8; 32],
+    ) -> anyhow::Result<()> {
+        self.state().sticker_packs.entry(pack).or_default();
+        Ok(())
+    }
+
+    async fn update_profile(&self, update: ProfileUpdate) -> anyhow::Result<()> {
+        self.state().profile_updates.push(update);
+        Ok(())
+    }
 }
 
 fn tokio_stream_from<T: Send + 'static>(
@@ -309,6 +332,7 @@ fn tokio_stream_from<T: Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RequestResponse;
     use uuid::Uuid;
 
     fn fake() -> FakeSignal {
@@ -457,10 +481,11 @@ mod tests {
         assert_eq!(signal.sent().len(), 1);
     }
 
-    /// The real backend can't put a timer update in a group message, so the
-    /// fake must refuse it too, or a tool could pass on a group timer.
+    /// Timer updates and message request answers only go to a person in the
+    /// real backend, so the fake must refuse both for a group, or a tool
+    /// could pass on a send that would never leave the machine.
     #[tokio::test]
-    async fn a_timer_update_to_a_group_fails() {
+    async fn contact_only_sends_to_a_group_fail() {
         let group = GroupId::new([3; 32]);
         let signal = fake().with_groups(vec![Group {
             id: group,
@@ -468,12 +493,23 @@ mod tests {
             members: vec![],
             admins: vec![],
         }]);
-        let timer = Outgoing::ExpirationTimer { seconds: 60 };
-        let result = signal.send(Recipient::Group(group), timer.clone()).await;
-        assert!(result.is_err(), "sent a group timer update");
         let alice = Recipient::Contact(ServiceId::new(Uuid::from_u128(2)));
-        signal.send(alice, timer).await.expect("a DM timer update");
-        assert_eq!(signal.sent().len(), 1);
+        for contact_only in [
+            Outgoing::ExpirationTimer { seconds: 60 },
+            Outgoing::MessageRequestResponse {
+                response: RequestResponse::Accept,
+            },
+        ] {
+            let result = signal
+                .send(Recipient::Group(group), contact_only.clone())
+                .await;
+            assert!(result.is_err(), "sent {contact_only:?} to a group");
+            signal
+                .send(alice, contact_only)
+                .await
+                .expect("to a contact");
+        }
+        assert_eq!(signal.sent().len(), 2);
     }
 
     /// Production can't look numbers up in this version, so the fake must
