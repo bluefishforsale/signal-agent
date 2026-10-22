@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The login agent SMAppService registers (relay-agent/src/login/launchd.rs).
+  Bundled at MCP Relay for Signal.app/Contents/Library/LaunchAgents/; the
+  agent binary must be at Contents/MacOS/signal-agent.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.bluefishforsale.signalagent.agent</string>
+	<key>BundleProgram</key>
+	<string>Contents/MacOS/signal-agent</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>signal-agent</string>
+		<string>agent</string>
+		<string>--profile</string>
+		<string>personal</string>
+	</array>
+	<key>AssociatedBundleIdentifiers</key>
+	<array>
+		<string>com.bluefishforsale.signalagent</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ProcessType</key>
+	<string>Background</string>
+</dict>
+</plist>
