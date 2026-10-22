@@ -66,6 +66,16 @@ pub trait SecretStore: Send + Sync {
     fn get(&self, profile: &ProfileName) -> anyhow::Result<Option<StoreKey>>;
     fn set(&self, profile: &ProfileName, key: &StoreKey) -> anyhow::Result<()>;
     fn delete(&self, profile: &ProfileName) -> anyhow::Result<()>;
+    /// The profile's key, or a new one saved before it is returned: a store
+    /// encrypted with a key that was never saved is lost.
+    fn ensure(&self, profile: &ProfileName) -> anyhow::Result<StoreKey> {
+        if let Some(key) = self.get(profile)? {
+            return Ok(key);
+        }
+        let key = StoreKey::generate()?;
+        self.set(profile, &key)?;
+        Ok(key)
+    }
     /// A sentence for setup to show when this store is weaker than the OS
     /// keychain, e.g. the headless Linux key-file fallback.
     fn caveat(&self) -> Option<&'static str> {
@@ -228,6 +238,17 @@ mod tests {
         let key = StoreKey::from_bytes([0xab; 32]);
         let printed = format!("{key:?} {:?}", Some(&key));
         assert!(!printed.contains("ab"), "key bytes leaked: {printed}");
+    }
+
+    /// A key is saved before anyone can encrypt with it, and the saved one
+    /// comes back every time after, or a store made with it is lost.
+    #[test]
+    fn ensure_saves_a_new_key_first_and_then_returns_that_key() {
+        let store = MemorySecretStore::default();
+        let profile = test_profile();
+        let made = store.ensure(&profile).expect("ensure");
+        assert_eq!(store.get(&profile).expect("get"), Some(made.clone()));
+        assert_eq!(store.ensure(&profile).expect("ensure again"), made);
     }
 
     /// Generated keys must differ, or every profile would share one key.

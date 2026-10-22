@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use relay_core::prelude::*;
 use relay_secrets::StoreKey;
 use relay_setup::{
+    AgentKeys,
     claude::{Clients, ServerEntry},
     driver::{Driver, HistorySkip, LoginItem, OpenProvisioner, Services},
     history::{LinkAndSync, ProfileStore, SignalDesktop},
@@ -39,20 +40,18 @@ impl Setup for Driver {
 /// Setup of the default profile, starting at `start`.
 pub fn setup(start: SetupState) -> anyhow::Result<Box<dyn Setup>> {
     let profile = ProfileName::default_profile();
-    let server = ServerEntry::for_profile(&profile, &agent()?, ["mcp", "--profile", &profile])?;
+    let agent = agent()?;
+    let server = ServerEntry::for_profile(&profile, &agent, ["mcp", "--profile", &profile])?;
     let paths = ProfilePaths::for_profile(&profile)?;
-    let store = || -> anyhow::Result<ProfileStore> {
-        Ok(ProfileStore::new(
-            &profile,
-            &paths,
-            relay_secrets::platform_store()?,
-        ))
-    };
+    // NOTE: every key read goes through the bundled signal-agent, never the
+    // app itself, so the Keychain item keeps trusting the program the login
+    // item runs (#112).
+    let store = || ProfileStore::new(&profile, &paths, Box::new(AgentKeys::new(agent.clone())));
     let services = Services {
         signal: Box::new(Presage),
-        secrets: relay_secrets::platform_store()?,
-        history: Box::new(LinkAndSync::new(store()?)),
-        desktop: Box::new(SignalDesktop::usual_place(store()?)),
+        secrets: Box::new(AgentKeys::new(agent.clone())),
+        history: Box::new(LinkAndSync::new(store())),
+        desktop: Box::new(SignalDesktop::usual_place(store())),
         login: Box::new(AgentAtLogin),
         clients: Clients::system(),
     };
