@@ -134,6 +134,69 @@ impl Tool for ListGroups {
     }
 }
 
+pub struct ListAttachments;
+
+#[async_trait]
+impl Tool for ListAttachments {
+    fn name(&self) -> &'static str {
+        "list_attachments"
+    }
+    fn description(&self) -> &'static str {
+        "List the attachments in stored message history, newest first: id, content_type, \
+         file_name, size (bytes), the message (author, sent_at_ms) and conversation it came \
+         in. Pass an id to get_attachment for the file itself. Local only; nothing is \
+         downloaded."
+    }
+    fn input_schema(&self) -> Value {
+        json!({"type": "object", "properties": {}, "additionalProperties": false})
+    }
+    fn writes(&self) -> bool {
+        false
+    }
+    async fn call(&self, ctx: &ToolContext, _input: Value) -> Result<Value, ToolError> {
+        let attachments: Vec<_> = stored_attachments(ctx)
+            .await?
+            .into_iter()
+            .map(|s| {
+                json!({
+                    "id": s.attachment.id,
+                    "content_type": s.attachment.content_type,
+                    "file_name": s.attachment.file_name,
+                    "size": s.attachment.size,
+                    "message": s.message,
+                    "conversation": s.conversation,
+                })
+            })
+            .collect();
+        Ok(json!({ "attachments": attachments }))
+    }
+}
+
+/// An attachment in stored history, with the message that carried it.
+struct Stored {
+    attachment: AttachmentRef,
+    message: MessageId,
+    conversation: Recipient,
+}
+
+/// Every attachment in stored history, newest message first.
+// NOTE: scans the whole store, since MessageStore has no attachment index.
+// Fine at personal-history sizes; an index belongs in the store if it isn't.
+async fn stored_attachments(ctx: &ToolContext) -> anyhow::Result<Vec<Stored>> {
+    let mut messages = ctx.store.export(None, None).await?;
+    messages.reverse();
+    Ok(messages
+        .into_iter()
+        .flat_map(|m| {
+            m.attachments.into_iter().map(move |attachment| Stored {
+                attachment,
+                message: m.id,
+                conversation: m.conversation,
+            })
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -243,6 +306,63 @@ mod tests {
                 "member_count": 3,
                 "members": [sid(ME).to_string(), sid(2).to_string(), sid(3).to_string()],
             }]})
+        );
+    }
+
+    fn attachment(id: &str, size: u64) -> AttachmentRef {
+        AttachmentRef {
+            id: id.into(),
+            content_type: "image/jpeg".into(),
+            file_name: Some(format!("{id}.jpg")),
+            size,
+        }
+    }
+
+    fn with_attachments(sender: u128, sent_at_ms: u64, ids: &[&str]) -> Message {
+        Message {
+            attachments: ids.iter().map(|id| attachment(id, 3)).collect(),
+            ..incoming(sender, sent_at_ms, "look")
+        }
+    }
+
+    /// Every attachment in stored history must be listed with the message it
+    /// came in, newest first, so a client can find "the photo Ada just sent".
+    #[tokio::test]
+    async fn list_attachments_lists_stored_attachments_newest_first_with_their_message() {
+        let ctx = ctx_of(|s| s);
+        ctx.store
+            .insert(&with_attachments(2, 100, &["old"]))
+            .await
+            .unwrap();
+        ctx.store
+            .insert(&incoming(2, 150, "no files"))
+            .await
+            .unwrap();
+        ctx.store
+            .insert(&with_attachments(3, 200, &["a", "b"]))
+            .await
+            .unwrap();
+        let out = Registry::standard()
+            .call(&ctx, "list_attachments", json!({}))
+            .await
+            .unwrap();
+        let ids: Vec<_> = out["attachments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["a", "b", "old"], "{out}");
+        assert_eq!(
+            out["attachments"][2],
+            json!({
+                "id": "old",
+                "content_type": "image/jpeg",
+                "file_name": "old.jpg",
+                "size": 3,
+                "message": {"author": sid(2).to_string(), "sent_at_ms": 100},
+                "conversation": {"kind": "contact", "id": sid(2).to_string()},
+            }),
         );
     }
 }

@@ -26,6 +26,7 @@ impl Registry {
             .with(read::SearchMessages)
             .with(directory::ListContacts)
             .with(directory::ListGroups)
+            .with(directory::ListAttachments)
     }
 
     pub fn with(mut self, tool: impl Tool + 'static) -> Self {
