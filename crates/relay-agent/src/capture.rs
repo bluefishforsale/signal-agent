@@ -13,7 +13,7 @@ pub(crate) async fn run(signal: Arc<dyn SignalBackend>, store: Arc<dyn MessageSt
     let mut events = signal.incoming();
     while let Some(event) = events.next().await {
         let result = match event {
-            Ok(event) => apply(store.as_ref(), event).await,
+            Ok(event) => apply(signal.as_ref(), store.as_ref(), event).await,
             Err(e) => Err(e),
         };
         // NOTE: one bad event (a forged edit, a delete for a message we never saw)
@@ -24,7 +24,11 @@ pub(crate) async fn run(signal: Arc<dyn SignalBackend>, store: Arc<dyn MessageSt
     }
 }
 
-async fn apply(store: &dyn MessageStore, event: Incoming) -> anyhow::Result<()> {
+async fn apply(
+    signal: &dyn SignalBackend,
+    store: &dyn MessageStore,
+    event: Incoming,
+) -> anyhow::Result<()> {
     match event {
         Incoming::Message(message) => {
             // NOTE: the store's edit and delete checks trust `id.author`, so a
@@ -42,10 +46,22 @@ async fn apply(store: &dyn MessageStore, event: Incoming) -> anyhow::Result<()> 
             target, from, body, ..
         } => store.apply_edit(target, from, &body).await,
         Incoming::Delete { target, from, .. } => store.mark_deleted(target, from).await,
-        // Applying it needs the group's admins from the backend to check
-        // `from` first, so until then it's logged and skipped, never trusted.
-        Incoming::AdminDelete { group, from, .. } => {
-            bail!("admin delete by {from} in group {group} not applied yet (lane L4b)")
+        Incoming::AdminDelete {
+            group,
+            target,
+            from,
+        } => {
+            // NOTE: the store can't check the deleter, so the admin list must
+            // come from Signal here, never from the event, or any member could
+            // erase anyone's messages from the local history.
+            let groups = signal.groups().await?;
+            let Some(found) = groups.iter().find(|g| g.id == group) else {
+                bail!("admin delete by {from} in group {group}, which this account isn't in");
+            };
+            if !found.admins.contains(&from) {
+                bail!("{from} is not an admin of group {group}, so their delete was dropped");
+            }
+            store.mark_admin_deleted(group, target).await
         }
         Incoming::Read { targets } => store.mark_read(&targets).await,
         // NOTE: MessageStore has no place for reactions yet, so they are dropped
@@ -272,6 +288,94 @@ mod tests {
         .await;
         capture.abort();
         assert_eq!(stored.len(), 1, "capture stopped after an identity change");
+    }
+
+    fn group_msg(group: GroupId, author: u128, sent_at_ms: u64, body: &str) -> Message {
+        Message {
+            conversation: Recipient::Group(group),
+            ..msg(author, sent_at_ms, body)
+        }
+    }
+
+    fn fake_with_group(group: GroupId, admins: &[u128]) -> Arc<FakeSignal> {
+        let ids = |ns: &[u128]| {
+            ns.iter()
+                .map(|n| ServiceId::new(Uuid::from_u128(*n)))
+                .collect()
+        };
+        Arc::new(
+            Arc::into_inner(fake())
+                .expect("sole owner")
+                .with_groups(vec![relay_signal::Group {
+                    id: group,
+                    title: "g".into(),
+                    members: ids(&[2, 3, 4]),
+                    admins: ids(admins),
+                }]),
+        )
+    }
+
+    /// A group admin's delete-for-everyone hides the target in the local
+    /// history, as it does on every phone in the group.
+    #[tokio::test]
+    async fn an_admins_delete_hides_another_members_group_message() {
+        let group = GroupId::new([7; 32]);
+        let signal = fake_with_group(group, &[3]);
+        let store = Arc::new(MemoryStore::default());
+        let capture = tokio::spawn(run(signal.clone(), store.clone()));
+        let original = group_msg(group, 2, 10, "spam");
+        signal.push(Incoming::Message(original.clone()));
+        signal.push(Incoming::AdminDelete {
+            group,
+            target: original.id,
+            from: ServiceId::new(Uuid::from_u128(3)),
+        });
+        let deleted = eventually(|| async {
+            let got = store.get(original.id).await.expect("get");
+            got.filter(|m| m.deleted).into_iter().collect()
+        })
+        .await;
+        capture.abort();
+        assert_eq!(deleted.len(), 1, "admin delete not applied");
+    }
+
+    /// An admin delete from a member who isn't an admin is forged or stale:
+    /// it's dropped, the message stays, and capture keeps going.
+    #[tokio::test]
+    async fn a_non_admins_admin_delete_is_dropped_and_capture_keeps_going() {
+        let group = GroupId::new([7; 32]);
+        let signal = fake_with_group(group, &[3]);
+        let store = Arc::new(MemoryStore::default());
+        let capture = tokio::spawn(run(signal.clone(), store.clone()));
+        let original = group_msg(group, 2, 10, "keep me");
+        signal.push(Incoming::Message(original.clone()));
+        signal.push(Incoming::AdminDelete {
+            group,
+            target: original.id,
+            from: ServiceId::new(Uuid::from_u128(4)),
+        });
+        let marker = group_msg(group, 2, 11, "marker");
+        signal.push(Incoming::Message(marker.clone()));
+        let landed = eventually(|| async {
+            store
+                .get(marker.id)
+                .await
+                .expect("get")
+                .into_iter()
+                .collect()
+        })
+        .await;
+        let kept = store.get(original.id).await.expect("get");
+        capture.abort();
+        assert_eq!(
+            landed.len(),
+            1,
+            "capture stopped after a forged admin delete"
+        );
+        assert!(
+            kept.is_some_and(|m| !m.deleted),
+            "a non-admin's delete was applied"
+        );
     }
 
     async fn eventually<F, Fut>(mut probe: F) -> Vec<Message>
