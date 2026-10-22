@@ -288,6 +288,7 @@ mod tests {
                         json!("+1"),
                         json!("15550000002"),
                         json!("+1555000000a"),
+                        json!("+1234567890123456"),
                         json!(sid(2).to_string()),
                     ]),
                     Some("signal-sticker-pack") => bad.extend([
