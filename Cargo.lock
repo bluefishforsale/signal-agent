@@ -4742,6 +4742,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "futures",
+ "proptest",
  "relay-core",
  "relay-signal",
  "relay-store",

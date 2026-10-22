@@ -5,12 +5,13 @@ use std::sync::Arc;
 use relay_core::prelude::*;
 use serde_json::Value;
 
-use crate::{Tool, ToolContext, ToolError, mutate, read, send};
+use crate::{Limiter, Tool, ToolContext, ToolError, limits, mutate, read, send};
 
 /// The set of tools a profile serves.
 #[derive(Clone, Default)]
 pub struct Registry {
     tools: Vec<Arc<dyn Tool>>,
+    limiter: Arc<Limiter>,
 }
 
 impl Registry {
@@ -33,6 +34,13 @@ impl Registry {
             .with(mutate::EditMessage)
             .with(mutate::DeleteMessage)
             .with(mutate::DeleteGroupMessage)
+    }
+
+    /// Replaces the default account-safety limits, which use the wall clock and
+    /// forget their state when the process exits.
+    pub fn with_limiter(mut self, limiter: Limiter) -> Self {
+        self.limiter = Arc::new(limiter);
+        self
     }
 
     pub fn with(mut self, tool: impl Tool + 'static) -> Self {
@@ -78,6 +86,7 @@ impl Registry {
                 "\"{name}\" has no parameter \"{unknown}\""
             )));
         }
+        let ctx = &limits::guard(&self.limiter, ctx);
         tool.call(ctx, input).await
     }
 }

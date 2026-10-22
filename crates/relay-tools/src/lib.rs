@@ -4,6 +4,7 @@
 
 mod input;
 mod mutate;
+mod limits;
 mod read;
 mod registry;
 mod send;
@@ -11,6 +12,7 @@ mod send;
 mod testing;
 mod tool;
 
+pub use limits::{Clock, LimitExceeded, Limiter, Limits, SystemClock};
 pub use registry::Registry;
 pub use tool::{Tool, ToolContext, ToolError};
 
