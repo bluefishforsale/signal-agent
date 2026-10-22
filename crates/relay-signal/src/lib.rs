@@ -7,6 +7,7 @@ mod convert;
 mod fake;
 mod files;
 mod presage_backend;
+mod transfer;
 
 pub use backend::{
     Account, Contact, Device, DiscoveryUnsupported, Group, HistoryTransfer, Identity, Incoming,

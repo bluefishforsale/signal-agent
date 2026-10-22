@@ -11,6 +11,10 @@ base64 = "0.22.1"
 futures.workspace = true
 mime_guess = "2.0.5"
 relay-core.workspace = true
+# Same version and TLS setup as libsignal-service, for the two link-and-sync
+# calls it doesn't make (transfer.rs).
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 serde.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
