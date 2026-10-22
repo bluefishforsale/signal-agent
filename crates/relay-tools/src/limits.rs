@@ -4,10 +4,12 @@
 
 use std::{
     num::NonZeroU32,
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use anyhow::Context;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use relay_core::prelude::*;
@@ -73,6 +75,7 @@ pub struct LimitExceeded {
 pub struct Limiter {
     limits: Limits,
     clock: Arc<dyn Clock>,
+    path: Option<PathBuf>,
     state: Mutex<State>,
 }
 
@@ -118,8 +121,26 @@ impl Limiter {
         Self {
             limits,
             clock,
+            path: None,
             state: Mutex::default(),
         }
+    }
+
+    /// Keeps the new-recipient count in `path`, so a restart doesn't reset it.
+    pub fn persisted(mut self, path: PathBuf) -> anyhow::Result<Self> {
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                self.state.get_mut().expect("limiter state").first_contacts =
+                    serde_json::from_slice(&bytes)
+                        .with_context(|| format!("unreadable limits file {}", path.display()))?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).with_context(|| format!("can't read {}", path.display()));
+            }
+        }
+        self.path = Some(path);
+        Ok(self)
     }
 }
 
@@ -167,9 +188,20 @@ impl Limiter {
         state.hour.take(HOUR_MS);
         if first {
             state.first_contacts.push((to, now));
+            if let Some(path) = &self.path {
+                write_atomically(path, &serde_json::to_vec(&state.first_contacts)?)?;
+            }
         }
         Ok(())
     }
+}
+
+// NOTE: a torn write would fail to load and keep the agent from starting, so
+// write beside the file and rename over it.
+fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes).with_context(|| format!("can't write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("can't replace {}", path.display()))
 }
 
 impl Default for Limiter {
@@ -377,6 +409,41 @@ mod tests {
             result.is_ok(),
             "the cap did not reset after a day: {result:?}"
         );
+    }
+
+    /// Restarting the agent must not hand out a fresh day of first contacts.
+    #[tokio::test]
+    async fn the_new_recipient_cap_survives_a_restart() {
+        let dir = std::env::temp_dir().join(format!("relay-limits-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("limits.json");
+        let clock = Arc::new(FakeClock::default());
+        let limits = Limits {
+            new_recipients_per_day: 1,
+            ..Limits::default()
+        };
+        let start = || {
+            Limiter::new(limits, clock.clone())
+                .persisted(path.clone())
+                .expect("load limiter state")
+        };
+        let (ctx, signal) = ctx();
+        let dm = |n: u128| json!({"recipient": sid(n).to_string(), "message": "hi"});
+        let registry = Registry::standard().with_limiter(start());
+        let result = registry.call(&ctx, "send_message", dm(10)).await;
+        assert!(result.is_ok(), "first new recipient refused: {result:?}");
+        let registry = Registry::standard().with_limiter(start());
+        let result = registry.call(&ctx, "send_message", dm(11)).await;
+        assert!(
+            refused(&result).is_some(),
+            "a restart reset the new-recipient cap: {result:?}"
+        );
+        assert_eq!(
+            signal.sent().len(),
+            1,
+            "a refused first contact reached Signal"
+        );
+        std::fs::remove_dir_all(&dir).expect("clean temp dir");
     }
 
     /// Sends counted by Signal-visible message, per window of `window_ms`,
