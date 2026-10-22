@@ -184,11 +184,16 @@ pub(crate) fn content_body(
         ..message
     };
     Ok(match message {
-        Outgoing::Text { attachments, .. } if !attachments.is_empty() => {
-            bail!("sending attachments is not implemented yet (lane L1b)")
-        }
-        Outgoing::Text { body, quote, .. } => ContentBody::DataMessage(data(DataMessage {
+        Outgoing::Text {
+            body,
+            quote,
+            attachments,
+        } => ContentBody::DataMessage(data(DataMessage {
             body: Some(body.clone()),
+            attachments: attachments
+                .iter()
+                .map(attachment_pointer)
+                .collect::<anyhow::Result<_>>()?,
             quote: quote.map(|quote| data_message::Quote {
                 id: Some(quote.sent_at_ms),
                 author_aci: Some(aci(quote.author).service_id_string()),
@@ -767,15 +772,43 @@ mod tests {
         })
     }
 
+    /// A ref as `upload` returns it: the id encodes a full pointer.
+    fn uploaded() -> impl Strategy<Value = AttachmentRef> {
+        (
+            proptest::collection::vec(any::<u8>(), 64),
+            proptest::collection::vec(any::<u8>(), 32),
+            "[A-Za-z0-9_-]{1,40}",
+            any::<u32>(),
+            proptest::option::of("[a-z]{1,8}\\.png"),
+        )
+            .prop_map(|(key, digest, cdn_key, size, file_name)| {
+                attachment_ref(&AttachmentPointer {
+                    content_type: Some("image/png".into()),
+                    key: Some(key),
+                    digest: Some(digest),
+                    size: Some(size),
+                    file_name,
+                    cdn_number: Some(3),
+                    attachment_identifier: Some(attachment_pointer::AttachmentIdentifier::CdnKey(
+                        cdn_key,
+                    )),
+                    ..Default::default()
+                })
+            })
+    }
+
     fn sendable() -> impl Strategy<Value = Outgoing> {
         prop_oneof![
-            (".{0,40}", proptest::option::of(message_id_by(ME))).prop_map(|(body, quote)| {
-                Outgoing::Text {
+            (
+                ".{0,40}",
+                proptest::option::of(message_id_by(ME)),
+                proptest::collection::vec(uploaded(), 0..3),
+            )
+                .prop_map(|(body, quote, attachments)| Outgoing::Text {
                     body,
                     quote,
-                    attachments: vec![],
-                }
-            }),
+                    attachments,
+                }),
             (message_id_by(ME), ".{1,4}", any::<bool>()).prop_map(|(target, emoji, remove)| {
                 Outgoing::Reaction {
                     target,
@@ -814,7 +847,7 @@ mod tests {
             };
             let got = incoming(&content_from(ALICE, body), ServiceId::new(ME));
             let expected = match message {
-                Outgoing::Text { body, quote, .. } => {
+                Outgoing::Text { body, quote, attachments } => {
                     let Some(Incoming::Message(got)) = got else {
                         return Err(TestCaseError::fail(format!("text read back as {got:?}")));
                     };
@@ -822,6 +855,7 @@ mod tests {
                     prop_assert_eq!(got.conversation, conversation);
                     prop_assert_eq!(got.body, Some(body));
                     prop_assert_eq!(got.quote, quote);
+                    prop_assert_eq!(got.attachments, attachments);
                     return Ok(());
                 }
                 Outgoing::Reaction { target, emoji, remove } => Incoming::Reaction { conversation, target, from: alice, emoji, remove },

@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 7c60c81182bcc9b62e76a7fb7d4abc56e50a53cb1cf9ce805fa316ba65dba0a5 # shrinks to message = Text { body: "", quote: None }, in_group = false, sent_at_ms = 1
+cc e7bb3a8ce7d17dc98cbc88fc2a41bf07898048642c5a2bbe705bb38d6b0856c2 # shrinks to message = Text { body: "", quote: None, attachments: [AttachmentRef { id: "egEtEglpbWFnZS9wbmcaQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgADIgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABwAw", content_type: "image/png", file_name: None, size: 0 }] }, in_group = false, sent_at_ms = 1
