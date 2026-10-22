@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use relay_core::AccessMode;
 use relay_tools::{Registry, ToolContext, ToolError};
 use rmcp::{
     ErrorData, RoleServer, ServerHandler,
@@ -14,11 +15,33 @@ use rmcp::{
 };
 use serde_json::Value;
 
+/// The experimental client capability a front end declares at initialize to
+/// have its connection served read-only, whatever the agent's own mode.
+pub const READ_ONLY_CAPABILITY: &str = "signal-agent/read-only";
+
 /// One client connection's view of the agent.
 #[derive(Clone)]
 pub(crate) struct Handler {
     pub(crate) ctx: ToolContext,
     pub(crate) registry: Arc<Registry>,
+}
+
+impl Handler {
+    /// The context this client's calls run in: the agent's, made read-only
+    /// when the client asked for that. A client can only lower its access.
+    fn ctx_for(&self, context: &RequestContext<RoleServer>) -> ToolContext {
+        let read_only = context.peer.peer_info().is_some_and(|info| {
+            info.capabilities
+                .experimental
+                .as_ref()
+                .is_some_and(|e| e.contains_key(READ_ONLY_CAPABILITY))
+        });
+        let mut ctx = self.ctx.clone();
+        if read_only {
+            ctx.access = AccessMode::ReadOnly;
+        }
+        ctx
+    }
 }
 
 impl ServerHandler for Handler {
@@ -29,11 +52,12 @@ impl ServerHandler for Handler {
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
+        let ctx = self.ctx_for(&context);
         let tools = self
             .registry
-            .visible(&self.ctx)
+            .visible(&ctx)
             .map(|tool| {
                 let Value::Object(schema) = tool.input_schema() else {
                     return Err(ErrorData::internal_error(
@@ -50,10 +74,11 @@ impl ServerHandler for Handler {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let input = Value::Object(request.arguments.unwrap_or_default());
-        let output = self.registry.call(&self.ctx, &request.name, input).await;
+        let ctx = self.ctx_for(&context);
+        let output = self.registry.call(&ctx, &request.name, input).await;
         // A malformed request is a protocol error the client fixes; a refusal or a
         // failure inside the tool is a result the model reads and explains.
         match output {
@@ -209,6 +234,40 @@ pub(crate) mod tests {
             .expect("a refusal is a result, not a protocol error");
         assert_eq!(refused.is_error, Some(true), "read-only write: {refused:?}");
         assert!(signal.sent().is_empty(), "read-only write reached Signal");
+    }
+
+    /// A front end serving a read-only client (an HTTP read-only token) asks
+    /// for read-only at initialize, and the registry must then hide and refuse
+    /// every write tool even though the agent itself runs with full access.
+    #[tokio::test]
+    async fn a_client_that_declares_read_only_is_served_read_only() {
+        let (server, signal) = handler(AccessMode::Full);
+        let (server_io, client_io) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let running = server.serve(server_io).await.expect("server starts");
+            running.waiting().await
+        });
+        let client = read_only_client_config()
+            .serve(client_io)
+            .await
+            .expect("client connects");
+        let tools = client.peer().list_tools(None).await.expect("tools/list");
+        assert!(tools.tools.is_empty(), "write tool listed: {tools:?}");
+        let refused = client
+            .peer()
+            .call_tool(call("probe_send", json!({"body": "hi"})))
+            .await
+            .expect("a refusal is a result, not a protocol error");
+        assert_eq!(refused.is_error, Some(true), "read-only write: {refused:?}");
+        assert!(signal.sent().is_empty(), "read-only write reached Signal");
+    }
+
+    fn read_only_client_config() -> rmcp::model::ClientConfig {
+        let mut experimental = rmcp::model::ExperimentalCapabilities::new();
+        experimental.insert(READ_ONLY_CAPABILITY.to_owned(), Default::default());
+        let mut info = rmcp::model::ClientConfig::default();
+        info.capabilities.experimental = Some(experimental);
+        info
     }
 
     /// tools/list must be the registry's visible set: a client must see the
