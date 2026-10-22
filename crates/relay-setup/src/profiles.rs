@@ -2,7 +2,7 @@
 //! uninstall agree on the list, and each account's files, key, agent and
 //! Claude entry stay apart from every other's.
 
-use std::{fs, io, path::PathBuf};
+use std::{fs, io, path::PathBuf, rc::Rc};
 
 use anyhow::{Context, bail};
 use relay_core::{ProfileName, ProfilePaths};
@@ -89,7 +89,9 @@ impl Profiles {
     /// The cleanup that removes `profile`: its access choice, so nothing
     /// starts its agent again, its Claude entries, the caller's `stop_agent`
     /// step, its key and data when `delete_data`, and finally its place in
-    /// the list. `entry` must be this profile's entry.
+    /// the list. Once a step fails the rest are skipped, so nothing is
+    /// deleted under an agent that didn't stop and the profile stays listed
+    /// to remove again. `entry` must be this profile's entry.
     pub fn removal_steps<'a>(
         &'a self,
         profile: &'a ProfileName,
@@ -105,6 +107,7 @@ impl Profiles {
                 entry.name
             );
         }
+        let failed = Rc::default();
         let root = self.paths(profile).root;
         let access = root.join(ACCESS_FILE);
         let unlist = Step::new(
@@ -120,8 +123,7 @@ impl Profiles {
             [
                 Step::new("Remove the database key", move || secrets.delete(profile)),
                 Step::new("Delete messages and account data", move || {
-                    fs::remove_dir_all(&root)
-                        .with_context(|| format!("unable to delete \"{}\"", root.display()))
+                    remove_path(&root)
                 }),
             ]
         });
@@ -134,6 +136,7 @@ impl Profiles {
             .chain([stop_agent])
             .chain(data.into_iter().flatten())
             .chain([forget])
+            .map(|step| step.unless_failed(Rc::clone(&failed)))
             .collect())
     }
 
@@ -460,6 +463,37 @@ mod tests {
             "a step failed: {outcomes:?}"
         );
         assert_eq!(set_up_while_stopping.get(), Some(false));
+    }
+
+    /// A removal that partly failed must leave the profile listed, or the
+    /// app's account list loses the only Remove button that could finish it.
+    #[test]
+    fn a_profile_whose_removal_partly_failed_stays_listed_to_remove_again() {
+        let base = tempfile::tempdir().expect("temp data dir");
+        let secrets = MemorySecretStore::default();
+        let profiles = Profiles::under(base.path().into());
+        profiles.ensure_default().expect("default profile");
+        let bot = profiles.create("bot").expect("create bot");
+        let clients = Clients::new(Platform::MacOs, Box::new(NoCli), None, None);
+        let entry = ServerEntry::for_profile(&bot, &base.path().join("signal-agent"), ["mcp"])
+            .expect("entry");
+
+        let steps = profiles
+            .removal_steps(
+                &bot,
+                &clients,
+                &entry,
+                Step::new("stop agent", || anyhow::bail!("agent would not stop")),
+                &secrets,
+                true,
+            )
+            .expect("removal steps");
+        let outcomes = run_steps(steps);
+        assert!(
+            outcomes.last().is_some_and(|o| o.result.is_err()),
+            "forgot the profile anyway: {outcomes:?}"
+        );
+        assert_eq!(profiles.list().expect("list"), [name("personal"), bot]);
     }
 
     /// Removing `bot` with `personal`'s Claude entry would unregister the
