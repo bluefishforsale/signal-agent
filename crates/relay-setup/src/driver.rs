@@ -11,6 +11,7 @@ use relay_core::prelude::*;
 use relay_secrets::{SecretStore, StoreKey};
 use relay_signal::{LinkEvent, Provisioner, RateLimited, RegistrationStep};
 use relay_tools::{Clock, Limits, Settings, SystemClock};
+use tokio::sync::watch;
 
 use crate::{
     Command, HistoryGap, SetupEvent, SetupState,
@@ -61,6 +62,19 @@ pub struct Services {
     pub clients: Clients,
 }
 
+/// Stops a history import from outside the driver. The import holds the
+/// driver until it ends, which can be an hour, so a Skip click queued behind it
+/// would never be seen.
+#[derive(Clone)]
+pub struct HistorySkip(Arc<watch::Sender<bool>>);
+
+impl HistorySkip {
+    /// Abandons the history import running now, or the next one to start.
+    pub fn skip(&self) {
+        self.0.send_replace(true);
+    }
+}
+
 /// What a front end passes to watch each state as setup enters it.
 pub type Show<'a> = &'a mut (dyn FnMut(&SetupState) + Send);
 
@@ -73,6 +87,7 @@ pub struct Driver {
     services: Services,
     provisioner: Option<Box<dyn Provisioner>>,
     clock: Arc<dyn Clock>,
+    skip: HistorySkip,
     /// Whether this registration attempt already asked for a call.
     called: bool,
 }
@@ -96,6 +111,7 @@ impl Driver {
             provisioner: None,
             called: false,
             clock: Arc::new(SystemClock),
+            skip: HistorySkip(Arc::new(watch::Sender::new(false))),
         }
     }
 
@@ -107,6 +123,11 @@ impl Driver {
 
     pub fn state(&self) -> &SetupState {
         &self.state
+    }
+
+    /// What a front end calls when the user skips history.
+    pub fn history_skip(&self) -> HistorySkip {
+        self.skip.clone()
     }
 
     /// The secret store's warning, for setup to show before anything is stored.
@@ -216,9 +237,20 @@ impl Driver {
                     let event = SetupEvent::HistoryProgress { imported, total };
                     pending.extend(apply(state, event, show));
                 };
-                match self.services.history.import(&mut progress).await? {
-                    None => SetupEvent::HistoryDone,
-                    Some(reason) => SetupEvent::NoHistory { reason },
+                let mut skipped = self.skip.0.subscribe();
+                let outcome = tokio::select! {
+                    outcome = self.services.history.import(&mut progress) => Some(outcome),
+                    _ = skipped.wait_for(|skip| *skip) => None,
+                };
+                // Cleared only once the import ends, so a click that lands just
+                // before it starts still counts, and a late one can't cancel a retry.
+                self.skip.0.send_replace(false);
+                match outcome {
+                    None => SetupEvent::SkipHistory,
+                    Some(outcome) => match outcome? {
+                        None => SetupEvent::HistoryDone,
+                        Some(reason) => SetupEvent::NoHistory { reason },
+                    },
                 }
             }
             Command::FindDesktop if self.services.desktop.found() => SetupEvent::DesktopFound,
@@ -359,6 +391,7 @@ mod tests {
         links: Arc<Mutex<VecDeque<Vec<anyhow::Result<LinkEvent>>>>>,
         codes: Arc<Mutex<VecDeque<anyhow::Result<RegistrationStep>>>>,
         imports: Arc<Mutex<Imports>>,
+        stalled: Arc<std::sync::atomic::AtomicBool>,
         desktop: Arc<Mutex<Option<Vec<u64>>>>,
         failures: Arc<Mutex<Vec<&'static str>>>,
         opened_with: Arc<Mutex<Vec<StoreKey>>>,
@@ -393,6 +426,7 @@ mod tests {
                 links: Arc::default(),
                 codes: Arc::default(),
                 imports: Arc::default(),
+                stalled: Arc::default(),
                 desktop: Arc::default(),
                 failures: Arc::default(),
                 opened_with: Arc::default(),
@@ -429,6 +463,13 @@ mod tests {
         fn import(self, progress: anyhow::Result<Vec<(u64, Option<u64>)>>) -> Self {
             let import = progress.map(|steps| (steps, None));
             self.imports.lock().expect("imports").push_back(import);
+            self
+        }
+
+        /// History imports wait on the phone forever, as a long-poll the phone
+        /// never answers does.
+        fn stalled_history(self) -> Self {
+            self.stalled.store(true, Ordering::SeqCst);
             self
         }
 
@@ -563,6 +604,10 @@ mod tests {
             progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
         ) -> anyhow::Result<Option<HistoryGap>> {
             self.push("import history");
+            if self.stalled.load(Ordering::SeqCst) {
+                let _waiting = Waiting(self.clone());
+                futures::future::pending::<()>().await;
+            }
             let (steps, gap) = self
                 .imports
                 .lock()
@@ -573,6 +618,15 @@ mod tests {
                 progress(imported, total);
             }
             Ok(gap)
+        }
+    }
+
+    /// Logs when a stalled import is abandoned.
+    struct Waiting(World);
+
+    impl Drop for Waiting {
+        fn drop(&mut self) {
+            self.0.push("stop waiting for history");
         }
     }
 
@@ -907,6 +961,37 @@ mod tests {
                 .contains(&"start agent personal, access ReadOnly".to_owned()),
             "{:?}",
             world.log()
+        );
+    }
+
+    /// The phone may take up to an hour to send history, or never send it.
+    /// Skip must stop waiting at once and finish setup, from the moment the
+    /// history screen shows.
+    #[tokio::test]
+    async fn skip_stops_waiting_for_history_and_finishes_setup() {
+        let world = World::new().link(vec![linked()]).stalled_history();
+        let mut h = Harness::new(&world);
+        h.send(LINK).await;
+        let skip = h.driver.history_skip();
+        let access = SetupEvent::AccessChosen {
+            access: AccessMode::Full,
+        };
+        let press = async {
+            tokio::task::yield_now().await;
+            skip.skip();
+        };
+        let (done, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(h.send(access), press)
+        })
+        .await
+        .expect("skip did not stop the wait");
+        assert!(matches!(done, SetupState::Done { .. }), "{done:?}");
+        let log = world.log();
+        let stopped = log.iter().position(|e| e == "stop waiting for history");
+        let started = log.iter().position(|e| e.starts_with("start agent"));
+        assert!(
+            stopped.is_some() && stopped < started,
+            "the wait outlived the skip: {log:?}"
         );
     }
 
