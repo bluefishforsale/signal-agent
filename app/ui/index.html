@@ -24,6 +24,21 @@
       <div class="actions"><button class="primary" data-action="move">Move to Applications</button></div>
     </section>
 
+    <section data-screen="already_set_up" hidden>
+      <h1>Signal is already set up</h1>
+      <p>This computer is linked to Signal as <strong data-field="device_name"></strong>, and Claude <span data-field="access"></span>.</p>
+      <p>If Claude can't see your messages, reconnect it. That doesn't touch your Signal link.</p>
+      <div class="actions"><button class="primary" data-action="reconnect">Reconnect Claude</button></div>
+      <details class="advanced">
+        <summary>Advanced</summary>
+        <p>Link again only if you removed this computer from Signal on your phone. It replaces this computer's link and pauses Claude's access to Signal until you finish.</p>
+        <div class="actions">
+          <button data-action="relink">Link again</button>
+          <button data-action="show_uninstall">Uninstall MCP Relay for Signal</button>
+        </div>
+      </details>
+    </section>
+
     <section data-screen="choose_account" hidden>
       <h1>Connect Claude to Signal</h1>
       <p>Claude will be able to read your Signal messages and, if you allow it, send them.</p>

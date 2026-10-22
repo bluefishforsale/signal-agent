@@ -30,6 +30,10 @@ function render(view) {
   for (const button of section.querySelectorAll("button")) button.disabled = false;
 
   switch (view.screen) {
+    case "already_set_up":
+      fill(section, "device_name", view.device_name);
+      fill(section, "access", view.can_send ? "can read and send your messages" : "can read your messages");
+      break;
     case "linking": {
       fill(section, "device_name", view.device_name);
       const box = section.querySelector('[data-field="qr"]');
@@ -135,6 +139,8 @@ const actions = {
     }
   },
   quit: () => invoke("quit"),
+  reconnect: () => send({ event: "reconnect" }),
+  relink: () => send({ event: "relink" }),
   choose_account: () => send({ event: "account_chosen", choice: checked("account") }),
   choose_access: () => send({ event: "access_chosen", access: checked("access") }),
   restart_desktop: () => send({ event: "restart_desktop" }),

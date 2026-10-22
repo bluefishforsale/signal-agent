@@ -25,6 +25,12 @@ pub struct ClientOutcome {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum SetupState {
+    /// The profile finished setup before and its agent may be running; only
+    /// an explicit re-link provisions it again.
+    AlreadySetUp {
+        device_name: String,
+        access: AccessMode,
+    },
     /// `device_name` is what the phone will list this computer as once linked.
     ChooseAccount {
         device_name: String,
@@ -76,6 +82,10 @@ pub enum SetupState {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum SetupEvent {
+    /// From `AlreadySetUp`: link or register this profile again.
+    Relink,
+    /// From `AlreadySetUp`: put back the Claude entries and login item only.
+    Reconnect,
     AccountChosen {
         choice: AccountChoice,
     },
@@ -144,9 +154,24 @@ impl SetupState {
     /// Where setup begins on the computer called `computer_name`.
     pub fn start(computer_name: &str) -> Self {
         Self::ChooseAccount {
-            device_name: format!("Claude ({computer_name})"),
+            device_name: device_name(computer_name),
         }
     }
+
+    /// Where setup begins for a profile whose saved access choice is `saved`.
+    pub fn for_profile(computer_name: &str, saved: Option<AccessMode>) -> Self {
+        let Some(access) = saved else {
+            return Self::start(computer_name);
+        };
+        Self::AlreadySetUp {
+            device_name: device_name(computer_name),
+            access,
+        }
+    }
+}
+
+fn device_name(computer_name: &str) -> String {
+    format!("Claude ({computer_name})")
 }
 
 /// The next state and the commands to run, given the current state and an event.
@@ -156,6 +181,13 @@ pub fn transition(state: &SetupState, event: SetupEvent) -> (SetupState, Vec<Com
     use SetupState as S;
 
     match (state, event) {
+        (S::AlreadySetUp { device_name, .. }, E::Relink) => (
+            S::ChooseAccount {
+                device_name: device_name.clone(),
+            },
+            Vec::new(),
+        ),
+        (S::AlreadySetUp { access, .. }, E::Reconnect) => connect_clients(*access),
         (
             S::ChooseAccount { device_name },
             E::AccountChosen {
@@ -274,7 +306,8 @@ fn resume_point(state: &SetupState) -> Option<SetupState> {
             access: *access,
         }),
         S::ConnectingClients { .. } | S::Done { .. } => Some(state.clone()),
-        S::ChooseAccount { .. }
+        S::AlreadySetUp { .. }
+        | S::ChooseAccount { .. }
         | S::EnterNumber
         | S::SolveCaptcha { .. }
         | S::EnterCode { .. }
@@ -350,6 +383,53 @@ mod tests {
 
     fn start() -> SetupState {
         SetupState::start("Terrac's MacBook")
+    }
+
+    /// Setup opened on a profile that finished setup before must not offer
+    /// to link or register again as if it were new (a second link replaces
+    /// the running agent's registration), and a new profile starts as before.
+    #[test]
+    fn setup_opens_on_already_set_up_only_for_a_profile_with_a_saved_choice() {
+        assert_eq!(
+            SetupState::for_profile("Terrac's MacBook", Some(AccessMode::ReadOnly)),
+            SetupState::AlreadySetUp {
+                device_name: DEVICE.into(),
+                access: AccessMode::ReadOnly
+            }
+        );
+        assert_eq!(SetupState::for_profile("Terrac's MacBook", None), start());
+    }
+
+    fn already_set_up() -> SetupState {
+        SetupState::AlreadySetUp {
+            device_name: DEVICE.into(),
+            access: AccessMode::ReadOnly,
+        }
+    }
+
+    /// Re-link leads to the usual account choice without contacting Signal,
+    /// and reconnecting puts the Claude entries back under the access the
+    /// user already chose, with nothing provisioned.
+    #[test]
+    fn a_set_up_profile_offers_relink_or_reconnect_and_nothing_else() {
+        assert_eq!(
+            transition(&already_set_up(), SetupEvent::Relink),
+            (start(), vec![])
+        );
+        assert_eq!(
+            transition(&already_set_up(), SetupEvent::Reconnect),
+            (
+                SetupState::ConnectingClients {
+                    access: AccessMode::ReadOnly
+                },
+                vec![
+                    Command::SaveAccess {
+                        access: AccessMode::ReadOnly
+                    },
+                    Command::ConnectClients
+                ]
+            )
+        );
     }
 
     /// Linking must tell the phone a readable device name, so the user can tell
@@ -997,12 +1077,38 @@ mod tests {
             Just(E::HistoryDone),
             Just(E::ClientsConnected { clients: vec![] }),
             Just(E::RestartDesktop),
+            Just(E::Relink),
+            Just(E::Reconnect),
             text.prop_map(|message| E::CommandFailed { message }),
             Just(E::Retry),
         ]
     }
 
     proptest! {
+        /// Signal flags accounts that link or register over and over, so setup
+        /// on a set-up profile must never reach Signal unless the user chose
+        /// Re-link, whatever else the window or a stale result sends.
+        #[test]
+        fn a_set_up_profile_is_never_provisioned_again_without_an_explicit_relink(
+            events in prop::collection::vec(any_event(), 0..80)
+        ) {
+            let mut state = already_set_up();
+            for event in events {
+                if event == SetupEvent::Relink && matches!(state, SetupState::AlreadySetUp { .. }) {
+                    break;
+                }
+                let (next, commands) = transition(&state, event.clone());
+                prop_assert!(
+                    !commands.iter().any(|c| matches!(
+                        c,
+                        Command::StartLink { .. } | Command::RequestCode { .. }
+                    )),
+                    "{event:?} in {state:?} provisioned without a re-link: {commands:?}"
+                );
+                state = next;
+            }
+        }
+
         /// No sequence of events, however nonsensical, may panic the machine or
         /// connect a client before the user chose an access mode and it was saved.
         #[test]

@@ -74,7 +74,10 @@ fn start_state() -> SetupState {
     {
         return state;
     }
-    SetupState::start(&computer_name())
+    #[cfg(feature = "mock-driver")]
+    return SetupState::start(&computer_name());
+    #[cfg(not(feature = "mock-driver"))]
+    SetupState::for_profile(&computer_name(), real::saved_access())
 }
 
 /// The name the user gave this computer, which the phone shows for the link.

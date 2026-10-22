@@ -10,6 +10,11 @@ use serde::Serialize;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "screen", rename_all = "snake_case")]
 pub enum View {
+    /// `can_send` is the access the user chose last time.
+    AlreadySetUp {
+        device_name: String,
+        can_send: bool,
+    },
     ChooseAccount {
         device_name: String,
     },
@@ -62,6 +67,13 @@ pub fn view(state: &SetupState) -> View {
     use SetupState as S;
 
     match state {
+        S::AlreadySetUp {
+            device_name,
+            access,
+        } => View::AlreadySetUp {
+            device_name: device_name.clone(),
+            can_send: *access == AccessMode::Full,
+        },
         S::ChooseAccount { device_name } => View::ChooseAccount {
             device_name: device_name.clone(),
         },
@@ -166,6 +178,7 @@ mod tests {
     fn every_state() -> Vec<SetupState> {
         let number = || "+15555550123".to_owned();
         vec![
+            SetupState::for_profile("Mac", Some(AccessMode::ReadOnly)),
             SetupState::start("Mac"),
             linking(None),
             linking(Some("sgnl://x")),

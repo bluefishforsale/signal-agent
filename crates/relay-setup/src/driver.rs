@@ -369,6 +369,8 @@ mod tests {
     }
 
     type Imports = VecDeque<anyhow::Result<Vec<(u64, Option<u64>)>>>;
+    /// At each store open and agent start: (setup running, stores free).
+    type HeldLog = Vec<(&'static str, bool, bool)>;
 
     /// The fakes' shared state: what Signal and the OS will do, and everything
     /// every fake did, in order. Clones share it, so two setup runs can see one
@@ -382,8 +384,7 @@ mod tests {
         imports: Arc<Mutex<Imports>>,
         failures: Arc<Mutex<Vec<&'static str>>>,
         opened_with: Arc<Mutex<Vec<StoreKey>>>,
-        /// At each store open and agent start: (setup running, stores free).
-        profile_held: Arc<Mutex<Vec<(&'static str, bool, bool)>>>,
+        profile_held: Arc<Mutex<HeldLog>>,
         secrets: Arc<MemorySecretStore>,
         clock: Arc<FakeClock>,
     }

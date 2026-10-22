@@ -50,6 +50,12 @@ pub fn setup(start: SetupState) -> anyhow::Result<Box<dyn Setup>> {
     )))
 }
 
+/// The access choice the default profile's last setup saved, if it finished.
+pub fn saved_access() -> Option<AccessMode> {
+    let paths = ProfilePaths::for_profile(&ProfileName::default_profile()).ok()?;
+    paths.load_access().ok()
+}
+
 /// The `signal-agent` binary shipped beside the app, which Claude launches.
 pub fn agent() -> anyhow::Result<PathBuf> {
     let me = std::env::current_exe().context("unable to locate this app")?;
