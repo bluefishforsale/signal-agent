@@ -414,4 +414,28 @@ mod tests {
         let stored = ctx.store.history(dm, None, 10).await.unwrap();
         assert!(stored[0].deleted, "delete not flagged: {stored:?}");
     }
+
+    /// Someone else's message at the same timestamp must survive a delete, for
+    /// the same reason as edit_message_cannot_rewrite_someone_elses_message.
+    #[tokio::test]
+    async fn delete_message_cannot_erase_someone_elses_message() {
+        let (ctx, _) = ctx(AccessMode::Full, ProfileKind::Linked);
+        ctx.store
+            .insert(&incoming(2, 42, "their words"))
+            .await
+            .unwrap();
+        let result = Registry::standard()
+            .call(
+                &ctx,
+                "delete_message",
+                json!({"recipient": sid(2).to_string(), "target_timestamp": 42}),
+            )
+            .await;
+        let stored = ctx
+            .store
+            .history(Recipient::Contact(sid(2)), None, 10)
+            .await
+            .unwrap();
+        assert!(!stored[0].deleted, "foreign message deleted: {result:?}");
+    }
 }
