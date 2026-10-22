@@ -564,7 +564,11 @@ mod tests {
             .fetch_one(&store.pool)
             .await
             .expect("query");
-        let expected = if cfg!(windows) {
+        let arm_linux = cfg!(all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "arm")
+        ));
+        let expected = if cfg!(windows) || arm_linux {
             "openssl"
         } else {
             "rustcrypto"
