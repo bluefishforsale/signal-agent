@@ -9,7 +9,7 @@ use bytes::Bytes;
 use http::{Request, Response, StatusCode, header};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::body::Incoming;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use relay_core::AccessMode;
 use rmcp::transport::{
     StreamableHttpServerConfig, StreamableHttpService,
@@ -69,10 +69,15 @@ struct Gate {
 struct Limits {
     /// Open connections at once; past this, new ones wait in the backlog.
     connections: usize,
+    /// How long a connection may take to send a request's headers.
+    headers: Duration,
 }
 
 // A handful of personal MCP clients never comes close to these.
-const LIMITS: Limits = Limits { connections: 64 };
+const LIMITS: Limits = Limits {
+    connections: 64,
+    headers: Duration::from_secs(30),
+};
 
 /// Serves MCP on `listener` for every request carrying a live token, through
 /// the agent at `agent`, until accepting fails for good.
@@ -112,9 +117,9 @@ async fn serve_with(
         tokio::spawn(async move {
             let _slot = slot;
             let served = match tls {
-                None => connection(tcp, peer, gate).await,
+                None => connection(tcp, peer, gate, limits).await,
                 Some(tls) => match tls.accept(tcp).await {
-                    Ok(stream) => connection(stream, peer, gate).await,
+                    Ok(stream) => connection(stream, peer, gate, limits).await,
                     Err(e) => return tracing::debug!(%peer, "TLS handshake failed: {e}"),
                 },
             };
@@ -125,7 +130,12 @@ async fn serve_with(
     }
 }
 
-async fn connection<S>(stream: S, peer: SocketAddr, gate: Arc<Gate>) -> hyper::Result<()>
+async fn connection<S>(
+    stream: S,
+    peer: SocketAddr,
+    gate: Arc<Gate>,
+    limits: Limits,
+) -> hyper::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -134,6 +144,8 @@ where
         async move { Ok::<_, Infallible>(gate.handle(peer, request).await) }
     });
     hyper::server::conn::http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(limits.headers)
         .serve_connection(TokioIo::new(stream), service)
         .await
 }
@@ -530,5 +542,34 @@ mod tests {
         assert!(waiting.is_err(), "served past the cap: {waiting:?}");
         drop(hog);
         assert_eq!(post(addr, None).await, reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    /// Resolves when the server closes `stream`, or panics after `within`.
+    async fn closed_by_server(mut stream: impl AsyncRead + Unpin, within: Duration) {
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 64];
+        let read = tokio::time::timeout(within, stream.read(&mut buf)).await;
+        assert!(
+            matches!(read, Ok(Ok(0)) | Ok(Err(_))),
+            "connection still open: {read:?}"
+        );
+    }
+
+    /// A client that connects and never finishes its headers (slowloris)
+    /// must lose its connection, or a few of them would fill every slot.
+    #[tokio::test]
+    async fn a_client_that_never_sends_headers_is_disconnected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tokens = Tokens::at(&dir.path().join("http_tokens.json"));
+        let limits = Limits {
+            headers: Duration::from_millis(200),
+            ..LIMITS
+        };
+        let addr = start_with(tokens, "no-agent".into(), limits).await;
+        let mut slow = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        tokio::io::AsyncWriteExt::write_all(&mut slow, b"POST /mcp HTTP/1.1\r\n")
+            .await
+            .expect("write");
+        closed_by_server(slow, Duration::from_secs(5)).await;
     }
 }
