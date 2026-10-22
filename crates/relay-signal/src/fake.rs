@@ -16,8 +16,8 @@ use relay_core::prelude::*;
 use tokio::sync::mpsc;
 
 use crate::{
-    Account, Contact, Device, Group, Identity, Incoming, Outgoing, RateLimited, SendableFile,
-    SignalBackend,
+    Account, Contact, Device, DiscoveryUnsupported, Group, Identity, Incoming, Outgoing,
+    RateLimited, SendableFile, SignalBackend,
 };
 
 /// A fake registered account. Build one with `FakeSignal::new`, seed it with
@@ -38,7 +38,6 @@ struct State {
     sent: Vec<(Recipient, Outgoing)>,
     attempts: usize,
     rate_limit_next_send: Option<RateLimited>,
-    registered: HashMap<String, ServiceId>,
     usernames: HashMap<String, ServiceId>,
     avatars: HashMap<Recipient, Vec<u8>>,
     identities: Vec<Identity>,
@@ -71,12 +70,6 @@ impl FakeSignal {
 
     pub fn with_attachment(self, id: impl Into<String>, bytes: Vec<u8>) -> Self {
         self.state().attachments.insert(id.into(), bytes);
-        self
-    }
-
-    /// A phone number `discover` reports as registered to `service_id`.
-    pub fn with_registered(self, number: impl Into<String>, service_id: ServiceId) -> Self {
-        self.state().registered.insert(number.into(), service_id);
         self
     }
 
@@ -246,13 +239,9 @@ impl SignalBackend for FakeSignal {
 
     async fn discover(
         &self,
-        numbers: &[String],
+        _numbers: &[String],
     ) -> anyhow::Result<Vec<(String, Option<ServiceId>)>> {
-        let state = self.state();
-        Ok(numbers
-            .iter()
-            .map(|n| (n.clone(), state.registered.get(n).copied()))
-            .collect())
+        Err(DiscoveryUnsupported.into())
     }
 
     async fn lookup_username(&self, username: &str) -> anyhow::Result<Option<ServiceId>> {
@@ -429,20 +418,18 @@ mod tests {
         assert_eq!(signal.sent().len(), 1);
     }
 
-    /// Discovery answers every number asked, in order, with None for the
-    /// unregistered, so a tool can zip answers back onto its input.
+    /// Production can't look numbers up in this version, so the fake must
+    /// refuse with the same typed error, or tool tests would pass on a lookup
+    /// the real backend refuses.
     #[tokio::test]
-    async fn discover_answers_every_number_in_the_order_asked() {
-        let bob = ServiceId::new(Uuid::from_u128(3));
-        let signal = fake().with_registered("+15550000003", bob);
-        let asked = ["+15550000009".to_owned(), "+15550000003".to_owned()];
-        let got = signal.discover(&asked).await.expect("discover");
-        assert_eq!(
-            got,
-            vec![
-                ("+15550000009".to_owned(), None),
-                ("+15550000003".to_owned(), Some(bob)),
-            ]
+    async fn discovery_is_unsupported_like_the_real_backend() {
+        let err = fake()
+            .discover(&["+15550000003".to_owned()])
+            .await
+            .expect_err("the fake answered a discovery");
+        assert!(
+            err.downcast_ref::<crate::DiscoveryUnsupported>().is_some(),
+            "untyped: {err:#}"
         );
     }
 
