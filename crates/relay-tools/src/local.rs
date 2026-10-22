@@ -471,4 +471,32 @@ mod tests {
             "store changed"
         );
     }
+
+    /// days counts back from now: a message from yesterday survives a 2-day
+    /// prune and one from three days ago doesn't.
+    #[tokio::test]
+    async fn prune_store_drops_only_messages_older_than_days_before_now() {
+        let (ctx, _) = ctx(AccessMode::Full, ProfileKind::Primary);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let day_ms = 86_400_000;
+        ctx.store
+            .insert(&incoming(2, now_ms - 3 * day_ms, "three days ago"))
+            .await
+            .unwrap();
+        ctx.store
+            .insert(&incoming(2, now_ms - day_ms, "yesterday"))
+            .await
+            .unwrap();
+        let out = Registry::standard()
+            .call(&ctx, "prune_store", json!({"days": 2}))
+            .await
+            .unwrap();
+        assert_eq!(out, json!({"deleted": 1, "older_than_days": 2}));
+        let left = ctx.store.export(None, None).await.unwrap();
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert_eq!(left[0].body.as_deref(), Some("yesterday"), "{left:?}");
+    }
 }
