@@ -54,12 +54,12 @@ pub async fn serve(listener: Listener, tokens: Tokens, agent: String) -> anyhow:
         read_only: mcp_service(Proxy::new(agent, AccessMode::ReadOnly)),
     });
     loop {
-        let (tcp, _) = listener.tcp.accept().await?;
+        let (tcp, peer) = listener.tcp.accept().await?;
         let gate = gate.clone();
         tokio::spawn(async move {
             let service = hyper::service::service_fn(move |request| {
                 let gate = gate.clone();
-                async move { Ok::<_, Infallible>(gate.handle(request).await) }
+                async move { Ok::<_, Infallible>(gate.handle(peer, request).await) }
             });
             let served = hyper::server::conn::http1::Builder::new()
                 .serve_connection(TokioIo::new(tcp), service)
@@ -83,7 +83,8 @@ fn mcp_service(proxy: Proxy) -> StreamableHttpService<Proxy, NeverSessionManager
 }
 
 impl Gate {
-    async fn handle(&self, request: Request<Incoming>) -> Response<Body> {
+    async fn handle(&self, peer: SocketAddr, request: Request<Incoming>) -> Response<Body> {
+        let (method, path) = (request.method().clone(), request.uri().path().to_owned());
         let presented = request
             .headers()
             .get(header::AUTHORIZATION)
@@ -95,13 +96,19 @@ impl Gate {
                 tracing::error!("unable to check a token: {e:#}");
                 return unauthorized();
             }
-            Some(Ok(None)) | None => return unauthorized(),
+            Some(Ok(None)) | None => {
+                tracing::warn!(%peer, %method, path, "refused an HTTP request without a live token");
+                return unauthorized();
+            }
         };
         let service = match grant.scope {
             AccessMode::Full => &self.full,
             AccessMode::ReadOnly => &self.read_only,
         };
-        service.handle(request).await
+        let response = service.handle(request).await;
+        let status = response.status().as_u16();
+        tracing::info!(token = grant.name, %peer, %method, path, status, "HTTP request");
+        response
     }
 }
 

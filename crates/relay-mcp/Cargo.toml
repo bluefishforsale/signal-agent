@@ -33,4 +33,5 @@ rmcp = { version = "3.6.0", default-features = false, features = ["client", "tra
 reqwest = { version = "0.13.5", default-features = false }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 tempfile = "3"
+tracing-subscriber = "0.3.23"
 uuid.workspace = true
