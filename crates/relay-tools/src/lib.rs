@@ -6,6 +6,8 @@ mod directory;
 mod input;
 mod limits;
 mod local;
+mod lookup;
+mod media;
 mod mutate;
 mod read;
 mod registry;

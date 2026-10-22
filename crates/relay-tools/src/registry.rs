@@ -5,7 +5,10 @@ use std::sync::Arc;
 use relay_core::prelude::*;
 use serde_json::Value;
 
-use crate::{Limiter, Tool, ToolContext, ToolError, directory, limits, local, mutate, read, send};
+use crate::{
+    Limiter, Tool, ToolContext, ToolError, directory, limits, local, lookup, media, mutate, read,
+    send,
+};
 
 /// The set of tools a profile serves.
 #[derive(Clone, Default)]
@@ -43,6 +46,15 @@ impl Registry {
             .with(local::MarkAsUnread)
             .with(local::ClearLocalStore)
             .with(local::PruneStore)
+            .with(lookup::ListDevices)
+            .with(lookup::ListIdentities)
+            .with(lookup::GetAvatar)
+            .with(media::SendAttachment)
+            .with(media::SendGroupAttachment)
+            .with(media::SendSticker)
+            .with(media::SendGroupSticker)
+            .with(lookup::GetProfile)
+            .with(lookup::GetUserStatus)
     }
 
     /// Applies account-safety limits to every send a tool makes.
@@ -216,6 +228,8 @@ mod tests {
         match prop["format"].as_str() {
             Some("signal-recipient" | "signal-service-id") => json!(sid(2).to_string()),
             Some("signal-group-id") => json!("ab".repeat(32)),
+            Some("signal-sticker-pack") => json!("ab".repeat(16)),
+            Some("e164") => json!("+15550000002"),
             Some("iso-datetime") => json!("2024-01-01T00:00:00Z"),
             Some(other) => panic!("{name}: no sample for format \"{other}\"; add one here"),
             None => match prop["type"].as_str() {
@@ -266,6 +280,23 @@ mod tests {
                         bad.extend(malformed_ids);
                         bad.push(json!(sid(2).to_string()));
                     }
+                    // A well-formed stranger's number is valid here, unlike in
+                    // a contact field, so only malformed numbers are refused.
+                    Some("e164") => bad.extend([
+                        json!("not-an-id"),
+                        json!("+"),
+                        json!("+1"),
+                        json!("15550000002"),
+                        json!("+1555000000a"),
+                        json!("+1234567890123456"),
+                        json!(sid(2).to_string()),
+                    ]),
+                    Some("signal-sticker-pack") => bad.extend([
+                        json!("g".repeat(32)),
+                        json!("ab".repeat(15)),
+                        json!("ab".repeat(32)),
+                        json!(sid(2).to_string()),
+                    ]),
                     Some("iso-datetime") => bad.extend([
                         json!("yesterday"),
                         json!("2024-13-01"),
