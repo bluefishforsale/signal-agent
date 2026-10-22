@@ -37,7 +37,10 @@ pub async fn run_all_profiles() -> anyhow::Result<()> {
     }
     supervise(
         move || ready_profiles(&profiles),
-        Arc::new(Processes { exe }),
+        Arc::new(Processes {
+            exe,
+            profiles: Profiles::system()?,
+        }),
         Arc::new(SystemClock),
         crate::stop_requested(),
     )
@@ -160,16 +163,29 @@ pub(crate) async fn supervise(
     while children.join_next().await.is_some() {}
 }
 
-/// Each profile's agent as `<exe> agent --profile <name>`.
+/// Each profile's agent as `<exe> agent --profile <name>`, logging to that
+/// profile's agent log.
 struct Processes {
     exe: PathBuf,
+    profiles: Profiles,
 }
 
 impl Launcher for Processes {
     fn launch(&self, profile: &ProfileName) -> anyhow::Result<Box<dyn Child>> {
+        let paths = self.profiles.paths(profile);
+        std::fs::create_dir_all(&paths.root)
+            .with_context(|| format!("unable to create \"{}\"", paths.root.display()))?;
+        // NOTE: launchd and the Windows logon task discard the supervisor's
+        // own stderr, so an inherited one would lose every agent's errors.
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&paths.agent_log)
+            .with_context(|| format!("unable to open \"{}\"", paths.agent_log.display()))?;
         let child = tokio::process::Command::new(&self.exe)
             .args(["agent", "--profile", profile.as_ref()])
             .stdin(Stdio::null())
+            .stderr(log)
             .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("unable to run \"{}\"", self.exe.display()))?;
@@ -355,6 +371,32 @@ mod tests {
             .save_access(relay_core::AccessMode::ReadOnly)
             .expect("save");
         assert_eq!(ready_profiles(&profiles).expect("ready").len(), 2);
+    }
+
+    /// launchd and the Windows logon task throw the supervisor's stderr away,
+    /// so an agent that fails at start (no key, no account) must still leave
+    /// its reason in its profile's log.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_supervised_agents_errors_land_in_its_profile_log() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let exe = tmp.path().join("signal-agent");
+        std::fs::write(&exe, "#!/bin/sh\necho \"failed for $3\" >&2\n").expect("script");
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let profiles = Profiles::under(tmp.path().join("data"));
+        let processes = Processes { exe, profiles };
+        let mut child = processes.launch(&name("personal")).expect("launch");
+        tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .expect("child exited");
+        let log = processes.profiles.paths(&name("personal")).agent_log;
+        let logged = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            logged.contains("failed for personal"),
+            "the agent's stderr is not in \"{}\": {logged:?}",
+            log.display()
+        );
     }
 
     /// Stopping a real agent process must end it promptly, by SIGTERM so it
