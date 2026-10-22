@@ -294,7 +294,7 @@ mod tests {
         let personal = profiles.ensure_default(&secrets).expect("default profile");
         let bot = profiles.create("bot", &secrets).expect("create bot");
         let entry = |p: &ProfileName| {
-            ServerEntry::for_profile(p, Path::new("/bin/signal-agent"), ["mcp"]).expect("entry")
+            ServerEntry::for_profile(p, &base.path().join("signal-agent"), ["mcp"]).expect("entry")
         };
         for p in [&personal, &bot] {
             clients
@@ -355,7 +355,7 @@ mod tests {
         let personal = profiles.ensure_default(&secrets).expect("default profile");
         let bot = profiles.create("bot", &secrets).expect("create bot");
         let clients = Clients::new(Platform::MacOs, Box::new(NoCli), None, None);
-        let wrong = ServerEntry::for_profile(&personal, Path::new("/bin/signal-agent"), ["mcp"])
+        let wrong = ServerEntry::for_profile(&personal, &base.path().join("signal-agent"), ["mcp"])
             .expect("entry");
 
         let refused = profiles.removal_steps(
