@@ -66,6 +66,40 @@ impl Tool for ScheduleMessage {
     }
 }
 
+pub struct ListScheduledMessages;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListScheduledMessagesInput {}
+
+#[async_trait]
+impl Tool for ListScheduledMessages {
+    fn name(&self) -> &'static str {
+        "list_scheduled_messages"
+    }
+    fn description(&self) -> &'static str {
+        "List scheduled messages not yet sent, soonest first. Each job has its id (for \
+         cancel_scheduled_message), what it sends (recipient, body, send_at_ms) and its state: \
+         pending; sending (claimed by a send that didn't finish, never retried); or failed, \
+         with the error. Sent jobs are removed."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false,
+        })
+    }
+    fn writes(&self) -> bool {
+        false
+    }
+    async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
+        let ListScheduledMessagesInput {} = parse(input)?;
+        let jobs = ctx.store.scheduled().await?;
+        Ok(json!({ "jobs": jobs }))
+    }
+}
+
 /// Sends every scheduled message due at `now_ms` through `registry`'s send
 /// tools, once each, and records each outcome. Returns those outcomes.
 // NOTE: never retries. A send the limiter refused must not queue up to burst
@@ -222,5 +256,47 @@ mod tests {
             "{fired:?}"
         );
         assert!(signal.sent().is_empty(), "sent {:?}", signal.sent());
+    }
+
+    /// list_scheduled_messages is the only place a failed job surfaces, so it
+    /// must show pending jobs soonest first and a failure with its reason.
+    #[tokio::test]
+    async fn list_scheduled_messages_shows_jobs_soonest_first_with_failure_reasons() {
+        let (ctx, _) = ctx(AccessMode::Full, ProfileKind::Primary);
+        let registry = Registry::standard();
+        let later = registry
+            .call(
+                &ctx,
+                "schedule_message",
+                json!({
+                    "recipient": sid(3).to_string(),
+                    "message": "later",
+                    "send_at": "2030-01-01",
+                }),
+            )
+            .await
+            .unwrap();
+        let failed = schedule_hi(&ctx).await;
+        let read_only = ToolContext {
+            access: AccessMode::ReadOnly,
+            ..ctx.clone()
+        };
+        run_due(&registry, &read_only, 1).await.unwrap();
+        let out = registry
+            .call(&read_only, "list_scheduled_messages", json!({}))
+            .await
+            .unwrap();
+        let jobs = out["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 2, "{out}");
+        assert_eq!(jobs[0]["id"], json!(failed), "{out}");
+        assert_eq!(jobs[0]["state"]["state"], json!("failed"), "{out}");
+        assert!(
+            jobs[0]["state"]["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("read-only")),
+            "{out}"
+        );
+        assert_eq!(jobs[1]["id"], later["job_id"], "{out}");
+        assert_eq!(jobs[1]["send"]["body"], json!("later"), "{out}");
     }
 }
