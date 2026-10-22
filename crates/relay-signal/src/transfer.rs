@@ -2,7 +2,7 @@
 //! Neither presage nor libsignal-service speaks these two calls yet
 //! (docs/link-and-sync.md), so this does, over its own HTTP client.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow, bail};
 use reqwest::{StatusCode, header::RETRY_AFTER};
@@ -17,6 +17,7 @@ enum Waited {
     Ready { cdn: u32, key: String },
     Relink,
     NoUpload,
+    TimedOut,
 }
 
 /// The new device's view of Signal's servers, enough to fetch one archive.
@@ -34,7 +35,13 @@ enum Hosts {
 
 /// How long to wait on the phone.
 struct Patience {
+    /// The longest Signal is asked to hold one poll open.
     per_poll: Duration,
+    /// When to stop asking.
+    total: Duration,
+    /// The least time between the starts of two polls, whatever the server
+    /// does with `per_poll`.
+    min_gap: Duration,
 }
 
 #[derive(Deserialize)]
@@ -43,6 +50,9 @@ enum ArchiveResponse {
     Ready { cdn: u32, key: String },
     Failed { error: String },
 }
+
+/// How much longer than the poll's own timeout to wait for Signal's answer.
+const POLL_SLACK: Duration = Duration::from_secs(15);
 
 /// Why Signal refused `response`, as the typed `RateLimited` for a 429.
 fn refused(response: &reqwest::Response, what: &str) -> anyhow::Error {
@@ -85,20 +95,29 @@ impl ArchiveSource {
 
     /// Long-polls until the phone says where the archive is.
     async fn wait_for_archive(&self) -> anyhow::Result<Waited> {
-        let mut url = self.chat_url("/v1/devices/transfer_archive")?;
-        let secs = self.patience.per_poll.as_secs().max(1);
-        url.query_pairs_mut()
-            .append_pair("timeout", &secs.to_string());
+        let url = self.chat_url("/v1/devices/transfer_archive")?;
         let (user, password) = &self.login;
+        let deadline = Instant::now() + self.patience.total;
         loop {
+            let started = Instant::now();
+            let remaining = deadline.saturating_duration_since(started);
+            if remaining.is_zero() {
+                return Ok(Waited::TimedOut);
+            }
+            let secs = self.patience.per_poll.min(remaining).as_secs().max(1);
+            let mut url = url.clone();
+            url.query_pairs_mut()
+                .append_pair("timeout", &secs.to_string());
             let response = self
                 .http
-                .get(url.clone())
+                .get(url)
                 .basic_auth(user, Some(password))
+                .timeout(Duration::from_secs(secs) + POLL_SLACK)
                 .send()
                 .await
                 .context("unable to ask Signal for the history archive")?;
             if response.status() == StatusCode::NO_CONTENT {
+                tokio::time::sleep_until((started + self.patience.min_gap).into()).await;
                 continue;
             }
             if !response.status().is_success() {
@@ -189,6 +208,8 @@ mod tests {
             hosts: Hosts::Local(server.url.clone()),
             patience: Patience {
                 per_poll: Duration::from_secs(1),
+                total: Duration::from_secs(10),
+                min_gap: Duration::ZERO,
             },
         }
     }
@@ -285,5 +306,19 @@ mod tests {
             "{limited:?}"
         );
         assert_eq!(server.requests().len(), 1, "{:?}", server.requests());
+    }
+
+    /// The device gives up after the total wait, as Signal's apps do after an
+    /// hour, and a server that answers 204 at once must not be hammered.
+    #[tokio::test]
+    async fn waiting_gives_up_after_the_total_wait_without_hammering() {
+        let server = FakeServer::start(vec![empty("204 No Content")]).await;
+        let mut source = source(&server);
+        source.patience.total = Duration::from_millis(500);
+        source.patience.min_gap = Duration::from_millis(200);
+        let waited = source.wait_for_archive().await.expect("waited");
+        assert_eq!(waited, Waited::TimedOut);
+        let polls = server.requests().len();
+        assert!((2..=3).contains(&polls), "polled {polls} times in 500ms");
     }
 }
