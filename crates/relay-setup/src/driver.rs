@@ -36,6 +36,16 @@ pub trait HistoryImport: Send + Sync {
     ) -> anyhow::Result<()>;
 }
 
+/// Signal Desktop's own history on this computer, read only if the user opts in.
+#[async_trait]
+pub trait DesktopHistory: Send + Sync {
+    /// Whether Signal Desktop's data is on this computer.
+    fn found(&self) -> bool;
+
+    /// Imports Desktop's messages, reporting how many so far.
+    async fn import(&self, progress: &mut (dyn FnMut(u64) + Send)) -> anyhow::Result<()>;
+}
+
 /// Starts a profile's agent now and at every login.
 pub trait LoginItem: Send + Sync {
     fn register(&self, profile: &ProfileName) -> anyhow::Result<()>;
@@ -46,6 +56,7 @@ pub struct Services {
     pub signal: Box<dyn OpenProvisioner>,
     pub secrets: Box<dyn SecretStore>,
     pub history: Box<dyn HistoryImport>,
+    pub desktop: Box<dyn DesktopHistory>,
     pub login: Box<dyn LoginItem>,
     pub clients: Clients,
 }
@@ -208,8 +219,16 @@ impl Driver {
                 self.services.history.import(&mut progress).await?;
                 SetupEvent::HistoryDone
             }
+            Command::FindDesktop if self.services.desktop.found() => SetupEvent::DesktopFound,
             Command::FindDesktop => SetupEvent::DesktopAbsent,
-            Command::ImportDesktop => bail!("Signal Desktop import is not wired in yet"),
+            Command::ImportDesktop => {
+                let state = &mut self.state;
+                let mut progress = |imported| {
+                    pending.extend(apply(state, SetupEvent::DesktopProgress { imported }, show));
+                };
+                self.services.desktop.import(&mut progress).await?;
+                SetupEvent::DesktopImportDone
+            }
             Command::ConnectClients => {
                 self.services.login.register(&self.profile)?;
                 SetupEvent::ClientsConnected {
@@ -338,6 +357,7 @@ mod tests {
         links: Arc<Mutex<VecDeque<Vec<anyhow::Result<LinkEvent>>>>>,
         codes: Arc<Mutex<VecDeque<anyhow::Result<RegistrationStep>>>>,
         imports: Arc<Mutex<Imports>>,
+        desktop: Arc<Mutex<Option<Vec<u64>>>>,
         failures: Arc<Mutex<Vec<&'static str>>>,
         opened_with: Arc<Mutex<Vec<StoreKey>>>,
         secrets: Arc<MemorySecretStore>,
@@ -371,6 +391,7 @@ mod tests {
                 links: Arc::default(),
                 codes: Arc::default(),
                 imports: Arc::default(),
+                desktop: Arc::default(),
                 failures: Arc::default(),
                 opened_with: Arc::default(),
                 secrets: Arc::default(),
@@ -405,6 +426,12 @@ mod tests {
         /// The next history import reports `progress`, or fails.
         fn import(self, progress: anyhow::Result<Vec<(u64, Option<u64>)>>) -> Self {
             self.imports.lock().expect("imports").push_back(progress);
+            self
+        }
+
+        /// Signal Desktop is on this computer, and importing it reports `progress`.
+        fn with_desktop(self, progress: Vec<u64>) -> Self {
+            *self.desktop.lock().expect("desktop") = Some(progress);
             self
         }
 
@@ -539,6 +566,22 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl DesktopHistory for World {
+        fn found(&self) -> bool {
+            self.desktop.lock().expect("desktop").is_some()
+        }
+
+        async fn import(&self, progress: &mut (dyn FnMut(u64) + Send)) -> anyhow::Result<()> {
+            self.push("import desktop");
+            let steps = self.desktop.lock().expect("desktop").clone();
+            for imported in steps.unwrap_or_default() {
+                progress(imported);
+            }
+            Ok(())
+        }
+    }
+
     impl LoginItem for World {
         fn register(&self, profile: &ProfileName) -> anyhow::Result<()> {
             self.push(format!(
@@ -594,6 +637,7 @@ mod tests {
                 signal: Box::new(world.clone()),
                 secrets: Box::new(world.clone()),
                 history: Box::new(world.clone()),
+                desktop: Box::new(world.clone()),
                 login: Box::new(world.clone()),
                 clients: Clients::new(
                     Platform::MacOs,
@@ -762,6 +806,61 @@ mod tests {
             )),
             "{log:?}"
         );
+    }
+
+    /// Signal Desktop's history is never offered when Desktop is absent and
+    /// never read without a yes; with a yes, its progress shows and access is
+    /// still saved before the agent starts.
+    #[tokio::test]
+    async fn signal_desktop_is_offered_only_when_found_and_read_only_on_yes() {
+        let access = SetupEvent::AccessChosen {
+            access: AccessMode::Full,
+        };
+        let absent = World::new().link(vec![linked()]);
+        let mut h = Harness::new(&absent);
+        h.send(LINK).await;
+        let done = h.send(access.clone()).await;
+        assert!(matches!(done, SetupState::Done { .. }), "{done:?}");
+        assert!(
+            !h.shown
+                .iter()
+                .any(|s| matches!(s, SetupState::OfferDesktopImport { .. })),
+            "offered an absent Desktop: {:?}",
+            h.shown
+        );
+
+        for yes in [false, true] {
+            let world = World::new().link(vec![linked()]).with_desktop(vec![10, 20]);
+            let mut h = Harness::new(&world);
+            h.send(LINK).await;
+            let offer = h.send(access.clone()).await;
+            assert_eq!(
+                offer,
+                SetupState::OfferDesktopImport {
+                    access: AccessMode::Full
+                }
+            );
+            let done = h
+                .send(SetupEvent::DesktopImportChosen { import: yes })
+                .await;
+            assert!(matches!(done, SetupState::Done { .. }), "{done:?}");
+            let log = world.log();
+            let read = log.iter().position(|e| e == "import desktop");
+            assert_eq!(read.is_some(), yes, "yes={yes}: {log:?}");
+            let progress: Vec<_> = h
+                .shown
+                .iter()
+                .filter_map(|s| match s {
+                    SetupState::ImportingDesktop { imported, .. } => Some(*imported),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(progress, if yes { vec![0, 10, 20] } else { vec![] });
+            if let Some(read) = read {
+                let started = log.iter().position(|e| e.starts_with("start agent"));
+                assert!(started > Some(read), "agent started first: {log:?}");
+            }
+        }
     }
 
     const NUMBER: &str = "+15555550100";
