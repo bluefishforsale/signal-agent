@@ -57,6 +57,10 @@ pub trait MessageStore: Send + Sync {
     /// Local-only: makes `targets` count as unread again. Nothing is sent to Signal.
     async fn mark_unread(&self, targets: &[MessageId]) -> anyhow::Result<()>;
     async fn set_title(&self, conversation: Recipient, title: &str) -> anyhow::Result<()>;
+    /// The stored message with this id, if any. Tools that act on an existing
+    /// message use it to check the target belongs to the conversation named
+    /// in the request before anything is sent.
+    async fn get(&self, id: MessageId) -> anyhow::Result<Option<Message>>;
     /// Most recent first.
     async fn conversations(&self) -> anyhow::Result<Vec<Conversation>>;
     /// Newest first, strictly older than `before_ms` when given.
