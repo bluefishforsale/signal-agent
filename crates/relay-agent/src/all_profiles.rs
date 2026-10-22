@@ -308,10 +308,14 @@ impl Child for Process {
     }
 }
 
-/// The profiles whose setup finished, in the order they were created.
+/// The profiles whose setup finished and isn't running again, in the order
+/// they were created.
 fn ready_profiles(profiles: &Profiles) -> anyhow::Result<Vec<ProfileName>> {
     let mut ready = profiles.list()?;
-    ready.retain(|p| profiles.paths(p).load_access().is_ok());
+    ready.retain(|p| {
+        let paths = profiles.paths(p);
+        paths.load_access().is_ok() && !relay_setup::setup_running(&paths)
+    });
     Ok(ready)
 }
 
@@ -444,6 +448,26 @@ mod tests {
             .save_access(relay_core::AccessMode::ReadOnly)
             .expect("save");
         assert_eq!(ready_profiles(&profiles).expect("ready").len(), 2);
+    }
+
+    /// Setup run again on a set-up profile needs its stores to itself, so
+    /// while setup holds the profile the supervisor must not count it ready,
+    /// even with its old access choice still saved, and must again after.
+    #[test]
+    fn a_profile_with_setup_running_is_not_ready_until_setup_lets_go() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let profiles = Profiles::under(tmp.path().to_owned());
+        let personal = profiles.ensure_default().expect("default");
+        let paths = profiles.paths(&personal);
+        paths
+            .save_access(relay_core::AccessMode::Full)
+            .expect("save");
+        let setup = relay_setup::SetupLock::try_acquire(&paths)
+            .expect("lock")
+            .expect("free");
+        assert_eq!(ready_profiles(&profiles).expect("ready"), []);
+        drop(setup);
+        assert_eq!(ready_profiles(&profiles).expect("ready"), [personal]);
     }
 
     /// launchd and the Windows logon task throw the supervisor's stderr away,

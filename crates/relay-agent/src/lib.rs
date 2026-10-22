@@ -165,6 +165,8 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
     // device state before discovering it should exit.
     let name = endpoint::name(&config.profile, &config.paths)?;
     let listener = endpoint::Listener::bind(&name).await?;
+    let _stores = claim_stores(&config)?;
+    let mut stop = std::pin::pin!(stop_or_setup(&config));
     let profile = config.profile.clone();
     // Off the critical path: it shells out to Claude's CLIs, and the agent must
     // start capturing whether or not that works.
@@ -172,16 +174,52 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
     let secrets = Arc::from(relay_secrets::platform_store()?);
     let (signal, store) = tokio::select! {
         opened = open_backend_and_store(&config, secrets) => opened?,
-        () = stop_requested() => return Ok(()),
+        () = &mut stop => return Ok(()),
     };
     let settings = configured(&config.paths);
     let registry = registry(&config.paths, settings.limits, Arc::new(SystemClock));
     let mut agent =
         Agent::new(signal, store, registry, config.access).with_send_roots(settings.send_roots);
     if let Some(url) = settings.webhook {
-        agent = agent.with_webhook(config.profile, url);
+        agent = agent.with_webhook(config.profile.clone(), url);
     }
-    agent.serve(listener, stop_requested()).await
+    agent.serve(listener, stop).await
+}
+
+/// Takes the profile's stores for this agent, unless setup is running on the
+/// profile or another process already has them.
+fn claim_stores(config: &AgentConfig) -> anyhow::Result<relay_setup::StoreLock> {
+    let profile = &config.profile;
+    if relay_setup::setup_running(&config.paths) {
+        bail!("setup is running for profile \"{profile}\"; its agent starts once setup finishes");
+    }
+    relay_setup::StoreLock::try_acquire(&config.paths)?
+        .with_context(|| format!("another process has profile \"{profile}\"'s stores open"))
+}
+
+/// How often a running agent checks whether setup wants its profile.
+const SETUP_CHECK: Duration = Duration::from_secs(2);
+
+/// Resolves when the OS asks the agent to stop, or setup starts on its
+/// profile and needs the stores to itself.
+async fn stop_or_setup(config: &AgentConfig) {
+    tokio::select! {
+        () = stop_requested() => {}
+        () = setup_started(config.paths.clone()) => tracing::info!(
+            "setup started for profile \"{}\"; stopping so it has the stores to itself",
+            config.profile
+        ),
+    }
+}
+
+/// Resolves once setup is running on the profile at `paths`.
+async fn setup_started(paths: ProfilePaths) {
+    loop {
+        tokio::time::sleep(SETUP_CHECK).await;
+        if relay_setup::setup_running(&paths) {
+            return;
+        }
+    }
 }
 
 /// The shipped tools under `limits`, with what they've spent kept in the
@@ -444,6 +482,46 @@ pub(crate) mod tests {
                 .all(|w| *w <= std::time::Duration::from_secs(5 * 60)),
             "waited past the cap: {waits:?}"
         );
+    }
+
+    /// An agent must let go of its profile once setup starts there, and not
+    /// before, so a re-link never shares the Signal store with it.
+    #[tokio::test(start_paused = true)]
+    async fn the_agent_stops_once_setup_starts_on_its_profile_and_not_before() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = profile_paths(tmp.path());
+        let mut started = Box::pin(setup_started(config.paths.clone()));
+        let early = tokio::time::timeout(std::time::Duration::from_secs(60), &mut started).await;
+        assert!(early.is_err(), "stopped with no setup running");
+        let _setup = relay_setup::SetupLock::try_acquire(&config.paths)
+            .expect("lock")
+            .expect("free");
+        tokio::time::timeout(std::time::Duration::from_secs(10), started)
+            .await
+            .expect("still running after setup started");
+    }
+
+    /// An agent started while setup or another agent has the profile's
+    /// stores must stop before opening them, saying why.
+    #[test]
+    fn an_agent_never_opens_stores_another_process_holds() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = profile_paths(tmp.path());
+        let other = claim_stores(&config).expect("first claim");
+        let Err(e) = claim_stores(&config) else {
+            panic!("two agents hold one profile's stores");
+        };
+        assert!(format!("{e:#}").contains("\"personal\""), "{e:#}");
+        drop(other);
+        let setup = relay_setup::SetupLock::try_acquire(&config.paths)
+            .expect("lock")
+            .expect("free");
+        let Err(e) = claim_stores(&config) else {
+            panic!("claimed the stores while setup runs");
+        };
+        assert!(format!("{e:#}").contains("setup"), "{e:#}");
+        drop(setup);
+        claim_stores(&config).expect("free once setup is done");
     }
 
     /// A profile whose setup stopped before linking has a key but no account.

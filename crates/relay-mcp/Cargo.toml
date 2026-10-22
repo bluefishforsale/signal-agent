@@ -16,6 +16,7 @@ hyper-util = { version = "0.1.21", features = ["tokio"] }
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
 relay-agent.workspace = true
 relay-core.workspace = true
+relay-setup.workspace = true
 rmcp = { version = "3.6.0", default-features = false, features = ["client", "server", "transport-streamable-http-server"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 serde.workspace = true

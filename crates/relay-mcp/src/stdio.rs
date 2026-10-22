@@ -58,13 +58,17 @@ fn spawn_agent(profile: &ProfileName, paths: &ProfilePaths) -> anyhow::Result<()
     Ok(())
 }
 
-/// Refuses to start an agent for a profile without a saved access choice:
-/// one never set up, or one being uninstalled, whose agent would otherwise
-/// recreate its files and re-add its Claude entries.
+/// Refuses to start an agent for a profile without a saved access choice
+/// (one never set up, or one being uninstalled, whose agent would otherwise
+/// recreate its files and re-add its Claude entries), or while setup runs on
+/// it and has its stores open.
 fn may_start_agent(profile: &ProfileName, paths: &ProfilePaths) -> anyhow::Result<()> {
     paths.load_access().with_context(|| {
         format!("\"{profile}\" isn't set up on this computer, so its agent isn't started")
     })?;
+    if relay_setup::setup_running(paths) {
+        anyhow::bail!("setup is running for \"{profile}\"; its agent starts once setup finishes");
+    }
     Ok(())
 }
 
@@ -377,6 +381,27 @@ mod tests {
         paths
             .save_access(relay_core::AccessMode::ReadOnly)
             .expect("save");
+        assert!(may_start_agent(&profile, &paths).is_ok());
+    }
+
+    /// A Claude client launching the shim while setup re-links a profile
+    /// must not start that profile's agent onto the store setup has open.
+    #[test]
+    fn no_agent_is_started_while_setup_runs_on_the_profile() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let profile = ProfileName::default_profile();
+        let paths = ProfilePaths::under(tmp.path().to_owned(), &profile);
+        paths
+            .save_access(relay_core::AccessMode::Full)
+            .expect("save");
+        let setup = relay_setup::SetupLock::try_acquire(&paths)
+            .expect("lock")
+            .expect("free");
+        let Err(e) = may_start_agent(&profile, &paths) else {
+            panic!("started an agent while setup runs");
+        };
+        assert!(format!("{e:#}").contains("setup"), "{e:#}");
+        drop(setup);
         assert!(may_start_agent(&profile, &paths).is_ok());
     }
 }
