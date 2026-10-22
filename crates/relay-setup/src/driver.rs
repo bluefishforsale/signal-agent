@@ -230,7 +230,7 @@ impl Driver {
             Some(provisioner) => provisioner,
             None => {
                 self.list_profile()?;
-                let key = self.store_key()?;
+                let key = self.services.secrets.ensure(&self.profile)?;
                 fs::create_dir_all(&self.paths.root).with_context(|| {
                     format!("unable to create \"{}\"", self.paths.root.display())
                 })?;
@@ -284,18 +284,6 @@ impl Driver {
             .parent()
             .with_context(|| format!("profile directory \"{}\" has no parent", root.display()))?;
         Profiles::under(base.to_path_buf()).ensure(&self.profile)
-    }
-
-    /// The profile's saved key, or a new one saved before anything uses it:
-    /// a store encrypted with a key that was never saved is lost.
-    fn store_key(&self) -> anyhow::Result<StoreKey> {
-        let secrets = &self.services.secrets;
-        if let Some(key) = secrets.get(&self.profile)? {
-            return Ok(key);
-        }
-        let key = StoreKey::generate()?;
-        secrets.set(&self.profile, &key)?;
-        Ok(key)
     }
 }
 

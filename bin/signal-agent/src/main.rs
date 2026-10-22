@@ -5,9 +5,12 @@
 mod http_cli;
 mod setup_tty;
 
+use std::io::Write;
+
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use relay_core::prelude::*;
+use relay_setup::KeyAction;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -44,6 +47,30 @@ enum Cmd {
     /// The HTTP endpoint for remote MCP clients (Advanced).
     #[command(subcommand)]
     Http(http_cli::HttpCmd),
+    /// The setup app's way to a profile's database key, so only this program
+    /// ever touches the OS secret store.
+    #[command(hide = true)]
+    Key {
+        #[command(subcommand)]
+        action: KeyCmd,
+    },
+}
+
+#[derive(Clone, Copy, Subcommand)]
+enum KeyCmd {
+    Get,
+    Ensure,
+    Delete,
+}
+
+impl From<KeyCmd> for KeyAction {
+    fn from(cmd: KeyCmd) -> Self {
+        match cmd {
+            KeyCmd::Get => Self::Get,
+            KeyCmd::Ensure => Self::Ensure,
+            KeyCmd::Delete => Self::Delete,
+        }
+    }
 }
 
 #[tokio::main]
@@ -88,6 +115,13 @@ async fn main() -> anyhow::Result<()> {
             let paths = ProfilePaths::for_profile(&profile)?;
             http_cli::run(cmd, &paths, &mut std::io::stdout())
         }
+        Cmd::Key { action } => {
+            let store = relay_secrets::platform_store()?;
+            let printed = relay_setup::serve_key(action.into(), &profile, store.as_ref())?;
+            std::io::stdout()
+                .write_all(printed.as_bytes())
+                .context("unable to hand the key to the setup app")
+        }
     }
 }
 
@@ -95,7 +129,13 @@ async fn main() -> anyhow::Result<()> {
 /// step; the Windows uninstaller runs this too.
 fn uninstall(delete_data: bool) -> anyhow::Result<()> {
     let agent = std::env::current_exe().context("unable to locate this executable")?;
-    let outcomes = relay_setup::uninstall(&agent, relay_agent::login::unregister, delete_data)?;
+    let secrets = relay_secrets::platform_store()?;
+    let outcomes = relay_setup::uninstall(
+        &agent,
+        relay_agent::login::unregister,
+        secrets.as_ref(),
+        delete_data,
+    )?;
     let mut failed = 0;
     for outcome in &outcomes {
         match &outcome.result {
@@ -170,6 +210,22 @@ mod tests {
             .expect("saved file");
         std::fs::write(file, "full").expect("damage");
         assert_eq!(startup_access(&paths), AccessMode::ReadOnly, "damaged");
+    }
+
+    /// The setup app reaches each profile's key only through these exact
+    /// arguments, so every one must parse as that key action for that profile.
+    #[test]
+    fn the_setup_apps_key_requests_parse_as_key_actions() {
+        let work = ProfileName::new("work").expect("valid name");
+        for action in [KeyAction::Get, KeyAction::Ensure, KeyAction::Delete] {
+            let args = std::iter::once("signal-agent".to_owned()).chain(action.args(&work));
+            let cli = Cli::try_parse_from(args).expect("parse");
+            assert_eq!(cli.profile, "work");
+            assert!(
+                matches!(cli.command, Cmd::Key { action: a } if KeyAction::from(a) == action),
+                "{action:?}"
+            );
+        }
     }
 
     /// The Windows uninstaller passes the "delete app data" checkbox through

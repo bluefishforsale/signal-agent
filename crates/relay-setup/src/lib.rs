@@ -2,6 +2,7 @@
 //! code, so the Tauri window and the Linux terminal flow behave identically and
 //! setup is tested without either.
 
+mod agent_keys;
 mod captcha;
 pub mod claude;
 pub mod driver;
@@ -9,6 +10,7 @@ mod machine;
 mod profiles;
 mod uninstall;
 
+pub use agent_keys::{AgentKeys, KeyAction, serve_key};
 pub use captcha::{CAPTCHA_PAGE, captcha_navigation_allowed, captcha_token, pasted_captcha_token};
 pub use machine::{AccountChoice, ClientOutcome, Command, SetupEvent, SetupState, transition};
 pub use profiles::Profiles;

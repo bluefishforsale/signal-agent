@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use relay_core::prelude::*;
 use relay_secrets::StoreKey;
 use relay_setup::{
+    AgentKeys,
     claude::{Clients, ServerEntry},
     driver::{Driver, HistoryImport, LoginItem, OpenProvisioner, Services},
     prelude::*,
@@ -34,10 +35,11 @@ impl Setup for Driver {
 /// Setup of the default profile, starting at `start`.
 pub fn setup(start: SetupState) -> anyhow::Result<Box<dyn Setup>> {
     let profile = ProfileName::default_profile();
-    let server = ServerEntry::for_profile(&profile, &agent()?, ["mcp", "--profile", &profile])?;
+    let agent = agent()?;
+    let server = ServerEntry::for_profile(&profile, &agent, ["mcp", "--profile", &profile])?;
     let services = Services {
         signal: Box::new(Presage),
-        secrets: relay_secrets::platform_store()?,
+        secrets: Box::new(AgentKeys::new(agent)),
         history: Box::new(NoHistoryYet),
         login: Box::new(AgentAtLogin),
         clients: Clients::system(),

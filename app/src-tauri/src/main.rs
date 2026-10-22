@@ -183,7 +183,13 @@ async fn confirmed_deleting_data(app: &AppHandle) -> bool {
 async fn run_uninstall(delete_data: bool) -> anyhow::Result<Vec<StepOutcome>> {
     let agent = real::agent()?;
     tauri::async_runtime::spawn_blocking(move || {
-        relay_setup::uninstall(&agent, relay_agent::login::unregister, delete_data)
+        let secrets = relay_setup::AgentKeys::new(agent.clone());
+        relay_setup::uninstall(
+            &agent,
+            relay_agent::login::unregister,
+            &secrets,
+            delete_data,
+        )
     })
     .await?
 }
