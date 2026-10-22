@@ -5,6 +5,7 @@
 mod captcha;
 pub mod claude;
 pub mod driver;
+pub mod history;
 mod machine;
 mod profiles;
 mod uninstall;
