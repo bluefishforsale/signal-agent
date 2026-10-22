@@ -30,6 +30,10 @@ const STOP_GRACE: Duration = Duration::from_secs(10);
 pub async fn run_all_profiles() -> anyhow::Result<()> {
     let profiles = Profiles::system()?;
     let exe = std::env::current_exe().context("unable to locate this executable")?;
+    #[cfg(windows)]
+    if let Err(e) = end_children_with_this_process() {
+        tracing::warn!("agents may outlive the supervisor: {e:#}");
+    }
     supervise(
         move || ready_profiles(&profiles),
         Arc::new(Processes { exe }),
@@ -37,6 +41,49 @@ pub async fn run_all_profiles() -> anyhow::Result<()> {
         crate::stop_requested(),
     )
     .await;
+    Ok(())
+}
+
+/// Puts this process in a job that ends every process in it when this one
+/// exits, so ending the supervisor's logon task ends its agents too.
+// NOTE: Windows has no process group to stop with the task. Without this,
+// uninstall ending the task would leave every profile's agent running.
+#[cfg(windows)]
+fn end_children_with_this_process() -> anyhow::Result<()> {
+    use windows_sys::Win32::System::{
+        JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        },
+        Threading::GetCurrentProcess,
+    };
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    // SAFETY: plain Win32 calls with valid pointers. The job handle is never
+    // closed on purpose: closing it is what ends the job, which must happen
+    // only when this process exits.
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            anyhow::bail!("no job object: {}", std::io::Error::last_os_error());
+        }
+        let set = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            (&raw const limits).cast(),
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        );
+        if set == 0 {
+            anyhow::bail!("job limits refused: {}", std::io::Error::last_os_error());
+        }
+        if AssignProcessToJobObject(job, GetCurrentProcess()) == 0 {
+            anyhow::bail!(
+                "unable to join the job: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
     Ok(())
 }
 
