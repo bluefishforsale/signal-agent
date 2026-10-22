@@ -80,6 +80,13 @@ impl Session {
         if current.unhandled.load(Ordering::SeqCst) > 0 {
             bail!("setup is still working; wait for it to finish");
         }
+        let at_rest = matches!(
+            *self.screen.lock().expect("screen lock"),
+            View::ChooseAccount { .. } | View::Done { .. } | View::Failed { .. }
+        );
+        if !at_rest {
+            bail!("finish or close this account's setup first");
+        }
         let first = view(setup.state());
         let (next, run) = drive(setup, Arc::clone(&self.screen), Arc::clone(&self.on_change));
         *current = next;
@@ -268,6 +275,19 @@ mod tests {
         let switched = session.switch_to(scripted());
         assert!(switched.is_err(), "switched with a click queued");
         assert_eq!(next(&mut rx).await, "linking");
+    }
+
+    /// Between screens of one account's setup (a number entered, a code on
+    /// its way) switching would drop that setup halfway, so only a setup that
+    /// hasn't started or has ended may be replaced.
+    #[tokio::test(start_paused = true)]
+    async fn switching_is_refused_halfway_through_a_setup() {
+        let (session, _run) = Session::new(
+            Box::new(Scripted::new(SetupState::EnterNumber, link_at_once)),
+            |_| {},
+        );
+        let switched = session.switch_to(scripted());
+        assert!(switched.is_err(), "switched halfway through");
     }
 
     /// A click setup ignores changes nothing, but the page still needs a
