@@ -2,6 +2,7 @@
 //! and run. Access rules live in the registry, not in each tool, so a new tool
 //! can't forget them.
 
+mod directory;
 mod input;
 mod read;
 mod registry;
