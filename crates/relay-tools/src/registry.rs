@@ -5,7 +5,7 @@ use std::sync::Arc;
 use relay_core::prelude::*;
 use serde_json::Value;
 
-use crate::{Tool, ToolContext, ToolError, local, read, send};
+use crate::{Tool, ToolContext, ToolError, local, mutate, read, send};
 
 /// The set of tools a profile serves.
 #[derive(Clone, Default)]
@@ -29,6 +29,10 @@ impl Registry {
             .with(send::SendNoteToSelf)
             .with(send::SetTyping)
             .with(send::SendReadReceipt)
+            .with(mutate::ReactToMessage)
+            .with(mutate::EditMessage)
+            .with(mutate::DeleteMessage)
+            .with(mutate::DeleteGroupMessage)
             .with(local::ExportMessages)
             .with(local::MarkAsUnread)
             .with(local::ClearLocalStore)
@@ -103,6 +107,15 @@ mod tests {
 
     /// Tools the boundary sweep can't call meaningfully with probe inputs, and why.
     const EXCLUDED: &[&str] = &[];
+
+    /// Tools that act on a stored message and must refuse one the store doesn't
+    /// hold. The sweep's store is empty, so their sample input is refused too.
+    const NEEDS_STORED_TARGET: &[&str] = &[
+        "react_to_message",
+        "edit_message",
+        "delete_message",
+        "delete_group_message",
+    ];
 
     struct Sender;
 
@@ -381,11 +394,18 @@ mod tests {
             );
             let (valid, probes) = object_probes(name, &schema);
 
-            let (result, _) = probe(&registry, name, Value::Object(valid.clone())).await;
-            assert!(
-                !matches!(result, Err(ToolError::InvalidInput(_))),
-                "{name} refused its own schema's sample input {valid:?}: {result:?}"
-            );
+            let (result, sent) = probe(&registry, name, Value::Object(valid.clone())).await;
+            if NEEDS_STORED_TARGET.contains(&name) {
+                assert!(
+                    matches!(result, Err(ToolError::InvalidInput(_))) && sent == 0,
+                    "{name} acted on a target the empty store doesn't hold: {result:?}, {sent} sent"
+                );
+            } else {
+                assert!(
+                    !matches!(result, Err(ToolError::InvalidInput(_))),
+                    "{name} refused its own schema's sample input {valid:?}: {result:?}"
+                );
+            }
 
             for input in probes {
                 let input = Value::Object(input);
