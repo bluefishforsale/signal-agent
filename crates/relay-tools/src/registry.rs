@@ -25,6 +25,7 @@ impl Registry {
             .with(read::GetConversation)
             .with(read::SearchMessages)
             .with(local::ExportMessages)
+            .with(local::MarkAsUnread)
     }
 
     pub fn with(mut self, tool: impl Tool + 'static) -> Self {
@@ -196,13 +197,16 @@ mod tests {
                 Some("string") => json!("x"),
                 Some("integer") => prop["minimum"].clone(),
                 Some("boolean") => json!(true),
+                Some("array") => json!([sample(&format!("{name}[]"), &prop["items"])]),
+                Some("object") => Value::Object(object_probes(name, prop).0),
                 other => panic!("{name}: no sample for type {other:?}; add one here"),
             },
         }
     }
 
     /// Values the property's schema refuses: wrong types, empty strings,
-    /// malformed ids, and integers outside the declared bounds.
+    /// malformed ids, integers outside the declared bounds, arrays that are
+    /// empty, too long or hold a bad item, and objects with one bad field.
     fn bad_values(name: &str, prop: &Value) -> Vec<Value> {
         let mut bad = vec![json!(null), json!([]), json!({})];
         match prop["type"].as_str() {
@@ -259,9 +263,72 @@ mod tests {
                 ]);
             }
             Some("boolean") => bad.extend([json!("true"), json!(1)]),
+            Some("array") => {
+                let (Some(1..), Some(max)) = (prop["minItems"].as_u64(), prop["maxItems"].as_u64())
+                else {
+                    panic!(
+                        "{name}: arrays must declare minItems of at least 1 and maxItems: {prop}"
+                    );
+                };
+                let item = &prop["items"];
+                let ok = sample(&format!("{name}[]"), item);
+                bad.extend([json!(1), json!("x"), json!({})]);
+                bad.push(json!(vec![ok; max as usize + 1]));
+                for b in bad_values(&format!("{name}[]"), item) {
+                    bad.push(json!([b]));
+                }
+            }
+            Some("object") => {
+                assert!(
+                    prop["required"].as_array().is_some_and(|r| !r.is_empty()),
+                    "{name}: nested objects must require a field, or {{}} would be valid: {prop}"
+                );
+                bad.extend([json!(1), json!("x")]);
+                bad.extend(object_probes(name, prop).1.into_iter().map(Value::Object));
+            }
             other => panic!("{name}: no bad values for type {other:?}; add some here"),
         }
         bad
+    }
+
+    type Object = serde_json::Map<String, Value>;
+
+    /// A valid object for `schema`, and variants of it that each break one
+    /// thing: an unknown field, a missing required field, or one bad value.
+    fn object_probes(name: &str, schema: &Value) -> (Object, Vec<Object>) {
+        let props = schema["properties"]
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .map(|r| r.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        let valid: Object = props
+            .iter()
+            .map(|(k, p)| (k.clone(), sample(&format!("{name}.{k}"), p)))
+            .collect();
+
+        let mut probes = vec![];
+        let mut unknown = valid.clone();
+        unknown.insert("no_such_field".into(), json!(1));
+        probes.push(unknown);
+        for field in &required {
+            let mut missing = valid.clone();
+            missing.remove(*field);
+            probes.push(missing);
+        }
+        for (k, p) in &props {
+            for bad in bad_values(&format!("{name}.{k}"), p) {
+                if bad.is_null() && !required.contains(&k.as_str()) {
+                    continue;
+                }
+                let mut input = valid.clone();
+                input.insert(k.clone(), bad);
+                probes.push(input);
+            }
+        }
+        (valid, probes)
     }
 
     /// Calls `tool` on a fresh full-access primary profile in its own task, so
@@ -281,8 +348,9 @@ mod tests {
     }
 
     /// Sweep every shipped tool with boundary inputs derived from its own
-    /// schema: missing required fields, unknown fields, wrong types, empty
-    /// strings, malformed ids, out-of-range and huge numbers. Each must be
+    /// schema, nested arrays and objects included: missing required fields,
+    /// unknown fields, wrong types, empty strings, malformed ids, out-of-range
+    /// and huge numbers. Each must be
     /// refused as InvalidInput, never a panic, an Internal error, or a send.
     /// New tools are covered by being registered.
     #[tokio::test]
@@ -296,18 +364,7 @@ mod tests {
                 json!(false),
                 "{name} must refuse unknown fields in its schema: {schema}"
             );
-            let props = schema["properties"]
-                .as_object()
-                .cloned()
-                .unwrap_or_default();
-            let required: Vec<&str> = schema["required"]
-                .as_array()
-                .map(|r| r.iter().filter_map(Value::as_str).collect())
-                .unwrap_or_default();
-            let valid: serde_json::Map<String, Value> = props
-                .iter()
-                .map(|(k, p)| (k.clone(), sample(&format!("{name}.{k}"), p)))
-                .collect();
+            let (valid, probes) = object_probes(name, &schema);
 
             let (result, _) = probe(&registry, name, Value::Object(valid.clone())).await;
             assert!(
@@ -315,25 +372,6 @@ mod tests {
                 "{name} refused its own schema's sample input {valid:?}: {result:?}"
             );
 
-            let mut probes = vec![];
-            let mut unknown = valid.clone();
-            unknown.insert("no_such_field".into(), json!(1));
-            probes.push(unknown);
-            for field in &required {
-                let mut missing = valid.clone();
-                missing.remove(*field);
-                probes.push(missing);
-            }
-            for (k, p) in &props {
-                for bad in bad_values(&format!("{name}.{k}"), p) {
-                    if bad.is_null() && !required.contains(&k.as_str()) {
-                        continue;
-                    }
-                    let mut input = valid.clone();
-                    input.insert(k.clone(), bad);
-                    probes.push(input);
-                }
-            }
             for input in probes {
                 let input = Value::Object(input);
                 let (result, sent) = probe(&registry, name, input.clone()).await;

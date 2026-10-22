@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 use crate::{
     Tool, ToolContext, ToolError,
-    input::{Instant, parse, recipient, recipient_schema},
+    input::{Instant, MessageRef, parse, recipient, recipient_schema},
 };
 
 pub struct ExportMessages;
@@ -80,6 +80,62 @@ impl Tool for ExportMessages {
         })
     }
 }
+
+pub struct MarkAsUnread;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MarkAsUnreadInput {
+    message_ids: Vec<MessageRef>,
+}
+
+#[async_trait]
+impl Tool for MarkAsUnread {
+    fn name(&self) -> &'static str {
+        "mark_as_unread"
+    }
+    fn description(&self) -> &'static str {
+        "Mark messages unread again in the local store, so get_unread returns them on its next \
+         call, e.g. to flag them for follow-up. message_ids are the id objects get_conversation, \
+         get_unread or search_messages return; unknown ids are ignored. Idempotent. Returns \
+         {status, count}, count being how many ids were passed. Local only: read receipts \
+         already sent and other devices are unaffected."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "message_ids": {
+                    "type": "array",
+                    "items": MessageRef::schema(),
+                    "minItems": 1,
+                    "maxItems": MAX_IDS,
+                    "description": "The messages to mark unread",
+                },
+            },
+            "required": ["message_ids"],
+            "additionalProperties": false,
+        })
+    }
+    fn writes(&self) -> bool {
+        false
+    }
+    async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
+        let MarkAsUnreadInput { message_ids } = parse(input)?;
+        if !(1..=MAX_IDS).contains(&message_ids.len()) {
+            return Err(ToolError::InvalidInput(format!(
+                "message_ids must hold 1 to {MAX_IDS} ids, got {}",
+                message_ids.len()
+            )));
+        }
+        let ids: Vec<_> = message_ids.into_iter().map(MessageRef::id).collect();
+        ctx.store.mark_unread(&ids).await?;
+        Ok(json!({ "status": "marked unread", "count": ids.len() }))
+    }
+}
+
+/// The most ids one call takes, matching the largest page a read tool returns.
+const MAX_IDS: usize = 500;
 
 fn csv(messages: &[Message]) -> String {
     let mut out = String::from(
@@ -182,5 +238,30 @@ mod tests {
              {s},1000,contact,{s},{s},false,1000,\"say \"\"hi\"\", then\nbye\",,,0,false,false\r\n"
         );
         assert_eq!(out["data"].as_str().unwrap(), expected, "{out}");
+    }
+
+    /// A client flags a message for follow-up by passing back the id exactly
+    /// as get_unread returned it; only that message comes back as unread.
+    #[tokio::test]
+    async fn mark_as_unread_takes_ids_as_read_tools_return_them() {
+        let (ctx, _) = ctx(AccessMode::ReadOnly, ProfileKind::Linked);
+        ctx.store.insert(&incoming(2, 1000, "a")).await.unwrap();
+        ctx.store.insert(&incoming(2, 2000, "b")).await.unwrap();
+        let registry = Registry::standard();
+        let read = registry.call(&ctx, "get_unread", json!({})).await.unwrap();
+        let first_id = read["messages"][0]["id"].clone();
+        let out = registry
+            .call(&ctx, "mark_as_unread", json!({"message_ids": [first_id]}))
+            .await
+            .unwrap();
+        assert_eq!(out["count"], json!(1), "{out}");
+        let again = registry.call(&ctx, "get_unread", json!({})).await.unwrap();
+        let bodies: Vec<_> = again["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["body"].clone())
+            .collect();
+        assert_eq!(bodies, [json!("a")], "{again}");
     }
 }
