@@ -127,9 +127,9 @@ fn render(state: &SetupState, out: &mut impl Write) -> io::Result<()> {
         }
         SetupState::SolveCaptcha { .. } => writeln!(
             out,
-            "\nSignal wants a captcha first. On any computer, open\n  \
-             https://signalcaptchas.org/registration/generate.html\n\
-             solve it, then copy the \"Open Signal\" link (it starts with signalcaptcha://)."
+            "\nSignal wants a captcha first. On any computer, open\n  {}\n\
+             solve it, then copy the \"Open Signal\" link (it starts with signalcaptcha://).",
+            relay_setup::CAPTCHA_PAGE
         ),
         SetupState::EnterCode { number } => {
             writeln!(out, "Signal sent a verification code to {number}.")
@@ -224,7 +224,12 @@ fn ask(
             SetupEvent::NumberEntered { number }
         }
         SetupState::SolveCaptcha { .. } => {
-            let token = prompt(input, out, "Paste the link here: ", parse_captcha)?;
+            let token = prompt(
+                input,
+                out,
+                "Paste the link (or its token) here: ",
+                parse_captcha,
+            )?;
             SetupEvent::CaptchaSolved { token }
         }
         SetupState::EnterCode { .. } => {
@@ -320,17 +325,11 @@ fn parse_number(answer: &str) -> Result<String, &'static str> {
     Ok(number)
 }
 
-/// The token Signal needs from a pasted `signalcaptcha://` link.
-// NOTE: Signal wants the token alone, without the scheme, as signal-cli and
-// presage's own CLI pass it. Sending the whole link fails the captcha check.
+/// The token Signal needs, from a pasted `signalcaptcha://` link or the bare
+/// token people copy out of it.
 fn parse_captcha(answer: &str) -> Result<String, &'static str> {
-    let token = answer
-        .strip_prefix("signalcaptcha://")
-        .ok_or("Paste the whole link; it starts with signalcaptcha://.")?;
-    if token.is_empty() || token.contains(char::is_whitespace) {
-        return Err("That link looks cut off; copy it again.");
-    }
-    Ok(token.to_owned())
+    relay_setup::pasted_captcha_token(answer)
+        .ok_or("That isn't a whole captcha link or token; copy the link again.")
 }
 
 /// The verification code, accepting the dash Signal's SMS shows in it.
@@ -516,11 +515,20 @@ mod tests {
             parse_captcha("signalcaptcha://signal-hcaptcha.5fad.registration.P1_eyJ"),
             Ok("signal-hcaptcha.5fad.registration.P1_eyJ".into())
         );
-        for bad in [
-            "signal-hcaptcha.5fad",
-            "signalcaptcha://",
-            "signalcaptcha://a b",
-        ] {
+        for bad in ["signalcaptcha://", "signalcaptcha://signal-hcaptcha.5f ad"] {
+            assert!(parse_captcha(bad).is_err(), "{bad:?} accepted");
+        }
+    }
+
+    /// People often copy just the token out of the link; that works too, but
+    /// not any stray text that isn't a token.
+    #[test]
+    fn a_pasted_bare_captcha_token_is_accepted() {
+        assert_eq!(
+            parse_captcha("signal-recaptcha-v2.6LfB.registration.03AF"),
+            Ok("signal-recaptcha-v2.6LfB.registration.03AF".into())
+        );
+        for bad in ["+15555550100", "signal-hcaptcha.5f ad", "hcaptcha.5fad"] {
             assert!(parse_captcha(bad).is_err(), "{bad:?} accepted");
         }
     }

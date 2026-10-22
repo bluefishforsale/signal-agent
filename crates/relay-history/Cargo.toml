@@ -24,7 +24,6 @@ libsignal-message-backup = { git = "https://github.com/signalapp/libsignal", tag
 zkgroup = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0" }
 # NOTE: the one-SQLite rule (docs/slices.md): the same sqlx and libsqlite3-sys
 # as presage-store-sqlite, with the one crypto backend every crate declares.
-libsqlite3-sys = { version = "0.36.0", features = ["bundled-sqlcipher-custom-crypto"] }
 pbkdf2 = "0.13.0"
 protobuf = "3.7.2"
 relay-core.workspace = true
@@ -39,6 +38,16 @@ uuid.workspace = true
 # OpenSSL even with custom crypto (docs/slices.md).
 libsqlite3-sys = { version = "0.36.0", features = ["bundled-sqlcipher-vendored-openssl"] }
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+
+# NOTE: ARM Linux can't use custom crypto: the whisperfish fork's
+# sqlcipher_custom_crypto.rs hard-codes *const i8 where C's char is unsigned
+# there, so it doesn't compile. ARM Linux vendors OpenSSL like Windows does.
+# Revert once the c_char fix lands upstream (see docs/slices.md).
+[target.'cfg(not(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm"))))'.dependencies]
+libsqlite3-sys = { version = "0.36.0", features = ["bundled-sqlcipher-custom-crypto"] }
+
+[target.'cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm")))'.dependencies]
+libsqlite3-sys = { version = "0.36.0", features = ["bundled-sqlcipher-vendored-openssl"] }
 
 [dev-dependencies]
 tempfile = "3.23.0"

@@ -6,7 +6,10 @@ on:
   pull_request:
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # On main every commit gets its own group: GitHub keeps only one pending run per
+  # group and drops the older one, so a shared group skips merges that land close
+  # together. PRs still group by branch so a new push supersedes the old run.
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   # Cancel superseded runs on PR branches only; every merge to main gets its own
   # run, so a red main points at one merge.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -27,7 +30,7 @@ jobs:
       matrix:
         # windows-11-arm builds the crates, not just the app, so native pieces
         # (SQLCipher with vendored OpenSSL, libsignal) are proven on ARM64.
-        os: [ubuntu-latest, macos-latest, windows-latest, windows-11-arm]
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest, windows-11-arm]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
