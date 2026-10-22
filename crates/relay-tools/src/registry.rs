@@ -6,8 +6,8 @@ use relay_core::prelude::*;
 use serde_json::Value;
 
 use crate::{
-    Limiter, Tool, ToolContext, ToolError, directory, limits, local, mutate, pins, polls, read,
-    send,
+    Limiter, Tool, ToolContext, ToolError, admin, directory, limits, local, mutate, pins, polls,
+    read, send,
 };
 
 /// The set of tools a profile serves.
@@ -51,6 +51,7 @@ impl Registry {
             .with(polls::CreatePoll)
             .with(polls::VotePoll)
             .with(polls::TerminatePoll)
+            .with(admin::AdminDeleteMessage)
     }
 
     /// Applies account-safety limits to every send a tool makes.
