@@ -45,8 +45,10 @@ impl Session {
         let run = async move {
             let mut redraw = move |state: &SetupState| {
                 let view = view(state);
+                // Stored first: the page may ask for the current screen as
+                // soon as it hears of a redraw.
+                *shown.lock().expect("screen lock") = view.clone();
                 on_change(&view);
-                *shown.lock().expect("screen lock") = view;
             };
             while let Some(event) = queued.recv().await {
                 setup.dispatch(event, &mut redraw).await;
@@ -73,7 +75,7 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::mpsc as std_mpsc, time::Duration};
+    use std::{sync::OnceLock, time::Duration};
 
     use super::*;
     use crate::scripted::Scripted;
@@ -100,40 +102,76 @@ mod tests {
             .to_owned()
     }
 
-    fn started() -> (Session, std_mpsc::Receiver<String>) {
-        let (tx, rx) = std_mpsc::channel();
-        let (session, run) = Session::new(
-            Box::new(Scripted::new(SetupState::start("Mac"), link_at_once)),
-            move |view| tx.send(screen_name(view)).unwrap(),
-        );
+    fn scripted() -> Box<dyn Setup> {
+        Box::new(Scripted::new(SetupState::start("Mac"), link_at_once))
+    }
+
+    fn started() -> (Session, mpsc::UnboundedReceiver<String>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (session, run) = Session::new(scripted(), move |view| {
+            tx.send(screen_name(view)).unwrap();
+        });
         tokio::spawn(run);
         (session, rx)
     }
 
-    fn next(rx: &std_mpsc::Receiver<String>) -> String {
-        rx.recv_timeout(Duration::from_secs(5))
-            .expect("no redraw within 5s")
+    // The clock is paused, so this timeout never waits in real time: it fires
+    // only if the driver task can make no further progress.
+    async fn next(rx: &mut mpsc::UnboundedReceiver<String>) -> String {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("driver stalled before redrawing")
+            .expect("driver task ended")
     }
 
     /// Every state the driver passes through must reach the window in order,
     /// or a QR refresh or progress step is lost.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(start_paused = true)]
     async fn every_state_the_driver_enters_is_redrawn_in_order() {
-        let (session, rx) = started();
+        let (session, mut rx) = started();
         session.send(SetupEvent::AccountChosen {
             choice: AccountChoice::LinkExisting,
         });
-        let screens: Vec<_> = (0..3).map(|_| next(&rx)).collect();
+        let mut screens = Vec::new();
+        for _ in 0..3 {
+            screens.push(next(&mut rx).await);
+        }
         assert_eq!(screens, ["linking", "linking", "choose_access"]);
         assert_eq!(screen_name(&session.view()), "choose_access");
     }
 
+    /// The page reads the current screen as soon as it is told to redraw, so
+    /// that screen must already be stored when the redraw goes out. It once
+    /// lagged by one state and flaked on Windows CI.
+    #[tokio::test(start_paused = true)]
+    async fn a_redraw_stores_the_new_screen_before_anyone_is_told_it_changed() {
+        let screen: Arc<OnceLock<Arc<Mutex<View>>>> = Arc::default();
+        let stored = Arc::clone(&screen);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (session, run) = Session::new(scripted(), move |view: &View| {
+            let current = stored.get().unwrap().lock().unwrap().clone();
+            tx.send((screen_name(view), current == *view)).unwrap();
+        });
+        screen.set(Arc::clone(&session.screen)).unwrap();
+        tokio::spawn(run);
+        session.send(SetupEvent::AccountChosen {
+            choice: AccountChoice::LinkExisting,
+        });
+        for _ in 0..3 {
+            let (name, current) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("driver stalled before redrawing")
+                .expect("driver task ended");
+            assert!(current, "redraw of {name} went out before it was stored");
+        }
+    }
+
     /// A click setup ignores changes nothing, but the page still needs a
     /// redraw to re-enable the button it disabled.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(start_paused = true)]
     async fn an_ignored_click_still_redraws() {
-        let (session, rx) = started();
+        let (session, mut rx) = started();
         session.send(SetupEvent::Retry);
-        assert_eq!(next(&rx), "choose_account");
+        assert_eq!(next(&mut rx).await, "choose_account");
     }
 }
