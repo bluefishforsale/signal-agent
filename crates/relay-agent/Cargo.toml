@@ -9,6 +9,7 @@ anyhow.workspace = true
 dirs.workspace = true
 futures.workspace = true
 relay-core.workspace = true
+relay-secrets.workspace = true
 relay-setup.workspace = true
 relay-signal.workspace = true
 relay-store.workspace = true
@@ -40,7 +41,10 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
-relay-secrets.workspace = true
+# Only to write a linked account into a temporary presage store, as setup would,
+# without reaching Signal; same rev as relay-signal.
+presage = { git = "https://github.com/whisperfish/presage", rev = "6f630791b2c7bf3d5b00c75f5a6c94131bf79c8c" }
+presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "6f630791b2c7bf3d5b00c75f5a6c94131bf79c8c" }
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
 async-trait.workspace = true

@@ -13,7 +13,7 @@ use relay_signal::{LinkEvent, Provisioner, RateLimited, RegistrationStep};
 use relay_tools::{Clock, Limits, Settings, SystemClock};
 
 use crate::{
-    Command, SetupEvent, SetupState,
+    Command, Profiles, SetupEvent, SetupState,
     claude::{Clients, ServerEntry},
     transition,
 };
@@ -229,6 +229,7 @@ impl Driver {
         let provisioner = match self.provisioner.take() {
             Some(provisioner) => provisioner,
             None => {
+                self.list_profile()?;
                 let key = self.store_key()?;
                 fs::create_dir_all(&self.paths.root).with_context(|| {
                     format!("unable to create \"{}\"", self.paths.root.display())
@@ -269,6 +270,20 @@ impl Driver {
     // gone before ConnectClients starts the agent.
     fn close_signal_store(&mut self) {
         self.provisioner = None;
+    }
+
+    /// Lists the profile beside the others before it gets a key or a store,
+    /// so uninstall finds its key and, once its access choice is saved, the
+    /// login item runs its agent.
+    // NOTE: listed is not set up. Everything that starts an agent (supervisor,
+    // shim, startup re-registration) waits for access.json, which SaveAccess
+    // writes only after the link's store is closed.
+    fn list_profile(&self) -> anyhow::Result<()> {
+        let root = &self.paths.root;
+        let base = root
+            .parent()
+            .with_context(|| format!("profile directory \"{}\" has no parent", root.display()))?;
+        Profiles::under(base.to_path_buf()).ensure(&self.profile)
     }
 
     /// The profile's saved key, or a new one saved before anything uses it:
@@ -760,6 +775,24 @@ mod tests {
             )),
             "{log:?}"
         );
+    }
+
+    /// The login item runs only the profiles in the registry, so a profile
+    /// setup links but never lists has no agent until a Claude app happens to
+    /// start one, and captures nothing in between.
+    #[tokio::test]
+    async fn a_profile_set_up_is_listed_for_the_supervisor() {
+        let world = World::new().link(vec![linked()]);
+        let mut h = Harness::new(&world);
+        h.send(LINK).await;
+        h.send(SetupEvent::AccessChosen {
+            access: AccessMode::ReadOnly,
+        })
+        .await;
+        let listed = crate::Profiles::under(world.dir.path().to_path_buf())
+            .list()
+            .expect("registry");
+        assert_eq!(listed, [ProfileName::default_profile()]);
     }
 
     const NUMBER: &str = "+15555550100";
