@@ -275,7 +275,7 @@ struct Stored {
 /// Every attachment in stored history, newest message first, leaving out
 /// messages deleted for everyone.
 // NOTE: loads the whole store, since MessageStore has no attachment query.
-// Fine at personal-history sizes; a paged store query should replace it.
+// Fine at personal-history sizes; issue #65 proposes the paged query to replace it.
 async fn stored_attachments(ctx: &ToolContext) -> anyhow::Result<impl Iterator<Item = Stored>> {
     let messages = ctx.store.export(None, None).await?;
     Ok(messages
