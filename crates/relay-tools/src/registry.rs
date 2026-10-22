@@ -27,6 +27,7 @@ impl Registry {
             .with(send::SendMessage)
             .with(send::SendGroupMessage)
             .with(send::SendNoteToSelf)
+            .with(send::SetTyping)
     }
 
     pub fn with(mut self, tool: impl Tool + 'static) -> Self {

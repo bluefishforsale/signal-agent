@@ -8,7 +8,10 @@ use serde_json::{Value, json};
 
 use crate::{
     Tool, ToolContext, ToolError,
-    input::{Timestamp, contact, contact_schema, group, group_schema, non_blank, parse},
+    input::{
+        Timestamp, contact, contact_schema, group, group_schema, non_blank, parse, recipient,
+        recipient_schema,
+    },
 };
 
 pub struct SendMessage;
@@ -153,6 +156,51 @@ impl Tool for SendNoteToSelf {
             sent_at_ms: t.ms(),
         });
         send_text(ctx, Recipient::Contact(me), body, quote).await
+    }
+}
+
+pub struct SetTyping;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetTypingInput {
+    recipient: String,
+    #[serde(default)]
+    stop: bool,
+}
+
+#[async_trait]
+impl Tool for SetTyping {
+    fn name(&self) -> &'static str {
+        "set_typing"
+    }
+    fn description(&self) -> &'static str {
+        "Show or cancel the typing indicator in a DM or group. Purely cosmetic; use before \
+         send_message or send_group_message in an automated reply. recipient is a contact or \
+         group as list_conversations names it. stop=true cancels an active indicator \
+         (default false starts one). It expires by itself after about 15 seconds and clears \
+         when you send, so one call per message is enough. Nothing is stored."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "recipient": recipient_schema(),
+                "stop": {"type": "boolean", "default": false, "description": "True cancels the indicator instead of starting it"},
+            },
+            "required": ["recipient"],
+            "additionalProperties": false,
+        })
+    }
+    fn writes(&self) -> bool {
+        true
+    }
+    async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
+        let input: SetTypingInput = parse(input)?;
+        let to = recipient(ctx, &input.recipient).await?;
+        let started = !input.stop;
+        ctx.signal.send(to, Outgoing::Typing { started }).await?;
+        Ok(json!({ "status": if started { "typing" } else { "stopped" } }))
     }
 }
 
@@ -394,6 +442,39 @@ mod tests {
             quote: Some(earlier),
         };
         assert_eq!(signal.sent(), [(Recipient::Contact(sid(ME)), text)]);
+    }
+
+    /// Typing starts by default and stop cancels it, in a DM or a group; it is
+    /// cosmetic, so nothing lands in the local history.
+    #[tokio::test]
+    async fn set_typing_starts_or_stops_in_a_dm_or_group_and_stores_nothing() {
+        let (ctx, signal) = group_ctx();
+        let registry = Registry::standard();
+        let group = GroupId::new(GROUP);
+        registry
+            .call(&ctx, "set_typing", json!({"recipient": sid(2).to_string()}))
+            .await
+            .unwrap();
+        registry
+            .call(
+                &ctx,
+                "set_typing",
+                json!({"recipient": group.to_string(), "stop": true}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            signal.sent(),
+            [
+                (
+                    Recipient::Contact(sid(2)),
+                    Outgoing::Typing { started: true }
+                ),
+                (Recipient::Group(group), Outgoing::Typing { started: false }),
+            ]
+        );
+        let stats = ctx.store.stats().await.unwrap();
+        assert_eq!(stats.messages, 0, "{stats:?}");
     }
 
     /// Half a quote can't name a message; sending it as a plain message would
