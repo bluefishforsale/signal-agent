@@ -317,6 +317,7 @@ mod tests {
             access: AccessMode::ReadOnly,
             kind: ProfileKind::Linked,
             send_roots: Arc::default(),
+            webhook: None,
         }
     }
 

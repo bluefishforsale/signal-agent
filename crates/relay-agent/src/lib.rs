@@ -104,6 +104,7 @@ async fn serve_until(
             access,
             kind,
             send_roots: Arc::default(),
+            webhook: None,
         },
         registry,
     };
@@ -257,6 +258,7 @@ pub(crate) mod tests {
             access: AccessMode::Full,
             kind: ProfileKind::Linked,
             send_roots: Arc::default(),
+            webhook: None,
         };
         let dm = |n: u128| {
             let to = ServiceId::new(Uuid::from_u128(n)).to_string();
@@ -305,6 +307,7 @@ pub(crate) mod tests {
             access: AccessMode::Full,
             kind: ProfileKind::Linked,
             send_roots: Arc::default(),
+            webhook: None,
         };
         let registry = registry(&paths, Arc::new(FakeClock(0.into())));
         let stats = registry
@@ -428,12 +431,6 @@ pub(crate) mod tests {
         }
         async fn finish_scheduled(&self, id: JobId, r: Result<(), String>) -> anyhow::Result<()> {
             self.inner.finish_scheduled(id, r).await
-        }
-        async fn webhook(&self) -> anyhow::Result<Option<relay_store::WebhookUrl>> {
-            self.inner.webhook().await
-        }
-        async fn set_webhook(&self, u: Option<&relay_store::WebhookUrl>) -> anyhow::Result<()> {
-            self.inner.set_webhook(u).await
         }
         async fn close(&self) -> anyhow::Result<()> {
             self.closed.store(true, std::sync::atomic::Ordering::SeqCst);

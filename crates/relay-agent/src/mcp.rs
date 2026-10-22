@@ -135,6 +135,7 @@ pub(crate) mod tests {
             access,
             kind: ProfileKind::Linked,
             send_roots: Arc::default(),
+            webhook: None,
         };
         let registry = Arc::new(Registry::default().with(ProbeSend));
         (Handler { ctx, registry }, signal)

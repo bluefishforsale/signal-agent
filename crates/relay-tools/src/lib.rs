@@ -14,11 +14,13 @@ mod settings;
 #[cfg(test)]
 mod testing;
 mod tool;
+mod webhook;
 
 pub use limits::{Clock, LimitExceeded, Limiter, Limits, SystemClock, begin_provisioning};
 pub use registry::Registry;
 pub use settings::Settings;
 pub use tool::{Tool, ToolContext, ToolError};
+pub use webhook::WebhookUrl;
 
 pub mod prelude {
     pub use crate::{Registry, Tool, ToolContext, ToolError};

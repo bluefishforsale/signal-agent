@@ -15,7 +15,7 @@ use sqlx::{
 
 use crate::{
     JobId, MessageStore, ScheduledJob, ScheduledSend, SearchQuery, StoreStats, StoredAttachment,
-    WebhookUrl, ensure_author,
+    ensure_author,
 };
 
 /// A profile's encrypted message history.
@@ -446,14 +446,6 @@ impl MessageStore for SqlCipherStore {
         _result: Result<(), String>,
     ) -> anyhow::Result<()> {
         bail!("scheduled sends are not implemented yet (lane L2b)")
-    }
-
-    async fn webhook(&self) -> anyhow::Result<Option<WebhookUrl>> {
-        bail!("webhook config is not implemented yet (lane L2b)")
-    }
-
-    async fn set_webhook(&self, _url: Option<&WebhookUrl>) -> anyhow::Result<()> {
-        bail!("webhook config is not implemented yet (lane L2b)")
     }
 }
 

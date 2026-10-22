@@ -520,6 +520,7 @@ mod tests {
             access: AccessMode::Full,
             kind: ProfileKind::Linked,
             send_roots: Arc::default(),
+            webhook: None,
         };
         (ctx, signal)
     }

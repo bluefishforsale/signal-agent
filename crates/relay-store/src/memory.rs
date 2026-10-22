@@ -10,7 +10,7 @@ use relay_core::prelude::*;
 
 use crate::{
     JobId, JobState, MessageStore, ScheduledJob, ScheduledSend, SearchQuery, StoreStats,
-    StoredAttachment, WebhookUrl, ensure_author,
+    StoredAttachment, ensure_author,
 };
 
 #[derive(Default)]
@@ -26,7 +26,6 @@ struct Inner {
     poll_votes: HashMap<MessageId, u32>,
     jobs: Vec<ScheduledJob>,
     last_job: u64,
-    webhook: Option<WebhookUrl>,
 }
 
 impl MemoryStore {
@@ -312,15 +311,6 @@ impl MessageStore for MemoryStore {
                 }
             }
         }
-        Ok(())
-    }
-
-    async fn webhook(&self) -> anyhow::Result<Option<WebhookUrl>> {
-        Ok(self.inner().webhook.clone())
-    }
-
-    async fn set_webhook(&self, url: Option<&WebhookUrl>) -> anyhow::Result<()> {
-        self.inner().webhook = url.cloned();
         Ok(())
     }
 

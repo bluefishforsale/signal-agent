@@ -1,5 +1,6 @@
 //! The webhook address the agent posts incoming messages to. Every message's
-//! contents leave the machine through it, so it's validated once, here.
+//! contents leave the machine through it, so it's validated once, here, and
+//! only the user sets it, in Settings.
 
 use std::{fmt, net::IpAddr};
 
@@ -41,7 +42,6 @@ fn is_loopback(url: &Url) -> bool {
     }
 }
 
-// Display redacts nothing on purpose: get_webhook shows the user what they set.
 impl fmt::Display for WebhookUrl {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)

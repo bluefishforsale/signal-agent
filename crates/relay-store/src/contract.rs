@@ -9,7 +9,6 @@ use uuid::Uuid;
 
 use crate::{
     JobId, JobState, MemoryStore, MessageStore, ScheduledSend, SearchQuery, SqlCipherStore,
-    WebhookUrl,
 };
 
 /// One fresh instance of every implementation.
@@ -712,21 +711,6 @@ async fn cancelling_a_job_removes_it_once() {
         assert!(!store.cancel_scheduled(id).await.expect("cancel"), "{name}");
         assert!(!store.cancel_scheduled(JobId(999)).await.expect("cancel"));
         assert!(store.take_due(u64::MAX).await.expect("tick").is_empty());
-    }
-    stores.close().await;
-}
-
-/// The webhook reads back as set, and clearing it leaves none.
-#[tokio::test]
-async fn the_webhook_reads_back_as_set_until_cleared() {
-    let url = WebhookUrl::parse("https://example.com/hook?token=t").expect("valid");
-    let stores = Stores::open().await;
-    for (name, store) in stores.round_two() {
-        assert_eq!(store.webhook().await.expect("get"), None, "{name}");
-        store.set_webhook(Some(&url)).await.expect("set");
-        assert_eq!(store.webhook().await.expect("get"), Some(url.clone()));
-        store.set_webhook(None).await.expect("clear");
-        assert_eq!(store.webhook().await.expect("get"), None, "{name}");
     }
     stores.close().await;
 }

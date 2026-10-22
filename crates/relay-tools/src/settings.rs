@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-use crate::Limits;
+use crate::{Limits, WebhookUrl};
 
 /// What a user can adjust under Advanced.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -15,6 +15,11 @@ pub struct Settings {
     pub limits: Limits,
     /// Folders tools may send files from. Empty means no file can be sent.
     pub send_roots: Vec<PathBuf>,
+    /// Where the agent posts every incoming message, if anywhere.
+    // NOTE: settable only here, by the user, never by an MCP tool. A tool that
+    // could set it would let one prompt injection forward every future
+    // message to an attacker, silently and for good.
+    pub webhook: Option<WebhookUrl>,
 }
 
 impl Settings {
@@ -72,11 +77,29 @@ mod tests {
             r#"{"limit": {}}"#,
             r#"{"limits": {"per_hour": 0}}"#,
             r#"{"send_root": []}"#,
+            r#"{"webhook": "http://example.com/hook"}"#,
         ] {
             std::fs::write(&path, bad).expect("write");
             let loaded = Settings::load(&path);
             assert!(loaded.is_err(), "accepted {bad}: {loaded:?}");
         }
         std::fs::remove_dir_all(&dir).expect("clean temp dir");
+    }
+
+    /// The webhook is a standing channel out of the machine, so the user sets
+    /// it in Settings and no shipped tool may write it. A tool named for it
+    /// may only read.
+    #[test]
+    fn no_registered_tool_can_set_the_webhook() {
+        let registry = crate::Registry::standard();
+        let setters: Vec<_> = registry
+            .all()
+            .filter(|t| t.writes() && t.name().contains("webhook"))
+            .map(|t| t.name())
+            .collect();
+        assert!(
+            setters.is_empty(),
+            "tools that can set the webhook: {setters:?}"
+        );
     }
 }

@@ -5,7 +5,6 @@
 mod contract;
 mod memory;
 mod sqlcipher;
-mod webhook;
 
 use anyhow::bail;
 use async_trait::async_trait;
@@ -14,7 +13,6 @@ use serde::{Deserialize, Serialize};
 
 pub use memory::MemoryStore;
 pub use sqlcipher::SqlCipherStore;
-pub use webhook::WebhookUrl;
 
 /// A full-text search with optional filters.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,9 +162,6 @@ pub trait MessageStore: Send + Sync {
     /// Records how a claimed job's send went: success removes it, failure
     /// keeps it as `Failed` for the user to see. Never re-queues it.
     async fn finish_scheduled(&self, id: JobId, result: Result<(), String>) -> anyhow::Result<()>;
-
-    async fn webhook(&self) -> anyhow::Result<Option<WebhookUrl>>;
-    async fn set_webhook(&self, url: Option<&WebhookUrl>) -> anyhow::Result<()>;
 
     /// Releases the store's connections. The agent calls this before exiting.
     // NOTE: dropping the SQLCipher store without closing it first crashed the
