@@ -504,7 +504,7 @@ async fn deleting_a_conversation_leaves_the_others_untouched() {
     let alice = Recipient::Contact(sid(1));
     let bob = Recipient::Contact(sid(2));
     let stores = Stores::open().await;
-    for (name, store) in stores.round_two() {
+    for (name, store) in stores.each() {
         for t in [1, 2] {
             store.insert(&msg(1, t, alice, "a")).await.expect("insert");
         }

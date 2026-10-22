@@ -400,8 +400,20 @@ impl MessageStore for SqlCipherStore {
             newest_ms: newest.map(to_u64).transpose()?,
         })
     }
-    async fn delete_conversation(&self, _conversation: Recipient) -> anyhow::Result<u64> {
-        bail!("deleting a conversation is not implemented yet (lane L2b)")
+    // Read state lives on the message rows, so it goes with them.
+    async fn delete_conversation(&self, conversation: Recipient) -> anyhow::Result<u64> {
+        let key = recipient_key(conversation);
+        let mut tx = self.pool.begin().await?;
+        let deleted = sqlx::query("DELETE FROM messages WHERE conversation = ?")
+            .bind(&key)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM titles WHERE conversation = ?")
+            .bind(&key)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(deleted.rows_affected())
     }
 
     async fn mark_admin_deleted(&self, group: GroupId, target: MessageId) -> anyhow::Result<()> {
