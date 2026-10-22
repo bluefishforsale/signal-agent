@@ -14,7 +14,8 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use relay_core::prelude::*;
 use relay_signal::{
-    Account, Contact, Device, Group, Identity, Incoming, Outgoing, SendableFile, SignalBackend,
+    Account, Contact, Device, Group, Identity, Incoming, Outgoing, RateLimited, SendableFile,
+    SignalBackend,
 };
 use relay_store::MessageStore;
 use serde::{Deserialize, Serialize};
@@ -95,6 +96,8 @@ struct State {
     first_contacts: Vec<(Recipient, u64)>,
     /// No first contacts before this time.
     first_contacts_paused_until_ms: u64,
+    /// No counted sends before this time, because Signal asked us to wait.
+    sends_paused_until_ms: u64,
 }
 
 impl State {
@@ -109,6 +112,7 @@ impl State {
             hour: empty(),
             first_contacts: vec![],
             first_contacts_paused_until_ms: now + DAY_MS,
+            sends_paused_until_ms: 0,
         }
     }
 }
@@ -187,6 +191,15 @@ impl Limiter {
         let known = !store.history(to, None, 1).await?.is_empty();
         let now = self.clock.now_ms();
         let mut state = self.state.lock().expect("limiter state");
+        if now < state.sends_paused_until_ms {
+            return Err(LimitExceeded {
+                limit: "Signal rate-limited a recent message, so sending is paused for as \
+                        long as Signal asked"
+                    .into(),
+                retry_after: Duration::from_millis(state.sends_paused_until_ms - now),
+            }
+            .into());
+        }
         let Limits {
             burst_per_minute,
             per_hour,
@@ -239,11 +252,31 @@ impl Limiter {
         }
         // NOTE: saved before the send, so a crash mid-send costs a token
         // rather than handing one back.
-        if let Some(path) = &self.path {
-            write_atomically(path, &serde_json::to_vec(&*state)?)?;
-        }
-        Ok(())
+        self.save(&state)
     }
+
+    /// Holds every counted send until Signal's `limited` wait has passed.
+    fn pause_sends(&self, limited: &RateLimited) -> anyhow::Result<()> {
+        let until = self.clock.now_ms() + signal_wait_ms(limited);
+        let mut state = self.state.lock().expect("limiter state");
+        state.sends_paused_until_ms = state.sends_paused_until_ms.max(until);
+        self.save(&state)
+    }
+
+    fn save(&self, state: &State) -> anyhow::Result<()> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        write_atomically(path, &serde_json::to_vec(state)?)
+    }
+}
+
+/// How long to hold off after `limited`, assuming five minutes when Signal
+/// didn't say.
+fn signal_wait_ms(limited: &RateLimited) -> u64 {
+    limited
+        .retry_after
+        .map_or(5 * MINUTE_MS, |wait| wait.as_millis() as u64)
 }
 
 /// Records an attempt to link or register at `now_ms` in `path`, or refuses
@@ -369,7 +402,15 @@ impl SignalBackend for Guarded {
         if counts(&message) {
             self.limiter.admit(self.store.as_ref(), to).await?;
         }
-        self.inner.send(to, message).await
+        let sent = self.inner.send(to, message).await;
+        // The pause holds in memory even when it can't be saved, and the
+        // caller still needs Signal's own refusal, not the save error.
+        if let Some(limited) = sent.as_ref().err().and_then(|e| e.downcast_ref()) {
+            if let Err(e) = self.limiter.pause_sends(limited) {
+                tracing::warn!("{e:#}; the send pause won't survive a restart");
+            }
+        }
+        sent
     }
     async fn contacts(&self) -> anyhow::Result<Vec<Contact>> {
         self.inner.contacts().await
@@ -879,6 +920,73 @@ mod tests {
             1,
             "a refused first contact reached Signal"
         );
+        std::fs::remove_dir_all(&dir).expect("clean temp dir");
+    }
+
+    /// Once Signal rate-limits a send, the next one must be refused here with
+    /// Signal's wait rather than reach Signal again, and go through once that
+    /// wait has passed.
+    #[tokio::test]
+    async fn after_signal_rate_limits_a_send_the_next_is_refused_locally_until_its_wait_passes() {
+        let (registry, clock) = limited(Limits::default());
+        let (ctx, signal) = ctx();
+        let input = json!({"recipient": sid(2).to_string(), "message": "hi"});
+        signal.rate_limit_next_send(relay_signal::RateLimited {
+            message: "slow down".into(),
+            retry_after: Some(Duration::from_secs(600)),
+        });
+        let result = registry.call(&ctx, "send_message", input.clone()).await;
+        assert!(
+            result.is_err(),
+            "Signal's refusal was swallowed: {result:?}"
+        );
+        clock.advance(1_000);
+        let result = registry.call(&ctx, "send_message", input.clone()).await;
+        let Some(e) = refused(&result) else {
+            panic!("a send inside Signal's wait was not refused locally: {result:?}");
+        };
+        assert_eq!(e.retry_after, Duration::from_secs(599), "{e}");
+        assert!(signal.sent().is_empty(), "a refused send reached Signal");
+        clock.advance(599_000);
+        let result = registry.call(&ctx, "send_message", input).await;
+        assert!(
+            result.is_ok(),
+            "send after Signal's wait refused: {result:?}"
+        );
+    }
+
+    /// Signal's wait must outlive the agent, or a client that can crash it
+    /// gets straight back to the endpoint Signal told us to leave alone; with
+    /// no Retry-After from Signal the pause is five minutes.
+    #[tokio::test]
+    async fn a_send_pause_without_a_retry_after_survives_a_restart() {
+        let dir = std::env::temp_dir().join(format!("relay-limits-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("limits.json");
+        let clock = Arc::new(FakeClock::default());
+        let start = || Limiter::new(Limits::default(), clock.clone()).persisted(path.clone());
+        let (ctx, signal) = ctx();
+        let input = json!({"recipient": sid(2).to_string(), "message": "hi"});
+        signal.rate_limit_next_send(relay_signal::RateLimited {
+            message: "slow down".into(),
+            retry_after: None,
+        });
+        let registry = Registry::standard().with_limiter(start());
+        let result = registry.call(&ctx, "send_message", input.clone()).await;
+        assert!(
+            result.is_err(),
+            "Signal's refusal was swallowed: {result:?}"
+        );
+        let registry = Registry::standard().with_limiter(start());
+        let result = registry.call(&ctx, "send_message", input.clone()).await;
+        let Some(e) = refused(&result) else {
+            panic!("a restart lifted Signal's pause: {result:?}");
+        };
+        assert_eq!(e.retry_after, Duration::from_millis(5 * MINUTE_MS), "{e}");
+        assert!(signal.sent().is_empty(), "a refused send reached Signal");
+        clock.advance(5 * MINUTE_MS);
+        let result = registry.call(&ctx, "send_message", input).await;
+        assert!(result.is_ok(), "send after the pause refused: {result:?}");
         std::fs::remove_dir_all(&dir).expect("clean temp dir");
     }
 
