@@ -4,7 +4,7 @@ The HTTP endpoint lets an MCP client on another machine reach a profile over MCP
 
 ## How it fits
 
-The endpoint runs inside the `signal-agent agent` process when it's enabled, but it reaches Signal the same way the stdio shim does: as a client of the agent's user-only local socket. Each HTTP request is replayed on a fresh connection to the agent, so the agent's registry is the only place access is decided. A read-only token's connection declares the `signal-agent/read-only` capability at initialize, and the agent serves that connection read-only (a client can lower its access this way, never raise it). A full token gets whatever the profile allows, so a full token on a read-only profile is still read-only. The server runs in MCP's stateless mode with JSON responses, so there are no sessions to hijack between tokens.
+The endpoint runs inside the `signal-agent agent` process when it's enabled, but it reaches Signal the same way the stdio shim does: as a client of the agent's user-only local socket. Each HTTP request is replayed on a fresh connection to the agent, so the agent's registry is the only place access is decided. A read-only token's connection declares the `signal-agent/read-only` capability at initialize, and the agent serves that connection read-only (a client can lower its access this way, never raise it). A full token gets whatever the profile allows, so a full token on a read-only profile is still read-only. The server runs in MCP's stateless mode with JSON responses, so there are no sessions to hijack between tokens. To keep one client, or a flood of them, from taking the endpoint down, it serves at most 64 connections at once (the rest wait in the backlog), drops a connection that hasn't finished its TLS handshake within 10 seconds or its request headers within 30, and pauses and keeps going after transient accept errors such as running out of file descriptors.
 
 ## Turning it on
 
@@ -27,7 +27,7 @@ signal-agent http token list
 signal-agent http token revoke laptop
 ```
 
-A token is 32 random bytes, printed once at creation and never again. The profile keeps only its SHA-256 in `http_tokens.json` (mode 0600), compares hashes in constant time, and rereads the file on every request, so a revoked token fails on its very next request without restarting anything. Names must be unique, since they're how you revoke a client and how the log identifies it: every request is logged with the token's name, the peer address, the method, path and status, and never the token. Requests with a missing or unknown token get `401` with `WWW-Authenticate: Bearer`.
+A token is 32 random bytes, printed once at creation and never again. The profile keeps only its SHA-256 in `http_tokens.json` (mode 0600, replaced whole by write-and-rename like `http.json`), compares hashes in constant time, and rereads the file on every request, so a revoked token fails on its very next request without restarting anything. Names must be unique, since they're how you revoke a client and how the log identifies it: every request is logged with the token's name, the peer address, the method, path and status, and never the token. Requests with a missing or unknown token get `401` with `WWW-Authenticate: Bearer`.
 
 ## Claude Code
 

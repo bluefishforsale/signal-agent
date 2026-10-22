@@ -38,29 +38,64 @@ pub async fn run_http(profile: &ProfileName, paths: &ProfilePaths) -> anyhow::Re
     serve(listener, Tokens::of(paths), agent).await
 }
 
-/// Writes `bytes` to `path` readable only by the current user.
+/// Replaces `path` with `bytes`, readable only by the current user. Written
+/// beside it and renamed over it, so a reader never sees half a file.
 fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     use std::io::Write;
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)
-            .with_context(|| format!("unable to create \"{}\"", dir.display()))?;
-    }
+    let Some(dir) = path.parent() else {
+        anyhow::bail!("\"{}\" has no parent directory", path.display());
+    };
+    fs::create_dir_all(dir).with_context(|| format!("unable to create \"{}\"", dir.display()))?;
+    let mut suffix = [0u8; 8];
+    getrandom::fill(&mut suffix).map_err(|e| anyhow::anyhow!("no OS randomness: {e}"))?;
+    let mut name = path.file_name().unwrap_or_default().to_owned();
+    name.push(format!(".{}.tmp", hex::encode(suffix)));
+    let temp = dir.join(name);
     let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    // %LOCALAPPDATA%, where profiles live on Windows, is already private to the user.
-    let mut file = options
-        .open(path)
-        .with_context(|| format!("unable to write \"{}\"", path.display()))?;
-    // NOTE: `mode` only applies when the file is created; a pre-existing file
-    // keeps whatever permissions it had, so tighten them explicitly.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("unable to restrict \"{}\"", path.display()))?;
+    // %LOCALAPPDATA%, where profiles live on Windows, is already private to the
+    // user, and a new file there inherits that.
+    let written = options
+        .open(&temp)
+        .and_then(|mut file| {
+            file.write_all(bytes)?;
+            file.sync_all()
+        })
+        .and_then(|()| fs::rename(&temp, path));
+    if written.is_err() {
+        let _ = fs::remove_file(&temp);
     }
-    file.write_all(bytes)
-        .with_context(|| format!("unable to write \"{}\"", path.display()))
+    written.with_context(|| format!("unable to write \"{}\"", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Token and settings files replace the old copy whole: a crash mid-save
+    /// must never leave a truncated file, and the result is the user's alone
+    /// even when the old copy was readable by others.
+    #[cfg(unix)]
+    #[test]
+    fn a_private_write_replaces_the_file_whole_and_user_only() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("http_tokens.json");
+        fs::write(&path, b"old").expect("old copy");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod");
+        let old_inode = fs::metadata(&path).expect("stat").ino();
+        write_private(&path, b"new").expect("write");
+        let meta = fs::metadata(&path).expect("stat");
+        assert_eq!(fs::read(&path).expect("read"), b"new");
+        assert_eq!(meta.mode() & 0o777, 0o600, "mode {:o}", meta.mode());
+        assert_ne!(meta.ino(), old_inode, "rewritten in place, not replaced");
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .expect("list")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(leftovers.len(), 1, "temp files left: {leftovers:?}");
+    }
 }
