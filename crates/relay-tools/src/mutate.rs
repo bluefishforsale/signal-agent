@@ -277,4 +277,37 @@ mod tests {
         assert_eq!(stored[0].body.as_deref(), Some("the cat"), "{stored:?}");
         assert!(stored[0].edited, "edit not flagged: {stored:?}");
     }
+
+    /// Someone else's message at the same timestamp must survive an edit: the
+    /// tool only ever targets this account's own messages, so the store's
+    /// author check never gets a foreign target to accept.
+    #[tokio::test]
+    async fn edit_message_cannot_rewrite_someone_elses_message() {
+        let (ctx, _) = ctx(AccessMode::Full, ProfileKind::Linked);
+        ctx.store
+            .insert(&incoming(2, 42, "their words"))
+            .await
+            .unwrap();
+        let result = Registry::standard()
+            .call(
+                &ctx,
+                "edit_message",
+                json!({
+                    "recipient": sid(2).to_string(),
+                    "target_timestamp": 42,
+                    "message": "my words",
+                }),
+            )
+            .await;
+        let stored = ctx
+            .store
+            .history(Recipient::Contact(sid(2)), None, 10)
+            .await
+            .unwrap();
+        assert_eq!(stored[0].body.as_deref(), Some("their words"), "{result:?}");
+        assert!(
+            !stored[0].edited,
+            "foreign message flagged edited: {stored:?}"
+        );
+    }
 }
