@@ -530,9 +530,17 @@ impl Provisioner for PresageProvisioner {
 
     async fn transfer_history(&self, dir: &Path) -> anyhow::Result<HistoryTransfer> {
         let offered = self.history.lock().expect("offered history lock").take();
-        match offered {
-            None => Ok(HistoryTransfer::NotOffered),
-            Some(pending) => pending?.fetch(dir).await,
+        let Some(offered) = offered else {
+            return Ok(HistoryTransfer::NotOffered);
+        };
+        let mut pending = offered?;
+        match pending.fetch(dir).await {
+            Ok(fetched) => Ok(pending.hand_over(fetched)),
+            Err(e) => {
+                // Kept for a retry: the key exists nowhere else.
+                *self.history.lock().expect("offered history lock") = Some(Ok(pending));
+                Err(e)
+            }
         }
     }
 

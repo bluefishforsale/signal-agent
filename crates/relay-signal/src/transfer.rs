@@ -4,7 +4,7 @@
 
 use std::{
     io::SeekFrom,
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -28,6 +28,8 @@ use crate::{HistoryTransfer, RateLimited};
 pub(crate) struct PendingTransfer {
     key: LinkAndSyncKey,
     source: ArchiveSource,
+    /// Signal rate-limited an earlier fetch; nothing is asked before this.
+    not_before: Option<Instant>,
 }
 
 impl PendingTransfer {
@@ -38,13 +40,58 @@ impl PendingTransfer {
         let key = LinkAndSyncKey::new(registration.ephemeral_backup_key()?);
         let source = login(registration)
             .and_then(|login| ArchiveSource::signal(registration.signal_servers, login));
-        Some(source.map(|source| Self { key, source }))
+        Some(source.map(|source| Self {
+            key,
+            source,
+            not_before: None,
+        }))
     }
 
-    /// Waits for the phone's history and downloads it into `dir`.
-    pub(crate) async fn fetch(self, dir: &Path) -> anyhow::Result<HistoryTransfer> {
-        self.source.fetch(self.key, dir).await
+    /// Waits for the phone's history and downloads it into `dir`. Can be
+    /// called again after a failure; after a rate limit, the retry fails
+    /// without asking Signal until Signal's wait is over.
+    pub(crate) async fn fetch(&mut self, dir: &Path) -> anyhow::Result<Fetched> {
+        if let Some(wait) = self
+            .not_before
+            .and_then(|not_before| not_before.checked_duration_since(Instant::now()))
+        {
+            return Err(RateLimited {
+                message: "Signal asked to wait before the history is fetched again".into(),
+                retry_after: Some(wait),
+            }
+            .into());
+        }
+        let fetched = self.source.fetch(dir).await;
+        if let Err(e) = &fetched
+            && let Some(limited) = e.downcast_ref::<RateLimited>()
+        {
+            let wait = limited.retry_after.unwrap_or(RATE_LIMITED_WAIT);
+            self.not_before = Some(Instant::now() + wait);
+        }
+        fetched
     }
+
+    /// What `fetch` found, with the key handed over alongside an archive.
+    pub(crate) fn hand_over(self, fetched: Fetched) -> HistoryTransfer {
+        match fetched {
+            Fetched::Archive(path) => HistoryTransfer::Archive {
+                path,
+                key: self.key,
+            },
+            Fetched::Relink => HistoryTransfer::Relink,
+            Fetched::NoUpload => HistoryTransfer::NoUpload,
+            Fetched::TimedOut => HistoryTransfer::TimedOut,
+        }
+    }
+}
+
+/// How a fetch ended, before the key goes with it.
+#[derive(Debug)]
+pub(crate) enum Fetched {
+    Archive(PathBuf),
+    Relink,
+    NoUpload,
+    TimedOut,
 }
 
 /// The basic-auth login of the device `registration` describes.
@@ -106,7 +153,7 @@ struct Patience {
 }
 
 /// How one request for the archive went.
-enum Fetched {
+enum Attempt {
     Complete,
     BrokeOff(anyhow::Error),
 }
@@ -123,6 +170,10 @@ const USER_AGENT: &str = "presage-rs-0.8.0-dev";
 
 /// The downloaded archive's name in the profile directory.
 const ARCHIVE_FILE: &str = "link-and-sync.archive";
+
+/// How long to hold a retry back when Signal rate-limited without saying
+/// how long to wait.
+const RATE_LIMITED_WAIT: Duration = Duration::from_secs(5 * 60);
 
 /// How much longer than the poll's own timeout to wait for Signal's answer.
 const POLL_SLACK: Duration = Duration::from_secs(15);
@@ -183,23 +234,21 @@ impl ArchiveSource {
         })
     }
 
-    /// Waits for the phone's history and downloads it into `dir`, to be
-    /// decrypted with `key`.
-    async fn fetch(&self, key: LinkAndSyncKey, dir: &Path) -> anyhow::Result<HistoryTransfer> {
-        let (cdn, cdn_key) = match self.wait_for_archive().await? {
+    /// Waits for the phone's history and downloads it into `dir`.
+    async fn fetch(&self, dir: &Path) -> anyhow::Result<Fetched> {
+        let (cdn, key) = match self.wait_for_archive().await? {
             Waited::Ready { cdn, key } => (cdn, key),
-            Waited::Relink => return Ok(HistoryTransfer::Relink),
-            Waited::NoUpload => return Ok(HistoryTransfer::NoUpload),
-            Waited::TimedOut => return Ok(HistoryTransfer::TimedOut),
+            Waited::Relink => return Ok(Fetched::Relink),
+            Waited::NoUpload => return Ok(Fetched::NoUpload),
+            Waited::TimedOut => return Ok(Fetched::TimedOut),
         };
         let path = dir.join(ARCHIVE_FILE);
-        if let Err(e) = self.download(cdn, &cdn_key, &path).await {
-            // A partial download is useless without a retry, which only a
-            // fresh link can give.
+        if let Err(e) = self.download(cdn, &key, &path).await {
+            // A retry starts the download over, never resuming this file.
             let _ = tokio::fs::remove_file(&path).await;
             return Err(e);
         }
-        Ok(HistoryTransfer::Archive { path, key })
+        Ok(Fetched::Archive(path))
     }
 
     fn chat_url(&self, path: &str) -> anyhow::Result<Url> {
@@ -232,7 +281,7 @@ impl ArchiveSource {
         let mut written = 0u64;
         let mut attempt = 1;
         loop {
-            let Fetched::BrokeOff(broke) = self.fetch_from(&url, &mut file, &mut written).await?
+            let Attempt::BrokeOff(broke) = self.fetch_from(&url, &mut file, &mut written).await?
             else {
                 return Ok(());
             };
@@ -251,14 +300,14 @@ impl ArchiveSource {
         url: &Url,
         file: &mut tokio::fs::File,
         written: &mut u64,
-    ) -> anyhow::Result<Fetched> {
+    ) -> anyhow::Result<Attempt> {
         let mut request = self.http.get(url.clone());
         if *written > 0 {
             request = request.header(RANGE, format!("bytes={written}-"));
         }
         let mut response = match request.send().await {
             Ok(response) => response,
-            Err(e) => return Ok(Fetched::BrokeOff(e.into())),
+            Err(e) => return Ok(Attempt::BrokeOff(e.into())),
         };
         match response.status() {
             StatusCode::PARTIAL_CONTENT => {}
@@ -278,7 +327,7 @@ impl ArchiveSource {
             let chunk = match response.chunk().await {
                 Ok(Some(chunk)) => chunk,
                 Ok(None) => break,
-                Err(e) => return Ok(Fetched::BrokeOff(e.into())),
+                Err(e) => return Ok(Attempt::BrokeOff(e.into())),
             };
             file.write_all(&chunk)
                 .await
@@ -288,7 +337,7 @@ impl ArchiveSource {
         file.flush()
             .await
             .context("unable to write the history archive")?;
-        Ok(Fetched::Complete)
+        Ok(Attempt::Complete)
     }
 
     /// Long-polls until the phone says where the archive is.
@@ -642,10 +691,9 @@ mod tests {
         ])
         .await;
         let dir = tempfile::tempdir().expect("dir");
-        let transfer = source(&server)
-            .fetch(LinkAndSyncKey::new([5; 32]), dir.path())
-            .await
-            .expect("fetched");
+        let mut pending = pending(&server);
+        let fetched = pending.fetch(dir.path()).await.expect("fetched");
+        let transfer = pending.hand_over(fetched);
         let HistoryTransfer::Archive { path, key } = transfer else {
             panic!("no archive: {transfer:?}");
         };
@@ -720,10 +768,9 @@ mod tests {
             b"stale bytes from a killed run",
         )
         .expect("stale file");
-        let transfer = source(&server)
-            .fetch(LinkAndSyncKey::new([5; 32]), dir.path())
-            .await
-            .expect("fetched");
+        let mut pending = pending(&server);
+        let fetched = pending.fetch(dir.path()).await.expect("fetched");
+        let transfer = pending.hand_over(fetched);
         let HistoryTransfer::Archive { path, .. } = transfer else {
             panic!("no archive: {transfer:?}");
         };
@@ -735,5 +782,41 @@ mod tests {
                 .all(|r| !r.to_lowercase().contains("range:")),
             "resumed onto a stale file: {requests:?}"
         );
+    }
+
+    fn pending(server: &FakeServer) -> PendingTransfer {
+        PendingTransfer {
+            key: LinkAndSyncKey::new([5; 32]),
+            source: source(server),
+            not_before: None,
+        }
+    }
+
+    /// A fetch that fails partway (a network blip, a CDN error) must leave the
+    /// transfer in place, so the user's retry asks again instead of being
+    /// told the phone sent nothing.
+    #[tokio::test]
+    async fn a_failed_fetch_can_be_retried() {
+        let archive = b"encrypted archive bytes".to_vec();
+        let ready = json("200 OK", r#"{"cdn":0,"key":"k"}"#);
+        let server = FakeServer::start(vec![
+            ready.clone(),
+            empty("500 Internal Server Error"),
+            ready,
+            bytes("200 OK", "", &archive, archive.len()),
+        ])
+        .await;
+        let dir = tempfile::tempdir().expect("dir");
+        let mut pending = pending(&server);
+        pending
+            .fetch(dir.path())
+            .await
+            .expect_err("a 500 succeeded");
+        let outcome = pending.fetch(dir.path()).await.expect("retried");
+        let HistoryTransfer::Archive { path, key } = pending.hand_over(outcome) else {
+            panic!("no archive");
+        };
+        assert_eq!(std::fs::read(&path).expect("file"), archive);
+        assert_eq!(key.as_bytes(), &[5; 32]);
     }
 }
