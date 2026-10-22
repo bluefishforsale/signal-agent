@@ -27,6 +27,7 @@ impl Registry {
             .with(mutate::ReactToMessage)
             .with(mutate::EditMessage)
             .with(mutate::DeleteMessage)
+            .with(mutate::DeleteGroupMessage)
     }
 
     pub fn with(mut self, tool: impl Tool + 'static) -> Self {

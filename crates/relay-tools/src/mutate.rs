@@ -219,28 +219,81 @@ impl Tool for DeleteMessage {
     }
     async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
         let input: DeleteInput = parse(input)?;
-        let to = recipient(ctx, &input.recipient).await?;
-        // NOTE: as in edit_message, the target is always this account's own message.
-        let me = ctx.signal.account().await?.service_id;
-        let target = MessageId {
-            author: me,
-            sent_at_ms: input.target_timestamp.0,
-        };
-        ctx.signal.send(to, Outgoing::Delete { target }).await?;
-        ctx.store
-            .mark_deleted(target, me)
-            .await
-            .context("Signal accepted the delete, but the stored copy wasn't flagged")?;
-        Ok(json!({ "status": "deleted" }))
+        delete_own(ctx, &input.recipient, input.target_timestamp).await
     }
+}
+
+pub struct DeleteGroupMessage;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeleteGroupInput {
+    group_id: String,
+    target_timestamp: Timestamp,
+}
+
+#[async_trait]
+impl Tool for DeleteGroupMessage {
+    fn name(&self) -> &'static str {
+        "delete_group_message"
+    }
+    fn description(&self) -> &'static str {
+        "Delete a message you sent to a group for all members (Signal 5.0+ clients). \
+         group_id is the group, as list_conversations returns it (a contact's id works too, \
+         and acts like delete_message); target_timestamp names your message. Only your own \
+         messages can be deleted. Irreversible. Sends to Signal, then flags the stored copy \
+         deleted."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "group_id": recipient_schema(),
+                "target_timestamp": Timestamp::schema("Your message to delete"),
+            },
+            "required": ["group_id", "target_timestamp"],
+            "additionalProperties": false,
+        })
+    }
+    fn writes(&self) -> bool {
+        true
+    }
+    async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
+        let input: DeleteGroupInput = parse(input)?;
+        delete_own(ctx, &input.group_id, input.target_timestamp).await
+    }
+}
+
+/// Deletes this account's own message in `conversation` for everyone.
+async fn delete_own(
+    ctx: &ToolContext,
+    conversation: &str,
+    sent_at: Timestamp,
+) -> Result<Value, ToolError> {
+    let to = recipient(ctx, conversation).await?;
+    // NOTE: as in edit_message, the target is always this account's own message.
+    let me = ctx.signal.account().await?.service_id;
+    let target = MessageId {
+        author: me,
+        sent_at_ms: sent_at.0,
+    };
+    ctx.signal.send(to, Outgoing::Delete { target }).await?;
+    ctx.store
+        .mark_deleted(target, me)
+        .await
+        .context("Signal accepted the delete, but the stored copy wasn't flagged")?;
+    Ok(json!({ "status": "deleted" }))
 }
 
 #[cfg(test)]
 mod tests {
-    use relay_signal::Outgoing;
+    use std::sync::Arc;
+
+    use relay_signal::{Account, FakeSignal, Group, Outgoing};
+    use relay_store::MemoryStore;
     use serde_json::json;
 
-    use crate::{Registry, testing::*};
+    use crate::{Registry, ToolContext, testing::*};
     use relay_core::prelude::*;
 
     /// A reaction must name the target by its author and timestamp and go to
@@ -437,5 +490,57 @@ mod tests {
             .await
             .unwrap();
         assert!(!stored[0].deleted, "foreign message deleted: {result:?}");
+    }
+
+    /// A full-access context whose account is a member of `group`.
+    fn in_group(group: GroupId) -> (ToolContext, Arc<FakeSignal>) {
+        let signal = Arc::new(
+            FakeSignal::new(Account {
+                service_id: sid(ME),
+                phone_number: None,
+                kind: ProfileKind::Linked,
+                device_name: "test".into(),
+            })
+            .with_groups(vec![Group {
+                id: group,
+                title: "band".into(),
+                members: vec![sid(ME), sid(2)],
+            }]),
+        );
+        let ctx = ToolContext {
+            store: Arc::new(MemoryStore::default()),
+            signal: signal.clone(),
+            access: AccessMode::Full,
+            kind: ProfileKind::Linked,
+        };
+        (ctx, signal)
+    }
+
+    /// A group delete goes to the group as this account's own message, and only
+    /// then is the stored copy flagged deleted.
+    #[tokio::test]
+    async fn delete_group_message_sends_the_delete_to_the_group_then_flags_it() {
+        let group = GroupId::new([7; 32]);
+        let (ctx, signal) = in_group(group);
+        let conversation = Recipient::Group(group);
+        ctx.store
+            .insert(&mine(conversation, 42, "oops"))
+            .await
+            .unwrap();
+        Registry::standard()
+            .call(
+                &ctx,
+                "delete_group_message",
+                json!({"group_id": group.to_string(), "target_timestamp": 42}),
+            )
+            .await
+            .unwrap();
+        let target = MessageId {
+            author: sid(ME),
+            sent_at_ms: 42,
+        };
+        assert_eq!(signal.sent(), [(conversation, Outgoing::Delete { target })]);
+        let stored = ctx.store.history(conversation, None, 10).await.unwrap();
+        assert!(stored[0].deleted, "delete not flagged: {stored:?}");
     }
 }
