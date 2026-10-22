@@ -170,7 +170,7 @@ impl Driver {
     /// Applies `event`, then runs every command it leads to, showing each state
     /// as it is entered. Returns once setup waits on the user again.
     pub async fn dispatch(&mut self, event: SetupEvent, show: Show<'_>) {
-        let mut pending: VecDeque<Command> = apply(&mut self.state, event, show).into();
+        let mut pending: VecDeque<Command> = apply(&mut self.state, &self.skip, event, show).into();
         while let Some(command) = pending.pop_front() {
             let Err(e) = self.run(command, show, &mut pending).await else {
                 continue;
@@ -184,7 +184,7 @@ impl Driver {
             // hand clients a profile in the wrong access mode.
             pending.clear();
             let failed = SetupEvent::CommandFailed { message };
-            pending.extend(apply(&mut self.state, failed, show));
+            pending.extend(apply(&mut self.state, &self.skip, failed, show));
         }
     }
 
@@ -206,6 +206,7 @@ impl Driver {
                     match event? {
                         LinkEvent::Uri { uri } => pending.extend(apply(
                             &mut self.state,
+                            &self.skip,
                             SetupEvent::LinkUri { uri },
                             show,
                         )),
@@ -280,7 +281,7 @@ impl Driver {
                 } = self;
                 let mut progress = |imported, total| {
                     let event = SetupEvent::HistoryProgress { imported, total };
-                    pending.extend(apply(state, event, show));
+                    pending.extend(apply(state, skip, event, show));
                 };
                 let history = async {
                     let (Some(provisioner), Some(aci)) = (provisioner.as_deref(), *linked) else {
@@ -301,7 +302,6 @@ impl Driver {
                         .await?;
                     anyhow::Ok(None)
                 };
-                skip.0.send_replace(Import::Running);
                 let mut skipped = skip.0.subscribe();
                 let outcome = tokio::select! {
                     outcome = history => Some(outcome),
@@ -324,7 +324,8 @@ impl Driver {
             Command::ImportDesktop => {
                 let state = &mut self.state;
                 let mut progress = |imported| {
-                    pending.extend(apply(state, SetupEvent::DesktopProgress { imported }, show));
+                    let event = SetupEvent::DesktopProgress { imported };
+                    pending.extend(apply(state, &self.skip, event, show));
                 };
                 let aci = self
                     .linked
@@ -344,7 +345,7 @@ impl Driver {
                 return Ok(());
             }
         };
-        pending.extend(apply(&mut self.state, event, show));
+        pending.extend(apply(&mut self.state, &self.skip, event, show));
         Ok(())
     }
 
@@ -440,8 +441,19 @@ impl Drop for Downloaded {
 }
 
 /// Moves `state` on by `event`, showing it if it changed.
-fn apply(state: &mut SetupState, event: SetupEvent, show: Show<'_>) -> Vec<Command> {
+fn apply(
+    state: &mut SetupState,
+    skip: &HistorySkip,
+    event: SetupEvent,
+    show: Show<'_>,
+) -> Vec<Command> {
     let (next, commands) = transition(state, event);
+    // NOTE: armed before the history screen shows, not when the import
+    // starts: a Skip pressed in between would otherwise be lost and queue
+    // behind the phone's hour-long wait.
+    if commands.contains(&Command::ImportHistory) {
+        skip.0.send_replace(Import::Running);
+    }
     if next != *state {
         *state = next;
         show(state);
@@ -1097,6 +1109,37 @@ mod tests {
                 .contains(&"start agent personal, access ReadOnly".to_owned()),
             "{:?}",
             world.log()
+        );
+    }
+
+    /// The window draws the history screen before the import starts, so a
+    /// Skip pressed the moment it appears must still count; it once queued
+    /// behind the phone's hour-long wait (Windows CI).
+    #[tokio::test]
+    async fn a_skip_pressed_as_the_history_screen_appears_counts() {
+        let world = World::new().link(vec![linked()]).stalled_history();
+        let mut h = Harness::new(&world);
+        h.send(LINK).await;
+        let skip = h.driver.history_skip();
+        let mut pressed = false;
+        let mut show = |state: &SetupState| {
+            if matches!(state, SetupState::ImportingHistory { .. }) && !pressed {
+                pressed = skip.skip();
+            }
+        };
+        let access = SetupEvent::AccessChosen {
+            access: AccessMode::Full,
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            h.driver.dispatch(access, &mut show),
+        )
+        .await
+        .expect("the skip was lost before the import started");
+        assert!(
+            matches!(h.driver.state(), SetupState::Done { .. }),
+            "{:?}",
+            h.driver.state()
         );
     }
 
