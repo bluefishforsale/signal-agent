@@ -82,6 +82,18 @@ mod tests {
         ProfilePaths::under(dir.path().to_owned(), &ProfileName::default_profile())
     }
 
+    /// Whether `check` holds within a second. A lock let go of can stay held
+    /// for an instant longer: a process a parallel test is spawning shares
+    /// its descriptor until it execs.
+    fn soon(check: impl Fn() -> bool) -> bool {
+        (0..100).any(|_| {
+            check() || {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                false
+            }
+        })
+    }
+
     /// Agents and the shim must see setup running for exactly as long as
     /// setup holds its lock: a setup that quit or crashed must not keep the
     /// profile's agent off forever.
@@ -94,7 +106,10 @@ mod tests {
         let held = SetupLock::try_acquire(&paths).expect("lock").expect("free");
         assert!(setup_running(&paths), "setup's lock went unseen");
         drop(held);
-        assert!(!setup_running(&paths), "a dropped lock still counts");
+        assert!(
+            soon(|| !setup_running(&paths)),
+            "a dropped lock still counts"
+        );
     }
 
     /// The agent and setup must never have one profile's stores open at
@@ -110,7 +125,7 @@ mod tests {
         );
         drop(first);
         assert!(
-            StoreLock::try_acquire(&paths).expect("lock").is_some(),
+            soon(|| StoreLock::try_acquire(&paths).expect("lock").is_some()),
             "still held after its holder let go"
         );
     }

@@ -350,6 +350,18 @@ mod tests {
         ProfileName::new(s).expect("valid profile name")
     }
 
+    /// Whether `check` holds within a second. A lock let go of can stay held
+    /// for an instant longer: a process a parallel test is spawning shares
+    /// its descriptor until it execs.
+    fn soon(check: impl Fn() -> bool) -> bool {
+        (0..100).any(|_| {
+            check() || {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                false
+            }
+        })
+    }
+
     /// Milliseconds of tokio's clock, which a paused test runtime advances.
     struct TokioClock(tokio::time::Instant);
 
@@ -467,7 +479,10 @@ mod tests {
             .expect("free");
         assert_eq!(ready_profiles(&profiles).expect("ready"), []);
         drop(setup);
-        assert_eq!(ready_profiles(&profiles).expect("ready"), [personal]);
+        assert!(
+            soon(|| ready_profiles(&profiles).expect("ready") == [personal.clone()]),
+            "still not ready after setup let go"
+        );
     }
 
     /// launchd and the Windows logon task throw the supervisor's stderr away,

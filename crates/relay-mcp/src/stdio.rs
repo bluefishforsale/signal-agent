@@ -402,6 +402,21 @@ mod tests {
         };
         assert!(format!("{e:#}").contains("setup"), "{e:#}");
         drop(setup);
-        assert!(may_start_agent(&profile, &paths).is_ok());
+        assert!(
+            soon(|| may_start_agent(&profile, &paths).is_ok()),
+            "still refused after setup let go"
+        );
+    }
+
+    /// Whether `check` holds within a second. A lock let go of can stay held
+    /// for an instant longer: a process a parallel test is spawning shares
+    /// its descriptor until it execs.
+    fn soon(check: impl Fn() -> bool) -> bool {
+        (0..100).any(|_| {
+            check() || {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                false
+            }
+        })
     }
 }
