@@ -307,7 +307,10 @@ impl Driver {
                 };
                 skip.0.send_replace(Import::Idle);
                 match outcome {
-                    None => SetupEvent::SkipHistory,
+                    None => {
+                        drop(Downloaded(paths.root.join(PARTIAL_ARCHIVE)));
+                        SetupEvent::SkipHistory
+                    }
                     Some(outcome) => match outcome? {
                         None => SetupEvent::HistoryDone,
                         Some(reason) => SetupEvent::NoHistory { reason },
@@ -404,6 +407,11 @@ impl Driver {
     }
 }
 
+// NOTE: where relay-signal's transfer_history downloads the archive. A Skip
+// mid-download leaves part of it here; if relay-signal renames it, skipped
+// downloads pile up in the profile directory.
+const PARTIAL_ARCHIVE: &str = "link-and-sync.archive";
+
 /// A downloaded history archive, deleted once setup is done with it, however
 /// the import ends.
 struct Downloaded(PathBuf);
@@ -470,7 +478,7 @@ mod tests {
         Stalls,
     }
 
-    const ARCHIVE: &str = "history.archive";
+    const ARCHIVE: &str = "link-and-sync.archive";
 
     /// The fakes' shared state: what Signal and the OS will do, and everything
     /// every fake did, in order. Clones share it, so two setup runs can see one
@@ -674,6 +682,7 @@ mod tests {
                 Sent::Nothing(HistoryGap::TimedOut) => return Ok(HistoryTransfer::TimedOut),
                 Sent::Fails(e) => return Err(e),
                 Sent::Stalls => {
+                    fs::write(dir.join(ARCHIVE), "half a download")?;
                     let _waiting = Waiting(self.0.clone());
                     return futures::future::pending().await;
                 }
@@ -1134,6 +1143,10 @@ mod tests {
         assert!(
             stopped.is_some() && stopped < started,
             "the wait outlived the skip: {log:?}"
+        );
+        assert!(
+            !world.paths().root.join(ARCHIVE).exists(),
+            "a skipped download was left behind"
         );
     }
 

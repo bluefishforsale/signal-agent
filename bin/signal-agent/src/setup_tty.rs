@@ -782,7 +782,11 @@ mod tests {
         fn found(&self) -> bool {
             false
         }
-        async fn import(&self, _: &mut (dyn FnMut(u64) + Send)) -> anyhow::Result<()> {
+        async fn import(
+            &self,
+            _: ServiceId,
+            _: &mut (dyn FnMut(u64) + Send),
+        ) -> anyhow::Result<()> {
             bail!("no Signal Desktop here")
         }
     }
