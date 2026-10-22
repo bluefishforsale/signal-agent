@@ -3,6 +3,7 @@
 
 mod proxy;
 mod server;
+mod tls;
 mod tokens;
 
 use std::{fs, path::Path};
@@ -10,6 +11,7 @@ use std::{fs, path::Path};
 use anyhow::Context;
 
 pub use server::{Listener, serve};
+pub use tls::Tls;
 pub use tokens::{Grant, Tokens};
 
 /// Writes `bytes` to `path` readable only by the current user.
