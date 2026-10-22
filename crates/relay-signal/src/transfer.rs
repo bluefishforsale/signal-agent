@@ -481,4 +481,43 @@ mod tests {
             "{resumed}"
         );
     }
+
+    /// A download that keeps breaking must stop after its attempts instead of
+    /// fetching from Signal's CDN forever.
+    #[tokio::test]
+    async fn a_download_that_keeps_breaking_stops_after_its_attempts() {
+        let server = FakeServer::start(vec![bytes("200 OK", "", b"half", 8)]).await;
+        let dir = tempfile::tempdir().expect("dir");
+        source(&server)
+            .download(0, "k", &dir.path().join("archive"))
+            .await
+            .expect_err("a download that never finished succeeded");
+        assert_eq!(server.requests().len(), 3, "{:?}", server.requests());
+    }
+
+    /// The CDN's 429 is Signal's too: typed, with its wait, and not retried.
+    #[tokio::test]
+    async fn a_rate_limited_download_is_not_retried() {
+        let server = FakeServer::start(vec![bytes(
+            "429 Too Many Requests",
+            "retry-after: 30\r\n",
+            b"",
+            0,
+        )])
+        .await;
+        let dir = tempfile::tempdir().expect("dir");
+        let error = source(&server)
+            .download(0, "k", &dir.path().join("archive"))
+            .await
+            .expect_err("a 429 was not an error");
+        let limited = error
+            .downcast_ref::<RateLimited>()
+            .unwrap_or_else(|| panic!("not RateLimited: {error:#}"));
+        assert_eq!(
+            limited.retry_after,
+            Some(Duration::from_secs(30)),
+            "{limited:?}"
+        );
+        assert_eq!(server.requests().len(), 1, "{:?}", server.requests());
+    }
 }
