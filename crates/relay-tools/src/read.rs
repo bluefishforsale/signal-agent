@@ -179,10 +179,10 @@ impl Tool for ReceiveMessages {
         "receive_messages"
     }
     fn description(&self) -> &'static str {
-        "Return messages that arrived since any client last checked, oldest first. The \
-         background agent receives from Signal all the time, so this returns at once and \
-         shares one queue with get_unread and receive_direct: each message comes back from \
-         exactly one of them. limit keeps the newest N; if has_more is true, call again. \
+        "Return messages that arrived since any client last checked, oldest first. It \
+         consumes the unread queue it shares with get_unread and receive_direct: each message \
+         comes back from exactly one of them, once. The background agent receives from \
+         Signal all the time, so this returns at once. limit keeps the newest N; if has_more is true, call again. \
          Marks them read in the local store only; no read receipt is sent."
     }
     fn input_schema(&self) -> Value {
@@ -206,8 +206,9 @@ impl Tool for ReceiveDirect {
     fn description(&self) -> &'static str {
         "The same as receive_messages, kept for clients that call it by this name: there is \
          no separate daemon to bypass, the background agent already holds the connection. \
-         Returns messages that arrived since any client last checked, oldest first, from the \
-         queue get_unread and receive_messages share. Marks them read in the local store \
+         Returns messages that arrived since any client last checked, oldest first, and \
+         consumes the unread queue get_unread and receive_messages share: each message comes \
+         back from exactly one of them, once. Marks them read in the local store \
          only; no read receipt is sent."
     }
     fn input_schema(&self) -> Value {
