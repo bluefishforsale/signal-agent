@@ -15,8 +15,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use relay_core::prelude::*;
-use relay_signal::{SendRoots, SignalBackend};
-use relay_store::MessageStore;
+use relay_signal::{PresageSignal, SendRoots, SignalBackend};
+use relay_store::{MessageStore, SqlCipherStore};
 use relay_tools::{
     Clock, Limiter, Limits, Registry, Settings, SystemClock, ToolContext, WebhookUrl,
 };
@@ -168,7 +168,8 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
     // Off the critical path: it shells out to Claude's CLIs, and the agent must
     // start capturing whether or not that works.
     tokio::task::spawn_blocking(move || startup::reregister_claude_entries(&profile));
-    let (signal, store) = open_backend_and_store(&config).await?;
+    let secrets = relay_secrets::platform_store()?;
+    let (signal, store) = open_backend_and_store(&config, &*secrets).await?;
     let settings = configured(&config.paths);
     let registry = registry(&config.paths, settings.limits, Arc::new(SystemClock));
     let mut agent =
@@ -234,20 +235,32 @@ async fn stop_requested() {
     }
 }
 
-// Integration seam: the presage backend (lane L1) and the SQLCipher store with
-// its key from relay-secrets (lane L2) are opened here once they exist. Tests
-// never come through this path; they build an `Agent` around fakes.
+/// The profile's Signal account and message history, both opened with the key
+/// setup saved for it.
 async fn open_backend_and_store(
     config: &AgentConfig,
+    secrets: &dyn relay_secrets::SecretStore,
 ) -> anyhow::Result<(Arc<dyn SignalBackend>, Arc<dyn MessageStore>)> {
-    bail!(
-        "profile \"{}\": the presage backend and SQLCipher store are not wired into the agent yet",
-        config.profile
-    )
+    let profile = &config.profile;
+    let Some(key) = secrets
+        .get(profile)
+        .with_context(|| format!("unable to read profile \"{profile}\"'s database key"))?
+    else {
+        bail!("profile \"{profile}\" has no database key; run setup for it again");
+    };
+    let paths = &config.paths;
+    let signal = PresageSignal::open(&paths.signal_store, key.as_bytes())
+        .await
+        .with_context(|| format!("unable to open profile \"{profile}\"'s Signal account"))?;
+    let store = SqlCipherStore::open(&paths.message_store, &key)
+        .await
+        .with_context(|| format!("unable to open profile \"{profile}\"'s messages"))?;
+    Ok((Arc::new(signal), Arc::new(store)))
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use relay_secrets::SecretStore;
     use relay_signal::{Account, FakeSignal, Incoming};
     use relay_store::{JobId, MemoryStore, SearchQuery};
     use rmcp::model::CallToolRequestParams;
@@ -286,6 +299,117 @@ pub(crate) mod tests {
         fn advance(&self, ms: u64) {
             self.0.fetch_add(ms, std::sync::atomic::Ordering::SeqCst);
         }
+    }
+
+    fn profile_paths(dir: &std::path::Path) -> AgentConfig {
+        let profile = ProfileName::new("personal").expect("valid profile");
+        AgentConfig {
+            paths: ProfilePaths::under(dir.to_owned(), &profile),
+            profile,
+            access: AccessMode::ReadOnly,
+        }
+    }
+
+    /// An agent started for a profile whose key is gone must say which profile
+    /// and stop, never create stores it could not open again.
+    #[tokio::test]
+    async fn a_profile_missing_its_key_fails_naming_it_and_creates_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = profile_paths(tmp.path());
+        std::fs::create_dir_all(&config.paths.root).expect("profile dir");
+        let secrets = relay_secrets::MemorySecretStore::default();
+        let Err(e) = open_backend_and_store(&config, &secrets).await else {
+            panic!("opened a profile that has no key");
+        };
+        let message = format!("{e:#}");
+        assert!(
+            message.contains("\"personal\"") && message.contains("key"),
+            "error doesn't name the profile and its key: {message}"
+        );
+        assert!(
+            !config.paths.signal_store.exists() && !config.paths.message_store.exists(),
+            "a store was created without a key"
+        );
+    }
+
+    fn assert_network_is_dead() {
+        for var in ["HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"] {
+            assert_eq!(
+                std::env::var(var).as_deref(),
+                Ok("http://127.0.0.1:9"),
+                "{var} must point at the dead proxy; run tests with \
+                 HTTPS_PROXY=HTTP_PROXY=ALL_PROXY=http://127.0.0.1:9"
+            );
+        }
+    }
+
+    /// Writes a linked account into a new presage store at `path`, encrypted
+    /// with `key` the way setup encrypts it, without touching Signal.
+    // NOTE: presage only knows staging and production, so this account points
+    // at staging. Nothing here connects, and the dead proxy is the backstop.
+    async fn linked_signal_store(path: &std::path::Path, key: &relay_secrets::StoreKey) {
+        use presage::store::StateStore;
+        assert_network_is_dead();
+        let hex: String = key.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        let options = presage_store_sqlite::SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true)
+            .pragma("key", format!("\"x'{hex}'\""));
+        let mut store = presage_store_sqlite::SqliteStore::open_with_options(
+            options,
+            presage_store_sqlite::OnNewIdentity::Trust,
+        )
+        .await
+        .expect("presage store");
+        let phone_number: presage::libsignal_service::prelude::phonenumber::PhoneNumber =
+            "+15550000001".parse().expect("valid number");
+        // presage's profile key deserializer borrows, so this goes through text.
+        let json = serde_json::json!({
+            "signal_servers": "Staging",
+            "device_name": "Claude (test)",
+            "phone_number": phone_number,
+            "uuid": "00000000-0000-0000-0000-00000000003e",
+            "pni": "00000000-0000-0000-0000-0000000000ff",
+            "password": "password",
+            "device_id": 2,
+            "registration_id": 1,
+            "pni_registration_id": 1,
+            "profile_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        })
+        .to_string();
+        let data: presage::manager::RegistrationData =
+            serde_json::from_str(&json).expect("registration");
+        store.save_registration_data(&data).await.expect("saved");
+        store.close().await;
+    }
+
+    /// A profile setup linked, with its key saved, must start a real agent:
+    /// the account setup linked and a working message store, both under the
+    /// one key.
+    #[tokio::test]
+    async fn a_linked_profile_with_its_key_opens_its_account_and_message_store() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = profile_paths(tmp.path());
+        std::fs::create_dir_all(&config.paths.root).expect("profile dir");
+        let secrets = relay_secrets::MemorySecretStore::default();
+        let key = relay_secrets::StoreKey::generate().expect("key");
+        secrets.set(&config.profile, &key).expect("save key");
+        linked_signal_store(&config.paths.signal_store, &key).await;
+
+        let (signal, store) = open_backend_and_store(&config, &secrets)
+            .await
+            .expect("opens");
+        let account = signal.account().await.expect("account");
+        assert_eq!(
+            (account.kind, account.device_name.as_str()),
+            (ProfileKind::Linked, "Claude (test)")
+        );
+        store.stats().await.expect("message store answers");
+        store.close().await.expect("close");
+        drop(signal);
+        relay_store::SqlCipherStore::open(&config.paths.message_store, &key)
+            .await
+            .expect("the message store is encrypted with the profile's key");
     }
 
     /// An AI client that can crash or restart the agent must not get a fresh
