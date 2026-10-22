@@ -2,11 +2,15 @@
 //! Neither presage nor libsignal-service speaks these two calls yet
 //! (docs/link-and-sync.md), so this does, over its own HTTP client.
 
-use std::time::{Duration, Instant};
+use std::{
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, anyhow, bail};
 use reqwest::{StatusCode, header::RETRY_AFTER};
 use serde::Deserialize;
+use tokio::io::AsyncWriteExt;
 use url::Url;
 
 use crate::RateLimited;
@@ -91,6 +95,46 @@ impl ArchiveSource {
             #[cfg(test)]
             Hosts::Local(base) => Ok(base.join(path)?),
         }
+    }
+
+    fn cdn_url(&self, cdn: u32, key: &str) -> anyhow::Result<Url> {
+        let mut url = match &self.hosts {
+            #[cfg(test)]
+            Hosts::Local(base) => base.join(&format!("cdn{cdn}/attachments"))?,
+        };
+        url.path_segments_mut()
+            .map_err(|()| anyhow!("CDN {cdn} has no path for attachments"))?
+            .push(key);
+        Ok(url)
+    }
+
+    /// Downloads the archive the phone put on `cdn` under `key` to `to`.
+    async fn download(&self, cdn: u32, key: &str, to: &Path) -> anyhow::Result<()> {
+        let url = self.cdn_url(cdn, key)?;
+        let mut file = tokio::fs::File::create(to)
+            .await
+            .with_context(|| format!("unable to create \"{}\"", to.display()))?;
+        let mut response = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .context("unable to download the history archive")?;
+        if !response.status().is_success() {
+            return Err(refused(&response, "the history archive download"));
+        }
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .context("the history archive download broke off")?
+        {
+            file.write_all(&chunk)
+                .await
+                .with_context(|| format!("unable to write \"{}\"", to.display()))?;
+        }
+        file.flush()
+            .await
+            .with_context(|| format!("unable to write \"{}\"", to.display()))
     }
 
     /// Long-polls until the phone says where the archive is.
@@ -320,5 +364,41 @@ mod tests {
         assert_eq!(waited, Waited::TimedOut);
         let polls = server.requests().len();
         assert!((2..=3).contains(&polls), "polled {polls} times in 500ms");
+    }
+
+    fn bytes(status: &str, extra_headers: &str, body: &[u8], content_length: usize) -> Vec<u8> {
+        let mut response = format!(
+            "HTTP/1.1 {status}\r\n{extra_headers}content-length: {content_length}\r\nconnection: close\r\n\r\n"
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    /// The archive is an ordinary attachment on the CDN the phone named,
+    /// fetched under its URL-encoded key without the device's credentials.
+    #[tokio::test]
+    async fn the_archive_downloads_from_the_named_cdn_without_credentials() {
+        let archive = b"encrypted archive bytes".to_vec();
+        let server = FakeServer::start(vec![bytes("200 OK", "", &archive, archive.len())]).await;
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("archive");
+        source(&server)
+            .download(3, "a/b c", &path)
+            .await
+            .expect("downloaded");
+        assert_eq!(std::fs::read(&path).expect("file"), archive);
+        let requests = server.requests();
+        let [request] = requests.as_slice() else {
+            panic!("expected one request: {requests:?}");
+        };
+        assert!(
+            request.starts_with("GET /cdn3/attachments/a%2Fb%20c HTTP/1.1"),
+            "{request}"
+        );
+        assert!(
+            !request.to_lowercase().contains("authorization"),
+            "{request}"
+        );
     }
 }
