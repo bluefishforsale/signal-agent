@@ -9,8 +9,55 @@ use serde_json::{Value, json};
 use crate::{
     Tool, ToolContext, ToolError,
     directory::MAX_ATTACHMENT_BYTES,
-    input::{contact, contact_schema, parse, recipient, recipient_schema},
+    input::{contact, contact_schema, e164, e164_schema, parse, recipient, recipient_schema},
 };
+
+pub struct GetProfile;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GetProfileInput {
+    number: String,
+}
+
+#[async_trait]
+impl Tool for GetProfile {
+    fn name(&self) -> &'static str {
+        "get_profile"
+    }
+    fn description(&self) -> &'static str {
+        "Check one phone number against Signal's servers. number is E.164 and need not be a \
+         contact. Returns number, service_id (the Signal account's id, null when the number \
+         isn't registered or hides itself from discovery) and registered. The lookup carries \
+         no profile name; list_contacts has names for contacts and get_avatar their picture. \
+         Use get_user_status to check several numbers or usernames at once. Nothing is sent."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {"number": e164_schema("The number to look up")},
+            "required": ["number"],
+            "additionalProperties": false,
+        })
+    }
+    fn writes(&self) -> bool {
+        false
+    }
+    async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
+        let GetProfileInput { number } = parse(input)?;
+        let number = e164(number)?;
+        let found = ctx.signal.discover(std::slice::from_ref(&number)).await?;
+        let service_id = found
+            .into_iter()
+            .find_map(|(n, id)| (n == number).then_some(id))
+            .flatten();
+        Ok(json!({
+            "number": number,
+            "service_id": service_id.map(|id| id.to_string()),
+            "registered": service_id.is_some(),
+        }))
+    }
+}
 
 pub struct ListDevices;
 
@@ -372,6 +419,30 @@ mod tests {
             matches!(&result, Err(ToolError::InvalidInput(e)) if e.contains("5 MiB")),
             "got {:?}",
             result.map(|_| "an avatar over the cap")
+        );
+    }
+
+    /// The point of get_profile is a number nobody in the contacts has yet,
+    /// so it must ask Signal rather than refuse a stranger's number.
+    #[tokio::test]
+    async fn get_profile_looks_up_a_number_that_is_not_a_contact() {
+        let ctx = ctx_of(|s| s.with_registered("+15550000009", sid(9)));
+        let registry = Registry::standard();
+        let found = registry
+            .call(&ctx, "get_profile", json!({"number": "+15550000009"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            found,
+            json!({"number": "+15550000009", "service_id": sid(9).to_string(), "registered": true})
+        );
+        let missing = registry
+            .call(&ctx, "get_profile", json!({"number": "+15550000008"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            missing,
+            json!({"number": "+15550000008", "service_id": null, "registered": false})
         );
     }
 }

@@ -244,6 +244,24 @@ pub fn group(s: &str) -> Result<GroupId, ToolError> {
     GroupId::parse(s).map_err(|e| ToolError::InvalidInput(e.to_string()))
 }
 
+pub fn e164_schema(description: &str) -> Value {
+    json!({
+        "type": "string",
+        "format": "e164",
+        "description": format!("{description}: a phone number in E.164 form, e.g. +15551234567"),
+    })
+}
+
+/// A phone number in E.164 form, whether or not it belongs to a contact.
+pub fn e164(s: String) -> Result<String, ToolError> {
+    if !is_e164(&s) {
+        return Err(ToolError::InvalidInput(format!(
+            "\"{s}\" is not a phone number in E.164 form (+ then 8 to 15 digits)"
+        )));
+    }
+    Ok(s)
+}
+
 pub fn sticker_pack_schema() -> Value {
     json!({
         "type": "string",
