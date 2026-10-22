@@ -1,0 +1,37 @@
+//! Registering the agent's own number: catching the captcha token Signal's
+//! page hands back, so nobody copies a link by hand.
+
+/// The `signalcaptcha://` token in `url`, if `url` is the link Signal's
+/// captcha page navigates to when solved.
+pub fn captcha_token(url: &str) -> Option<String> {
+    let token = url.trim().strip_prefix("signalcaptcha://")?;
+    Some(token.trim_end_matches('/').to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HCAPTCHA: &str = "signal-hcaptcha.5fad97ac-7d06-4e44-b18a-b950b20148ff.registration.P1_eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJwZCI6MCwiZXhwIjoxNzYxMDAwMDAwfQ.k2Zq-Xw_3bXr9aQ";
+    const RECAPTCHA: &str = "signal-recaptcha-v2.6LfBXs0bAAAAAAjkDyyI1Lk5gBAUWfhI_bIyox5W.registration.03AFcWeA5ZqgXb1vKx-Ym_8Lr2Qp0";
+
+    /// The page's result link is `signalcaptcha://<token>`, and Signal wants
+    /// the token alone; a pasted or reported link may carry a trailing slash
+    /// or surrounding whitespace that must not end up in the token.
+    #[test]
+    fn a_solved_captcha_link_yields_its_token() {
+        for token in [HCAPTCHA, RECAPTCHA] {
+            for link in [
+                format!("signalcaptcha://{token}"),
+                format!("signalcaptcha://{token}/"),
+                format!("  signalcaptcha://{token}\n"),
+            ] {
+                assert_eq!(
+                    captcha_token(&link).as_deref(),
+                    Some(token),
+                    "link {link:?}"
+                );
+            }
+        }
+    }
+}
