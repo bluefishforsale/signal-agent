@@ -1,12 +1,15 @@
 //! MCP over Streamable HTTP, for clients on other machines. Off unless the
 //! user turns it on, and every request must carry a token the user made.
 
+mod proxy;
+mod server;
 mod tokens;
 
 use std::{fs, path::Path};
 
 use anyhow::Context;
 
+pub use server::{Listener, serve};
 pub use tokens::{Grant, Tokens};
 
 /// Writes `bytes` to `path` readable only by the current user.
