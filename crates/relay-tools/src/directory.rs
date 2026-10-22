@@ -5,7 +5,6 @@
 use anyhow::Context;
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD};
-use relay_core::prelude::*;
 use relay_signal::Contact;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -168,14 +167,10 @@ impl Tool for ListAttachments {
     }
     async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
         let ListAttachmentsInput { limit, offset } = parse(input)?;
-        let limit = limit.get() as usize;
-        let mut page: Vec<_> = stored_attachments(ctx)
-            .await?
-            .skip(offset.get() as usize)
-            .take(limit + 1)
-            .collect();
-        let has_more = page.len() > limit;
-        page.truncate(limit);
+        let limit = limit.get();
+        let mut page = ctx.store.attachments(limit + 1, offset.get()).await?;
+        let has_more = page.len() > limit as usize;
+        page.truncate(limit as usize);
         let attachments: Vec<_> = page
             .into_iter()
             .map(|s| {
@@ -197,7 +192,7 @@ pub struct GetAttachment;
 
 /// The largest file get_attachment returns: 5 MiB, the most an image block in
 /// the Claude API accepts, and already about 7 MB once base64'd.
-const MAX_ATTACHMENT_BYTES: u64 = 5 * 1024 * 1024;
+pub(crate) const MAX_ATTACHMENT_BYTES: u64 = 5 * 1024 * 1024;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -236,10 +231,11 @@ impl Tool for GetAttachment {
     async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
         let GetAttachmentInput { filename } = parse(input)?;
         let id = non_blank("filename", filename)?;
-        let attachment = stored_attachments(ctx)
+        let attachment = ctx
+            .store
+            .attachment(&id)
             .await?
             .map(|s| s.attachment)
-            .find(|a| a.id == id)
             .with_context(|| {
                 format!("no stored message has an attachment with id \"{id}\"; list_attachments shows them")
             })?;
@@ -263,32 +259,6 @@ fn too_big(id: &str, size: u64) -> Result<(), ToolError> {
     Err(ToolError::InvalidInput(format!(
         "attachment \"{id}\" is {size} bytes, over get_attachment's 5 MiB cap"
     )))
-}
-
-/// An attachment in stored history, with the message that carried it.
-struct Stored {
-    attachment: AttachmentRef,
-    message: MessageId,
-    conversation: Recipient,
-}
-
-/// Every attachment in stored history, newest message first, leaving out
-/// messages deleted for everyone.
-// NOTE: loads the whole store, since MessageStore has no attachment query.
-// Fine at personal-history sizes; issue #65 proposes the paged query to replace it.
-async fn stored_attachments(ctx: &ToolContext) -> anyhow::Result<impl Iterator<Item = Stored>> {
-    let messages = ctx.store.export(None, None).await?;
-    Ok(messages
-        .into_iter()
-        .rev()
-        .filter(|m| !m.deleted)
-        .flat_map(|m| {
-            m.attachments.into_iter().map(move |attachment| Stored {
-                attachment,
-                message: m.id,
-                conversation: m.conversation,
-            })
-        }))
 }
 
 #[cfg(test)]

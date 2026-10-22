@@ -38,13 +38,6 @@ impl Stores {
         [("memory", &self.memory), ("sqlcipher", &self.sqlcipher)]
     }
 
-    /// The implementations that have contract round 2's methods so far.
-    // NOTE: lane L2b replaces every call to this with each() once the
-    // SQLCipher store implements them; until then it bails "not implemented".
-    fn round_two(&self) -> [(&'static str, &dyn MessageStore); 1] {
-        [("memory", &self.memory)]
-    }
-
     async fn close(self) {
         for (name, store) in self.each() {
             store
@@ -504,7 +497,7 @@ async fn deleting_a_conversation_leaves_the_others_untouched() {
     let alice = Recipient::Contact(sid(1));
     let bob = Recipient::Contact(sid(2));
     let stores = Stores::open().await;
-    for (name, store) in stores.round_two() {
+    for (name, store) in stores.each() {
         for t in [1, 2] {
             store.insert(&msg(1, t, alice, "a")).await.expect("insert");
         }
@@ -543,7 +536,7 @@ async fn admin_deletes_stay_inside_the_named_group_and_leave_the_author_check_al
     let in_group = msg(1, 1, Recipient::Group(group), "member's message");
     let elsewhere = msg(1, 2, Recipient::Group(other), "other group");
     let stores = Stores::open().await;
-    for (name, store) in stores.round_two() {
+    for (name, store) in stores.each() {
         store.insert(&in_group).await.expect("insert");
         store.insert(&elsewhere).await.expect("insert");
         let wrong_group = store.mark_admin_deleted(group, elsewhere.id).await;
@@ -581,7 +574,7 @@ async fn stored_attachments_page_newest_first_without_deleted_messages() {
         m
     };
     let stores = Stores::open().await;
-    for (name, store) in stores.round_two() {
+    for (name, store) in stores.each() {
         store.insert(&with(1, &["old"])).await.expect("insert");
         store
             .insert(&with(2, &["mid-a", "mid-b"]))
@@ -613,7 +606,7 @@ async fn poll_vote_counts_rise_per_poll() {
     let poll = msg(1, 1, Recipient::Contact(sid(1)), "").id;
     let other = msg(1, 2, Recipient::Contact(sid(1)), "").id;
     let stores = Stores::open().await;
-    for (name, store) in stores.round_two() {
+    for (name, store) in stores.each() {
         let counts = [
             store.next_poll_vote(poll).await.expect("vote"),
             store.next_poll_vote(poll).await.expect("vote"),
@@ -637,7 +630,7 @@ fn later(recipient: u128, send_at_ms: u64) -> ScheduledSend {
 #[tokio::test]
 async fn a_due_job_is_claimed_exactly_once() {
     let stores = Stores::open().await;
-    for (name, store) in stores.round_two() {
+    for (name, store) in stores.each() {
         let late = store.schedule(&later(1, 200)).await.expect("schedule");
         let soon = store.schedule(&later(2, 100)).await.expect("schedule");
         let listed: Vec<_> = store
@@ -666,7 +659,7 @@ async fn a_due_job_is_claimed_exactly_once() {
 #[tokio::test]
 async fn failed_and_interrupted_jobs_are_never_sent_again() {
     let stores = Stores::open().await;
-    for (name, store) in stores.round_two() {
+    for (name, store) in stores.each() {
         let ok = store.schedule(&later(1, 1)).await.expect("schedule");
         let failed = store.schedule(&later(2, 1)).await.expect("schedule");
         let crashed = store.schedule(&later(3, 1)).await.expect("schedule");
@@ -705,12 +698,75 @@ async fn failed_and_interrupted_jobs_are_never_sent_again() {
 #[tokio::test]
 async fn cancelling_a_job_removes_it_once() {
     let stores = Stores::open().await;
-    for (name, store) in stores.round_two() {
+    for (name, store) in stores.each() {
         let id = store.schedule(&later(1, 1)).await.expect("schedule");
         assert!(store.cancel_scheduled(id).await.expect("cancel"), "{name}");
         assert!(!store.cancel_scheduled(id).await.expect("cancel"), "{name}");
         assert!(!store.cancel_scheduled(JobId(999)).await.expect("cancel"));
         assert!(store.take_due(u64::MAX).await.expect("tick").is_empty());
+    }
+    stores.close().await;
+}
+
+/// Claims must hold under real concurrency, not just back to back: the tick
+/// and run_scheduled_messages can race while new jobs are being scheduled,
+/// and any job handed to two callers is a message sent twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parallel_claimers_never_share_a_job() {
+    const JOBS: u64 = 60;
+    let stores = Stores::open().await;
+    for (name, store) in stores.each() {
+        let claimer = || async {
+            let mut claimed = vec![];
+            for _ in 0..JOBS {
+                let due = store.take_due(u64::MAX).await.expect("tick");
+                claimed.extend(due.into_iter().map(|j| j.id));
+                tokio::task::yield_now().await;
+            }
+            claimed
+        };
+        let scheduler = async {
+            for t in 0..JOBS {
+                store.schedule(&later(1, t)).await.expect("schedule");
+                tokio::task::yield_now().await;
+            }
+        };
+        let (a, b, c, d, ()) = tokio::join!(claimer(), claimer(), claimer(), claimer(), scheduler);
+        let leftover = store.take_due(u64::MAX).await.expect("tick");
+        let mut all: Vec<_> = [a, b, c, d].concat();
+        all.extend(leftover.into_iter().map(|j| j.id));
+        let claims = all.len();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), claims, "{name}: a job was claimed twice");
+        assert_eq!(all.len() as u64, JOBS, "{name}: a job was never claimed");
+    }
+    stores.close().await;
+}
+
+/// A pruned message's attachments must leave the attachment listing with it,
+/// or get_attachment would point at a message that no longer exists.
+#[tokio::test]
+async fn pruned_messages_take_their_attachments_with_them() {
+    let alice = Recipient::Contact(sid(1));
+    let mut old = msg(1, 1, alice, "");
+    old.attachments = vec![AttachmentRef {
+        id: "old".into(),
+        content_type: "image/png".into(),
+        file_name: None,
+        size: 1,
+    }];
+    let stores = Stores::open().await;
+    for (name, store) in stores.each() {
+        store.insert(&old).await.expect("insert");
+        store.prune(2).await.expect("prune");
+        let page = store.attachments(10, 0).await.expect("page");
+        assert!(
+            page.is_empty(),
+            "{name}: pruned attachment listed: {page:?}"
+        );
+        let found = store.attachment("old").await.expect("lookup");
+        assert_eq!(found, None, "{name}: pruned attachment found");
     }
     stores.close().await;
 }

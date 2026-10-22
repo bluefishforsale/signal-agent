@@ -186,6 +186,61 @@ impl Tool for ClearLocalStore {
     }
 }
 
+pub struct DeleteLocalMessages;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeleteLocalMessagesInput {
+    recipient: String,
+    confirm: bool,
+}
+
+#[async_trait]
+impl Tool for DeleteLocalMessages {
+    fn name(&self) -> &'static str {
+        "delete_local_messages"
+    }
+    fn description(&self) -> &'static str {
+        "Delete one conversation's messages from the local store, with its read state and \
+         title. recipient is the conversation (as list_conversations names it, group ids \
+         included); confirm must be exactly true, otherwise nothing is deleted and an error is \
+         returned. Local only: nothing is deleted from Signal, your phone or other devices. \
+         Irreversible. Returns {deleted, status}. Use clear_local_store to delete everything."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "recipient": recipient_schema(),
+                "confirm": {
+                    "type": "boolean",
+                    "description": "Must be true to proceed; guards against accidental deletion",
+                },
+            },
+            "required": ["recipient", "confirm"],
+            "additionalProperties": false,
+        })
+    }
+    // NOTE: true for the same reason as clear_local_store: it destroys history
+    // a read-only profile must not be able to.
+    fn writes(&self) -> bool {
+        true
+    }
+    async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
+        let input: DeleteLocalMessagesInput = parse(input)?;
+        if !input.confirm {
+            return Err(ToolError::InvalidInput(
+                "delete_local_messages deletes the conversation's stored messages; pass \
+                 confirm: true to proceed"
+                    .into(),
+            ));
+        }
+        let conversation = recipient(ctx, &input.recipient).await?;
+        let deleted = ctx.store.delete_conversation(conversation).await?;
+        Ok(json!({ "deleted": deleted, "status": "deleted" }))
+    }
+}
+
 pub struct PruneStore;
 
 #[derive(Deserialize)]
@@ -551,5 +606,43 @@ mod tests {
                 "{body} not neutralized as {cell:?}: {data:?}"
             );
         }
+    }
+
+    /// Deleting one conversation must leave every other one alone, and only
+    /// with confirm: true, or a slip wipes history the account can't get back.
+    #[tokio::test]
+    async fn delete_local_messages_removes_one_conversation_only_when_confirmed() {
+        let (ctx, signal) = ctx(AccessMode::Full, ProfileKind::Primary);
+        for (sender, at) in [(2, 1), (2, 2), (3, 3)] {
+            ctx.store.insert(&incoming(sender, at, "hi")).await.unwrap();
+        }
+        let registry = Registry::standard();
+        let unconfirmed = registry
+            .call(
+                &ctx,
+                "delete_local_messages",
+                json!({"recipient": sid(2).to_string(), "confirm": false}),
+            )
+            .await;
+        assert!(
+            matches!(unconfirmed, Err(ToolError::InvalidInput(_))),
+            "unconfirmed delete gave {unconfirmed:?}"
+        );
+        assert_eq!(ctx.store.stats().await.unwrap().messages, 3);
+        let out = registry
+            .call(
+                &ctx,
+                "delete_local_messages",
+                json!({"recipient": sid(2).to_string(), "confirm": true}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["deleted"], json!(2), "{out}");
+        let left = ctx.store.export(None, None).await.unwrap();
+        assert!(
+            left.len() == 1 && left[0].conversation == Recipient::Contact(sid(3)),
+            "{left:?}"
+        );
+        assert!(signal.sent().is_empty(), "a local delete reached Signal");
     }
 }

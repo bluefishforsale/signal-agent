@@ -2,13 +2,19 @@
 //! and run. Access rules live in the registry, not in each tool, so a new tool
 //! can't forget them.
 
+mod admin;
 mod directory;
 mod input;
 mod limits;
 mod local;
+mod lookup;
+mod media;
 mod mutate;
+mod pins;
+mod polls;
 mod read;
 mod registry;
+mod schedule;
 mod send;
 mod settings;
 #[cfg(test)]
@@ -16,8 +22,11 @@ mod testing;
 mod tool;
 mod webhook;
 
-pub use limits::{Clock, LimitExceeded, Limiter, Limits, SystemClock, begin_provisioning};
+pub use limits::{
+    Clock, LimitExceeded, Limiter, Limits, SystemClock, begin_provisioning, defer_provisioning,
+};
 pub use registry::Registry;
+pub use schedule::run_due;
 pub use settings::Settings;
 pub use tool::{Tool, ToolContext, ToolError};
 pub use webhook::WebhookUrl;
