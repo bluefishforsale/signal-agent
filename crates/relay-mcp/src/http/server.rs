@@ -272,4 +272,48 @@ mod tests {
             .expect("request");
         assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
     }
+
+    /// PRD acceptance 10, swept over every shipped tool: a read-only token
+    /// must not see or run any write tool, even though the agent behind it
+    /// has full access. New tools are covered by being registered.
+    #[tokio::test]
+    async fn a_read_only_token_can_neither_see_nor_call_any_write_tool() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (agent, signal) = agent(dir.path(), Registry::standard()).await;
+        let tokens = Tokens::at(&dir.path().join("http_tokens.json"));
+        let token = tokens
+            .create("phone", AccessMode::ReadOnly)
+            .expect("create");
+        let addr = start(tokens, agent).await;
+        let client = remote(addr, &token).await;
+        let registry = Registry::standard();
+        let writes: Vec<_> = registry
+            .all()
+            .filter(|t| t.writes())
+            .map(|t| t.name())
+            .collect();
+        assert!(!writes.is_empty(), "no write tools to sweep");
+        let listed = client.peer().list_tools(None).await.expect("tools/list");
+        let leaked: Vec<_> = listed
+            .tools
+            .iter()
+            .filter(|t| writes.contains(&t.name.as_ref()))
+            .map(|t| t.name.to_string())
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "write tools listed read-only: {leaked:?}"
+        );
+        for name in writes {
+            let result = client
+                .peer()
+                .call_tool(CallToolRequestParams::new(name))
+                .await;
+            let refused = result
+                .as_ref()
+                .is_ok_and(|r| r.is_error == Some(true) && format!("{r:?}").contains("read-only"));
+            assert!(refused, "{name} over a read-only token: {result:?}");
+        }
+        assert!(signal.sent().is_empty(), "a read-only token reached Signal");
+    }
 }
