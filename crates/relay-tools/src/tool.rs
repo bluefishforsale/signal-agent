@@ -4,8 +4,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use relay_core::prelude::*;
-use relay_signal::SignalBackend;
+use relay_signal::{SendRoots, SignalBackend};
 use relay_store::MessageStore;
+
+use crate::WebhookUrl;
 use serde_json::Value;
 
 /// Everything a tool call can touch.
@@ -15,6 +17,11 @@ pub struct ToolContext {
     pub signal: Arc<dyn SignalBackend>,
     pub access: AccessMode,
     pub kind: ProfileKind,
+    /// The folders a tool may send files from.
+    pub send_roots: Arc<SendRoots>,
+    /// The webhook from Settings, a copy: nothing a tool does to it reaches
+    /// the agent's capture loop.
+    pub webhook: Option<WebhookUrl>,
 }
 
 /// Why a tool call failed, in the categories an MCP client needs to tell apart.

@@ -114,6 +114,7 @@ pub(crate) mod tests {
                     Outgoing::Text {
                         body: body.to_owned(),
                         quote: None,
+                        attachments: vec![],
                     },
                 )
                 .await?;
@@ -133,6 +134,8 @@ pub(crate) mod tests {
             signal: signal.clone(),
             access,
             kind: ProfileKind::Linked,
+            send_roots: Arc::default(),
+            webhook: None,
         };
         let registry = Arc::new(Registry::default().with(ProbeSend));
         (Handler { ctx, registry }, signal)

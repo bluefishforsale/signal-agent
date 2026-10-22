@@ -7,7 +7,9 @@ use relay_secrets::StoreKey;
 use tempfile::TempDir;
 use uuid::Uuid;
 
-use crate::{MemoryStore, MessageStore, SearchQuery, SqlCipherStore};
+use crate::{
+    JobId, JobState, MemoryStore, MessageStore, ScheduledSend, SearchQuery, SqlCipherStore,
+};
 
 /// One fresh instance of every implementation.
 struct Stores {
@@ -34,6 +36,13 @@ impl Stores {
 
     fn each(&self) -> [(&'static str, &dyn MessageStore); 2] {
         [("memory", &self.memory), ("sqlcipher", &self.sqlcipher)]
+    }
+
+    /// The implementations that have contract round 2's methods so far.
+    // NOTE: lane L2b replaces every call to this with each() once the
+    // SQLCipher store implements them; until then it bails "not implemented".
+    fn round_two(&self) -> [(&'static str, &dyn MessageStore); 1] {
+        [("memory", &self.memory)]
     }
 
     async fn close(self) {
@@ -484,6 +493,224 @@ async fn get_returns_the_stored_message_or_none() {
         assert_eq!(got, Some(m.clone()), "{name}");
         let none = store.get(missing).await.expect("get");
         assert_eq!(none, None, "{name}: found a message never stored");
+    }
+    stores.close().await;
+}
+
+/// Deleting one conversation must take its messages, read state and title,
+/// and leave every other conversation exactly as it was.
+#[tokio::test]
+async fn deleting_a_conversation_leaves_the_others_untouched() {
+    let alice = Recipient::Contact(sid(1));
+    let bob = Recipient::Contact(sid(2));
+    let stores = Stores::open().await;
+    for (name, store) in stores.round_two() {
+        for t in [1, 2] {
+            store.insert(&msg(1, t, alice, "a")).await.expect("insert");
+        }
+        store.insert(&msg(2, 3, bob, "b")).await.expect("insert");
+        store.set_title(alice, "Alice").await.expect("title");
+        store.set_title(bob, "Bob").await.expect("title");
+        let gone = store.delete_conversation(alice).await.expect("delete");
+        assert_eq!(gone, 2, "{name}");
+        let left = store.conversations().await.expect("conversations");
+        assert_eq!(left.len(), 1, "{name}: {left:?}");
+        assert_eq!(left[0].title, "Bob", "{name}");
+        assert_eq!(left[0].unread, 1, "{name}");
+        store
+            .insert(&msg(1, 9, alice, "again"))
+            .await
+            .expect("insert");
+        let back = store.conversations().await.expect("conversations");
+        let alice_row = back
+            .iter()
+            .find(|c| c.recipient == alice)
+            .expect("alice back");
+        assert_eq!(
+            alice_row.title, "",
+            "{name}: title outlived its conversation"
+        );
+    }
+    stores.close().await;
+}
+
+/// An admin delete may erase someone else's message, but only inside the
+/// group it names, and it must not loosen mark_deleted's author check.
+#[tokio::test]
+async fn admin_deletes_stay_inside_the_named_group_and_leave_the_author_check_alone() {
+    let group = GroupId::new([5; 32]);
+    let other = GroupId::new([6; 32]);
+    let in_group = msg(1, 1, Recipient::Group(group), "member's message");
+    let elsewhere = msg(1, 2, Recipient::Group(other), "other group");
+    let stores = Stores::open().await;
+    for (name, store) in stores.round_two() {
+        store.insert(&in_group).await.expect("insert");
+        store.insert(&elsewhere).await.expect("insert");
+        let wrong_group = store.mark_admin_deleted(group, elsewhere.id).await;
+        assert!(wrong_group.is_err(), "{name}: deleted across groups");
+        let stranger = store.mark_deleted(in_group.id, sid(666)).await;
+        assert!(stranger.is_err(), "{name}: author check loosened");
+        store
+            .mark_admin_deleted(group, in_group.id)
+            .await
+            .expect("admin delete");
+        let got = store.get(in_group.id).await.expect("get").expect("kept");
+        assert!(got.deleted, "{name}: not flagged deleted");
+        let untouched = store.get(elsewhere.id).await.expect("get").expect("kept");
+        assert!(!untouched.deleted, "{name}: wrong message flagged");
+    }
+    stores.close().await;
+}
+
+/// The attachment index pages newest message first and hides attachments
+/// on messages deleted for everyone, by page and by id alike.
+#[tokio::test]
+async fn stored_attachments_page_newest_first_without_deleted_messages() {
+    let alice = Recipient::Contact(sid(1));
+    let with = |t: u64, ids: &[&str]| {
+        let mut m = msg(1, t, alice, "");
+        m.attachments = ids
+            .iter()
+            .map(|id| AttachmentRef {
+                id: (*id).into(),
+                content_type: "image/png".into(),
+                file_name: None,
+                size: 1,
+            })
+            .collect();
+        m
+    };
+    let stores = Stores::open().await;
+    for (name, store) in stores.round_two() {
+        store.insert(&with(1, &["old"])).await.expect("insert");
+        store
+            .insert(&with(2, &["mid-a", "mid-b"]))
+            .await
+            .expect("insert");
+        let deleted = with(3, &["gone"]);
+        store.insert(&deleted).await.expect("insert");
+        store
+            .mark_deleted(deleted.id, deleted.id.author)
+            .await
+            .expect("delete");
+        let page = store.attachments(2, 1).await.expect("page");
+        let ids: Vec<_> = page.iter().map(|a| a.attachment.id.as_str()).collect();
+        assert_eq!(ids, vec!["mid-b", "old"], "{name}");
+        assert_eq!(page[1].message, with(1, &[]).id, "{name}");
+        assert_eq!(page[1].conversation, alice, "{name}");
+        let hidden = store.attachment("gone").await.expect("lookup");
+        assert_eq!(hidden, None, "{name}: deleted message's attachment found");
+        let found = store.attachment("old").await.expect("lookup");
+        assert!(found.is_some(), "{name}: stored attachment not found");
+    }
+    stores.close().await;
+}
+
+/// Signal's apps keep only a poll's highest vote count, so each vote this
+/// account casts must count higher than its last, per poll.
+#[tokio::test]
+async fn poll_vote_counts_rise_per_poll() {
+    let poll = msg(1, 1, Recipient::Contact(sid(1)), "").id;
+    let other = msg(1, 2, Recipient::Contact(sid(1)), "").id;
+    let stores = Stores::open().await;
+    for (name, store) in stores.round_two() {
+        let counts = [
+            store.next_poll_vote(poll).await.expect("vote"),
+            store.next_poll_vote(poll).await.expect("vote"),
+            store.next_poll_vote(other).await.expect("vote"),
+        ];
+        assert_eq!(counts, [1, 2, 1], "{name}");
+    }
+    stores.close().await;
+}
+
+fn later(recipient: u128, send_at_ms: u64) -> ScheduledSend {
+    ScheduledSend {
+        recipient: Recipient::Contact(sid(recipient)),
+        body: "later".into(),
+        send_at_ms,
+    }
+}
+
+/// A due job must be handed out once, ever: two ticks, or a tick racing
+/// run_scheduled_messages, would otherwise send it twice.
+#[tokio::test]
+async fn a_due_job_is_claimed_exactly_once() {
+    let stores = Stores::open().await;
+    for (name, store) in stores.round_two() {
+        let late = store.schedule(&later(1, 200)).await.expect("schedule");
+        let soon = store.schedule(&later(2, 100)).await.expect("schedule");
+        let listed: Vec<_> = store
+            .scheduled()
+            .await
+            .expect("list")
+            .iter()
+            .map(|j| j.id)
+            .collect();
+        assert_eq!(listed, vec![soon, late], "{name}: not soonest first");
+        assert!(store.take_due(99).await.expect("tick").is_empty(), "{name}");
+        let due = store.take_due(150).await.expect("tick");
+        assert_eq!(due.iter().map(|j| j.id).collect::<Vec<_>>(), vec![soon]);
+        assert!(
+            store.take_due(150).await.expect("tick").is_empty(),
+            "{name}: claimed twice"
+        );
+        let all = store.take_due(1_000).await.expect("tick");
+        assert_eq!(all.iter().map(|j| j.id).collect::<Vec<_>>(), vec![late]);
+    }
+    stores.close().await;
+}
+
+/// A failed or interrupted job may already have reached Signal, so it stays
+/// visible and is never claimed again; a successful one leaves the list.
+#[tokio::test]
+async fn failed_and_interrupted_jobs_are_never_sent_again() {
+    let stores = Stores::open().await;
+    for (name, store) in stores.round_two() {
+        let ok = store.schedule(&later(1, 1)).await.expect("schedule");
+        let failed = store.schedule(&later(2, 1)).await.expect("schedule");
+        let crashed = store.schedule(&later(3, 1)).await.expect("schedule");
+        assert_eq!(store.take_due(1).await.expect("tick").len(), 3, "{name}");
+        store.finish_scheduled(ok, Ok(())).await.expect("finish");
+        store
+            .finish_scheduled(failed, Err("limit reached".into()))
+            .await
+            .expect("finish");
+        assert!(store.take_due(u64::MAX).await.expect("tick").is_empty());
+        let states: Vec<_> = store
+            .scheduled()
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|j| (j.id, j.state))
+            .collect();
+        assert_eq!(
+            states,
+            vec![
+                (
+                    failed,
+                    JobState::Failed {
+                        error: "limit reached".into()
+                    }
+                ),
+                (crashed, JobState::Sending),
+            ],
+            "{name}"
+        );
+    }
+    stores.close().await;
+}
+
+/// Cancel removes a job once and reports whether there was one to remove.
+#[tokio::test]
+async fn cancelling_a_job_removes_it_once() {
+    let stores = Stores::open().await;
+    for (name, store) in stores.round_two() {
+        let id = store.schedule(&later(1, 1)).await.expect("schedule");
+        assert!(store.cancel_scheduled(id).await.expect("cancel"), "{name}");
+        assert!(!store.cancel_scheduled(id).await.expect("cancel"), "{name}");
+        assert!(!store.cancel_scheduled(JobId(999)).await.expect("cancel"));
+        assert!(store.take_due(u64::MAX).await.expect("tick").is_empty());
     }
     stores.close().await;
 }

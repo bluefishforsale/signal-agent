@@ -1,7 +1,7 @@
 //! The only place presage and libsignal types meet relay-core types, so the
 //! protocol's shape changes in one file when presage moves.
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use presage::libsignal_service::prelude::{
     ProtobufMessage,
@@ -10,6 +10,7 @@ use presage::libsignal_service::prelude::{
 use presage::{
     libsignal_service::{
         content::{Content, ContentBody},
+        groups_v2::Role,
         protocol,
         zkgroup::groups::{GroupMasterKey, GroupSecretParams},
     },
@@ -176,14 +177,17 @@ pub(crate) fn content_body(
     message: &Outgoing,
     sent_at_ms: u64,
     group: Option<&GroupContextV2>,
-) -> ContentBody {
+) -> anyhow::Result<ContentBody> {
     let data = |message: DataMessage| DataMessage {
         timestamp: Some(sent_at_ms),
         group_v2: group.cloned(),
         ..message
     };
-    match message {
-        Outgoing::Text { body, quote } => ContentBody::DataMessage(data(DataMessage {
+    Ok(match message {
+        Outgoing::Text { attachments, .. } if !attachments.is_empty() => {
+            bail!("sending attachments is not implemented yet (lane L1b)")
+        }
+        Outgoing::Text { body, quote, .. } => ContentBody::DataMessage(data(DataMessage {
             body: Some(body.clone()),
             quote: quote.map(|quote| data_message::Quote {
                 id: Some(quote.sent_at_ms),
@@ -239,7 +243,16 @@ pub(crate) fn content_body(
             r#type: Some(receipt_message::Type::Read.into()),
             timestamp: targets.iter().map(|t| t.sent_at_ms).collect(),
         }),
-    }
+        Outgoing::Sticker { .. }
+        | Outgoing::Pin { .. }
+        | Outgoing::Unpin { .. }
+        | Outgoing::PollCreate { .. }
+        | Outgoing::PollVote { .. }
+        | Outgoing::PollTerminate { .. }
+        | Outgoing::AdminDelete { .. } => {
+            bail!("sending {message:?} is not implemented yet (lane L1b)")
+        }
+    })
 }
 
 pub(crate) fn contact_from(contact: &presage::model::contacts::Contact) -> crate::Contact {
@@ -260,6 +273,12 @@ pub(crate) fn group_from(
         members: group
             .members
             .iter()
+            .map(|member| ServiceId::new(member.aci.into()))
+            .collect(),
+        admins: group
+            .members
+            .iter()
+            .filter(|member| member.role == Role::Administrator)
             .map(|member| ServiceId::new(member.aci.into()))
             .collect(),
     }
@@ -750,8 +769,13 @@ mod tests {
 
     fn sendable() -> impl Strategy<Value = Outgoing> {
         prop_oneof![
-            (".{0,40}", proptest::option::of(message_id_by(ME)))
-                .prop_map(|(body, quote)| Outgoing::Text { body, quote }),
+            (".{0,40}", proptest::option::of(message_id_by(ME))).prop_map(|(body, quote)| {
+                Outgoing::Text {
+                    body,
+                    quote,
+                    attachments: vec![],
+                }
+            }),
             (message_id_by(ME), ".{1,4}", any::<bool>()).prop_map(|(target, emoji, remove)| {
                 Outgoing::Reaction {
                     target,
@@ -781,7 +805,7 @@ mod tests {
                 revision: Some(4),
                 group_change: None,
             });
-            let body = content_body(&message, sent_at_ms, group.as_ref());
+            let body = content_body(&message, sent_at_ms, group.as_ref()).expect("generated variants convert");
             let alice = ServiceId::new(ALICE);
             let conversation = if in_group {
                 Recipient::Group(group_id(master_key))
@@ -790,7 +814,7 @@ mod tests {
             };
             let got = incoming(&content_from(ALICE, body), ServiceId::new(ME));
             let expected = match message {
-                Outgoing::Text { body, quote } => {
+                Outgoing::Text { body, quote, .. } => {
                     let Some(Incoming::Message(got)) = got else {
                         return Err(TestCaseError::fail(format!("text read back as {got:?}")));
                     };
@@ -803,7 +827,7 @@ mod tests {
                 Outgoing::Reaction { target, emoji, remove } => Incoming::Reaction { conversation, target, from: alice, emoji, remove },
                 Outgoing::Edit { target, body } => Incoming::Edit { conversation, target, from: alice, body },
                 Outgoing::Delete { target } => Incoming::Delete { conversation, target, from: alice },
-                Outgoing::Typing { .. } | Outgoing::ReadReceipt { .. } => unreachable!("not generated"),
+                other => unreachable!("not generated: {other:?}"),
             };
             prop_assert_eq!(got, Some(expected));
         }
@@ -820,7 +844,7 @@ mod tests {
             group_change: None,
         };
         let ContentBody::TypingMessage(typing) =
-            content_body(&Outgoing::Typing { started: true }, 9, Some(&group))
+            content_body(&Outgoing::Typing { started: true }, 9, Some(&group)).expect("converts")
         else {
             panic!("typing is not a typing message");
         };
@@ -860,9 +884,9 @@ mod tests {
     #[test]
     fn group_lists_members_under_its_public_id() {
         let master_key = [8u8; 32];
-        let member = |uuid: Uuid| presage::model::groups::Member {
+        let member = |uuid: Uuid, role| presage::model::groups::Member {
             aci: aci(uuid),
-            role: presage::libsignal_service::groups_v2::Role::Default,
+            role,
             profile_key: presage::libsignal_service::prelude::ProfileKey::create([0; 32]),
             joined_at_revision: 0,
             label: None,
@@ -874,7 +898,10 @@ mod tests {
             disappearing_messages_timer: None,
             access_control: None,
             revision: 3,
-            members: vec![member(ALICE), member(ME)],
+            members: vec![
+                member(ALICE, Role::Administrator),
+                member(ME, Role::Default),
+            ],
             pending_members: Vec::new(),
             requesting_members: Vec::new(),
             invite_link_password: Vec::new(),
@@ -886,6 +913,7 @@ mod tests {
                 id: group_id(master_key),
                 title: "cats".into(),
                 members: vec![ServiceId::new(ALICE), ServiceId::new(ME)],
+                admins: vec![ServiceId::new(ALICE)],
             }
         );
     }

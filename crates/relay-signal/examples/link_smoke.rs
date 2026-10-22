@@ -68,6 +68,7 @@ async fn main() -> anyhow::Result<()> {
             Outgoing::Text {
                 body: "signal-agent smoke test: note to self".into(),
                 quote: None,
+                attachments: vec![],
             },
         )
         .await?;

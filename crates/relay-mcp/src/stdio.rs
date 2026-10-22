@@ -182,7 +182,14 @@ mod tests {
             let to = Recipient::Contact(ServiceId::new(Uuid::from_u128(2)));
             let body = body.to_owned();
             ctx.signal
-                .send(to, Outgoing::Text { body, quote: None })
+                .send(
+                    to,
+                    Outgoing::Text {
+                        body,
+                        quote: None,
+                        attachments: vec![],
+                    },
+                )
                 .await?;
             Ok(json!({}))
         }

@@ -511,6 +511,7 @@ mod tests {
                 id: group,
                 title: "band".into(),
                 members: vec![sid(ME), sid(2)],
+                admins: vec![sid(ME)],
             }]),
         );
         let ctx = ToolContext {
@@ -518,6 +519,8 @@ mod tests {
             signal: signal.clone(),
             access: AccessMode::Full,
             kind: ProfileKind::Linked,
+            send_roots: Arc::default(),
+            webhook: None,
         };
         (ctx, signal)
     }

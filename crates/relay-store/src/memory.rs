@@ -4,11 +4,14 @@
 
 use std::{collections::HashMap, sync::Mutex};
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use async_trait::async_trait;
 use relay_core::prelude::*;
 
-use crate::{MessageStore, SearchQuery, StoreStats, ensure_author};
+use crate::{
+    JobId, JobState, MessageStore, ScheduledJob, ScheduledSend, SearchQuery, StoreStats,
+    StoredAttachment, ensure_author,
+};
 
 #[derive(Default)]
 pub struct MemoryStore {
@@ -20,6 +23,9 @@ struct Inner {
     messages: Vec<Message>,
     read: Vec<MessageId>,
     titles: HashMap<Recipient, String>,
+    poll_votes: HashMap<MessageId, u32>,
+    jobs: Vec<ScheduledJob>,
+    last_job: u64,
 }
 
 impl MemoryStore {
@@ -189,6 +195,123 @@ impl MessageStore for MemoryStore {
             .collect();
         out.sort_by_key(|m| m.id.sent_at_ms);
         Ok(out)
+    }
+
+    async fn delete_conversation(&self, conversation: Recipient) -> anyhow::Result<u64> {
+        let mut inner = self.inner();
+        let Inner {
+            messages,
+            read,
+            titles,
+            ..
+        } = &mut *inner;
+        let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(messages)
+            .into_iter()
+            .partition(|m| m.conversation == conversation);
+        *messages = kept;
+        read.retain(|id| !gone.iter().any(|m| m.id == *id));
+        titles.remove(&conversation);
+        Ok(gone.len() as u64)
+    }
+
+    async fn mark_admin_deleted(&self, group: GroupId, target: MessageId) -> anyhow::Result<()> {
+        let mut inner = self.inner();
+        let message = find(&mut inner.messages, target)?;
+        if message.conversation != Recipient::Group(group) {
+            bail!("{target:?} is not a message in group {group}");
+        }
+        message.deleted = true;
+        Ok(())
+    }
+
+    async fn attachments(&self, limit: u32, offset: u32) -> anyhow::Result<Vec<StoredAttachment>> {
+        let inner = self.inner();
+        let mut messages: Vec<_> = inner.messages.iter().filter(|m| !m.deleted).collect();
+        messages.sort_by_key(|m| std::cmp::Reverse(m.id.sent_at_ms));
+        Ok(messages
+            .into_iter()
+            .flat_map(|m| {
+                m.attachments.iter().map(|a| StoredAttachment {
+                    attachment: a.clone(),
+                    message: m.id,
+                    conversation: m.conversation,
+                })
+            })
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect())
+    }
+
+    async fn attachment(&self, id: &str) -> anyhow::Result<Option<StoredAttachment>> {
+        let inner = self.inner();
+        Ok(inner.messages.iter().filter(|m| !m.deleted).find_map(|m| {
+            let a = m.attachments.iter().find(|a| a.id == id)?;
+            Some(StoredAttachment {
+                attachment: a.clone(),
+                message: m.id,
+                conversation: m.conversation,
+            })
+        }))
+    }
+
+    async fn next_poll_vote(&self, poll: MessageId) -> anyhow::Result<u32> {
+        let mut inner = self.inner();
+        let count = inner.poll_votes.entry(poll).or_default();
+        *count = count
+            .checked_add(1)
+            .with_context(|| format!("no votes left on poll {poll:?}"))?;
+        Ok(*count)
+    }
+
+    async fn schedule(&self, send: &ScheduledSend) -> anyhow::Result<JobId> {
+        let mut inner = self.inner();
+        inner.last_job += 1;
+        let id = JobId(inner.last_job);
+        inner.jobs.push(ScheduledJob {
+            id,
+            send: send.clone(),
+            state: JobState::Pending,
+        });
+        Ok(id)
+    }
+
+    async fn scheduled(&self) -> anyhow::Result<Vec<ScheduledJob>> {
+        let mut jobs = self.inner().jobs.clone();
+        jobs.sort_by_key(|j| (j.send.send_at_ms, j.id));
+        Ok(jobs)
+    }
+
+    async fn cancel_scheduled(&self, id: JobId) -> anyhow::Result<bool> {
+        let mut inner = self.inner();
+        let before = inner.jobs.len();
+        inner.jobs.retain(|j| j.id != id);
+        Ok(inner.jobs.len() < before)
+    }
+
+    async fn take_due(&self, now_ms: u64) -> anyhow::Result<Vec<ScheduledJob>> {
+        let mut inner = self.inner();
+        let mut due = vec![];
+        for job in &mut inner.jobs {
+            if job.state == JobState::Pending && job.send.send_at_ms <= now_ms {
+                job.state = JobState::Sending;
+                due.push(job.clone());
+            }
+        }
+        due.sort_by_key(|j| (j.send.send_at_ms, j.id));
+        Ok(due)
+    }
+
+    async fn finish_scheduled(&self, id: JobId, result: Result<(), String>) -> anyhow::Result<()> {
+        let mut inner = self.inner();
+        match result {
+            Ok(()) => inner.jobs.retain(|j| j.id != id),
+            Err(error) => {
+                if let Some(job) = inner.jobs.iter_mut().find(|j| j.id == id) {
+                    job.state = JobState::Failed { error };
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn stats(&self) -> anyhow::Result<StoreStats> {

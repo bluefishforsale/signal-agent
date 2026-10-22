@@ -6,7 +6,7 @@ mod message;
 mod paths;
 mod profile;
 
-pub use ids::{GroupId, MessageId, Recipient, ServiceId};
+pub use ids::{GroupId, MessageId, Recipient, ServiceId, StickerPackId};
 pub use message::{AttachmentRef, Conversation, Message};
 pub use paths::ProfilePaths;
 pub use profile::{AccessMode, ProfileKind, ProfileName};
@@ -14,6 +14,6 @@ pub use profile::{AccessMode, ProfileKind, ProfileName};
 pub mod prelude {
     pub use crate::{
         AccessMode, AttachmentRef, Conversation, GroupId, Message, MessageId, ProfileKind,
-        ProfileName, ProfilePaths, Recipient, ServiceId,
+        ProfileName, ProfilePaths, Recipient, ServiceId, StickerPackId,
     };
 }

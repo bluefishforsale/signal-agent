@@ -7,6 +7,7 @@ pub mod endpoint;
 pub mod login;
 mod mcp;
 mod startup;
+mod supervisor;
 
 use std::sync::Arc;
 
@@ -17,6 +18,8 @@ use relay_store::MessageStore;
 use relay_tools::{Clock, Limiter, Limits, Registry, SystemClock, ToolContext};
 use rmcp::ServiceExt;
 use tokio::task::JoinSet;
+
+pub use supervisor::{Supervisor, SupervisorAction};
 
 /// What the agent needs to start.
 #[derive(Clone, Debug)]
@@ -100,6 +103,8 @@ async fn serve_until(
             signal: signal.clone(),
             access,
             kind,
+            send_roots: Arc::default(),
+            webhook: None,
         },
         registry,
     };
@@ -198,7 +203,7 @@ async fn open_backend_and_store(
 #[cfg(test)]
 pub(crate) mod tests {
     use relay_signal::{Account, FakeSignal, Incoming};
-    use relay_store::{MemoryStore, SearchQuery};
+    use relay_store::{JobId, MemoryStore, SearchQuery};
     use rmcp::model::CallToolRequestParams;
     use uuid::Uuid;
 
@@ -252,6 +257,8 @@ pub(crate) mod tests {
             signal: signal.clone(),
             access: AccessMode::Full,
             kind: ProfileKind::Linked,
+            send_roots: Arc::default(),
+            webhook: None,
         };
         let dm = |n: u128| {
             let to = ServiceId::new(Uuid::from_u128(n)).to_string();
@@ -299,6 +306,8 @@ pub(crate) mod tests {
             signal: signal.clone(),
             access: AccessMode::Full,
             kind: ProfileKind::Linked,
+            send_roots: Arc::default(),
+            webhook: None,
         };
         let registry = registry(&paths, Arc::new(FakeClock(0.into())));
         let stats = registry
@@ -386,6 +395,43 @@ pub(crate) mod tests {
         async fn stats(&self) -> anyhow::Result<relay_store::StoreStats> {
             self.inner.stats().await
         }
+        async fn delete_conversation(&self, c: Recipient) -> anyhow::Result<u64> {
+            self.inner.delete_conversation(c).await
+        }
+        async fn mark_admin_deleted(&self, g: GroupId, t: MessageId) -> anyhow::Result<()> {
+            self.inner.mark_admin_deleted(g, t).await
+        }
+        async fn attachments(
+            &self,
+            l: u32,
+            o: u32,
+        ) -> anyhow::Result<Vec<relay_store::StoredAttachment>> {
+            self.inner.attachments(l, o).await
+        }
+        async fn attachment(
+            &self,
+            id: &str,
+        ) -> anyhow::Result<Option<relay_store::StoredAttachment>> {
+            self.inner.attachment(id).await
+        }
+        async fn next_poll_vote(&self, p: MessageId) -> anyhow::Result<u32> {
+            self.inner.next_poll_vote(p).await
+        }
+        async fn schedule(&self, s: &relay_store::ScheduledSend) -> anyhow::Result<JobId> {
+            self.inner.schedule(s).await
+        }
+        async fn scheduled(&self) -> anyhow::Result<Vec<relay_store::ScheduledJob>> {
+            self.inner.scheduled().await
+        }
+        async fn cancel_scheduled(&self, id: JobId) -> anyhow::Result<bool> {
+            self.inner.cancel_scheduled(id).await
+        }
+        async fn take_due(&self, now: u64) -> anyhow::Result<Vec<relay_store::ScheduledJob>> {
+            self.inner.take_due(now).await
+        }
+        async fn finish_scheduled(&self, id: JobId, r: Result<(), String>) -> anyhow::Result<()> {
+            self.inner.finish_scheduled(id, r).await
+        }
         async fn close(&self) -> anyhow::Result<()> {
             self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(())
@@ -445,6 +491,24 @@ pub(crate) mod tests {
         }
         fn incoming(&self) -> futures::stream::BoxStream<'static, anyhow::Result<Incoming>> {
             Box::pin(futures::stream::empty())
+        }
+        async fn upload(&self, _: &relay_signal::SendableFile) -> anyhow::Result<AttachmentRef> {
+            anyhow::bail!("offline")
+        }
+        async fn discover(&self, _: &[String]) -> anyhow::Result<Vec<(String, Option<ServiceId>)>> {
+            anyhow::bail!("offline")
+        }
+        async fn lookup_username(&self, _: &str) -> anyhow::Result<Option<ServiceId>> {
+            anyhow::bail!("offline")
+        }
+        async fn avatar(&self, _: Recipient) -> anyhow::Result<Option<Vec<u8>>> {
+            anyhow::bail!("offline")
+        }
+        async fn identities(&self) -> anyhow::Result<Vec<relay_signal::Identity>> {
+            anyhow::bail!("offline")
+        }
+        async fn devices(&self) -> anyhow::Result<Vec<relay_signal::Device>> {
+            anyhow::bail!("offline")
         }
     }
 

@@ -42,6 +42,11 @@ async fn apply(store: &dyn MessageStore, event: Incoming) -> anyhow::Result<()> 
             target, from, body, ..
         } => store.apply_edit(target, from, &body).await,
         Incoming::Delete { target, from, .. } => store.mark_deleted(target, from).await,
+        // Applying it needs the group's admins from the backend to check
+        // `from` first, so until then it's logged and skipped, never trusted.
+        Incoming::AdminDelete { group, from, .. } => {
+            bail!("admin delete by {from} in group {group} not applied yet (lane L4b)")
+        }
         Incoming::Read { targets } => store.mark_read(&targets).await,
         // NOTE: MessageStore has no place for reactions yet, so they are dropped
         // here. When the store grows one, apply them with `from` like edits.
