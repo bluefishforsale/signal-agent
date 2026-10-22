@@ -162,6 +162,44 @@ impl TryFrom<JobRow> for ScheduledJob {
     }
 }
 
+// NOTE: CROSS JOIN pins attachments as the outer loop, so SQLite walks
+// attachments_newest_first and stops at the limit. Left to choose, the planner
+// may scan messages and sort, which reads every message the profile has.
+const ATTACHMENT_PAGE: &str = "SELECT a.attachment, m.author, m.sent_at_ms, m.conversation \
+     FROM attachments a CROSS JOIN messages m ON m.id = a.message \
+     WHERE m.deleted = 0 \
+     ORDER BY a.sent_at_ms DESC, a.message, a.position LIMIT ? OFFSET ?";
+
+const ATTACHMENT_BY_ID: &str = "SELECT a.attachment, m.author, m.sent_at_ms, m.conversation \
+     FROM attachments a CROSS JOIN messages m ON m.id = a.message \
+     WHERE a.id = ? AND m.deleted = 0 \
+     ORDER BY a.message LIMIT 1";
+
+/// An `attachments` row joined to its message.
+#[derive(FromRow)]
+struct AttachmentRow {
+    attachment: String,
+    author: String,
+    sent_at_ms: i64,
+    conversation: String,
+}
+
+impl TryFrom<AttachmentRow> for StoredAttachment {
+    type Error = anyhow::Error;
+
+    fn try_from(row: AttachmentRow) -> anyhow::Result<Self> {
+        Ok(StoredAttachment {
+            attachment: serde_json::from_str(&row.attachment)
+                .with_context(|| format!("corrupt attachment column {:?}", row.attachment))?,
+            message: MessageId {
+                author: ServiceId::parse(&row.author)?,
+                sent_at_ms: to_u64(row.sent_at_ms)?,
+            },
+            conversation: parse_recipient(&row.conversation)?,
+        })
+    }
+}
+
 fn to_u64(n: i64) -> anyhow::Result<u64> {
     u64::try_from(n).with_context(|| format!("negative timestamp {n} in message store"))
 }
@@ -470,16 +508,21 @@ impl MessageStore for SqlCipherStore {
         Ok(())
     }
 
-    async fn attachments(
-        &self,
-        _limit: u32,
-        _offset: u32,
-    ) -> anyhow::Result<Vec<StoredAttachment>> {
-        bail!("the attachment index is not implemented yet (lane L2b)")
+    async fn attachments(&self, limit: u32, offset: u32) -> anyhow::Result<Vec<StoredAttachment>> {
+        let rows: Vec<AttachmentRow> = sqlx::query_as(ATTACHMENT_PAGE)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(StoredAttachment::try_from).collect()
     }
 
-    async fn attachment(&self, _id: &str) -> anyhow::Result<Option<StoredAttachment>> {
-        bail!("the attachment index is not implemented yet (lane L2b)")
+    async fn attachment(&self, id: &str) -> anyhow::Result<Option<StoredAttachment>> {
+        let row: Option<AttachmentRow> = sqlx::query_as(ATTACHMENT_BY_ID)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(StoredAttachment::try_from).transpose()
     }
 
     async fn next_poll_vote(&self, poll: MessageId) -> anyhow::Result<u32> {

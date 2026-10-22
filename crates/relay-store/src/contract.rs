@@ -38,13 +38,6 @@ impl Stores {
         [("memory", &self.memory), ("sqlcipher", &self.sqlcipher)]
     }
 
-    /// The implementations that have contract round 2's methods so far.
-    // NOTE: lane L2b replaces every call to this with each() once the
-    // SQLCipher store implements them; until then it bails "not implemented".
-    fn round_two(&self) -> [(&'static str, &dyn MessageStore); 1] {
-        [("memory", &self.memory)]
-    }
-
     async fn close(self) {
         for (name, store) in self.each() {
             store
@@ -581,7 +574,7 @@ async fn stored_attachments_page_newest_first_without_deleted_messages() {
         m
     };
     let stores = Stores::open().await;
-    for (name, store) in stores.round_two() {
+    for (name, store) in stores.each() {
         store.insert(&with(1, &["old"])).await.expect("insert");
         store
             .insert(&with(2, &["mid-a", "mid-b"]))

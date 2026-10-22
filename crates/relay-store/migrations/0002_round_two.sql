@@ -18,3 +18,32 @@ CREATE TABLE scheduled_jobs (
 );
 
 CREATE INDEX scheduled_jobs_by_due ON scheduled_jobs (state, send_at_ms);
+
+-- One row per attachment, kept in step with messages by the triggers below, so
+-- paging attachments walks an index instead of every message's JSON.
+CREATE TABLE attachments (
+    message INTEGER NOT NULL,
+    position INTEGER NOT NULL,
+    sent_at_ms INTEGER NOT NULL,
+    id TEXT NOT NULL,
+    attachment TEXT NOT NULL,
+    PRIMARY KEY (message, position)
+);
+
+CREATE INDEX attachments_newest_first ON attachments (sent_at_ms DESC, message, position);
+
+CREATE INDEX attachments_by_id ON attachments (id);
+
+INSERT INTO attachments (message, position, sent_at_ms, id, attachment)
+SELECT m.id, a.key, m.sent_at_ms, json_extract(a.value, '$.id'), a.value
+FROM messages m, json_each(m.attachments) a;
+
+CREATE TRIGGER attachments_insert AFTER INSERT ON messages BEGIN
+    INSERT INTO attachments (message, position, sent_at_ms, id, attachment)
+    SELECT new.id, a.key, new.sent_at_ms, json_extract(a.value, '$.id'), a.value
+    FROM json_each(new.attachments) a;
+END;
+
+CREATE TRIGGER attachments_delete AFTER DELETE ON messages BEGIN
+    DELETE FROM attachments WHERE message = old.id;
+END;
