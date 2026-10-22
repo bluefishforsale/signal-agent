@@ -15,13 +15,27 @@ use relay_core::ProfilePaths;
 /// Held while setup runs on a profile: its agent lets go of the stores, and
 /// nothing starts one.
 pub struct SetupLock {
+    _gate: File,
     _held: File,
 }
 
 impl SetupLock {
     /// The lock, or None while another setup holds it.
+    // NOTE: setup.lock alone can't say "another setup": `setup_running` takes
+    // it shared for an instant to look, and a setup starting just then would
+    // be refused. Only setups ever lock setup.gate, so a busy gate is another
+    // setup, and once through it the wait on setup.lock is only ever a probe
+    // finishing its look.
     pub fn try_acquire(paths: &ProfilePaths) -> anyhow::Result<Option<Self>> {
-        Ok(try_lock(&setup_file(paths))?.map(|_held| Self { _held }))
+        let Some(_gate) = try_lock(&paths.root.join("setup.gate"))? else {
+            return Ok(None);
+        };
+        let path = setup_file(paths);
+        let _held = open(&path)?;
+        _held
+            .lock()
+            .with_context(|| format!("unable to lock \"{}\"", path.display()))?;
+        Ok(Some(Self { _gate, _held }))
     }
 }
 
@@ -53,16 +67,7 @@ fn setup_file(paths: &ProfilePaths) -> PathBuf {
 /// An exclusive lock on the file at `path`, created with its folder if
 /// missing, or None while someone else holds it.
 fn try_lock(path: &Path) -> anyhow::Result<Option<File>> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)
-            .with_context(|| format!("unable to create \"{}\"", dir.display()))?;
-    }
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(path)
-        .with_context(|| format!("unable to open \"{}\"", path.display()))?;
+    let file = open(path)?;
     match file.try_lock() {
         Ok(()) => Ok(Some(file)),
         Err(TryLockError::WouldBlock) => Ok(None),
@@ -70,6 +75,20 @@ fn try_lock(path: &Path) -> anyhow::Result<Option<File>> {
             Err(e).with_context(|| format!("unable to lock \"{}\"", path.display()))
         }
     }
+}
+
+/// The lock file at `path`, created with its folder if missing.
+fn open(path: &Path) -> anyhow::Result<File> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)
+            .with_context(|| format!("unable to create \"{}\"", dir.display()))?;
+    }
+    OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("unable to open \"{}\"", path.display()))
 }
 
 #[cfg(test)]
@@ -127,6 +146,34 @@ mod tests {
         assert!(
             soon(|| StoreLock::try_acquire(&paths).expect("lock").is_some()),
             "still held after its holder let go"
+        );
+    }
+
+    /// Agents and the supervisor probe for setup all the time; a setup that
+    /// starts while a probe is looking must still get its lock, not be told
+    /// another setup is running.
+    #[test]
+    fn a_probe_for_setup_never_keeps_setup_from_starting() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = paths(&dir);
+        drop(SetupLock::try_acquire(&paths).expect("lock").expect("free"));
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probing = {
+            let (paths, done) = (paths.clone(), done.clone());
+            std::thread::spawn(move || {
+                while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                    setup_running(&paths);
+                }
+            })
+        };
+        let refused = (0..2000)
+            .filter(|_| SetupLock::try_acquire(&paths).expect("lock").is_none())
+            .count();
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        probing.join().expect("probe");
+        assert_eq!(
+            refused, 0,
+            "setup refused {refused} of 2000 times by a probe"
         );
     }
 }
