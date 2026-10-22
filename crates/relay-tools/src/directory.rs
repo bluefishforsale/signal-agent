@@ -2,7 +2,9 @@
 //! received attachments. They read from Signal's side of the seam or the local
 //! store, and never send.
 
+use anyhow::Context;
 use async_trait::async_trait;
+use base64::{Engine, engine::general_purpose::STANDARD};
 use relay_core::prelude::*;
 use relay_signal::Contact;
 use serde::Deserialize;
@@ -169,6 +171,63 @@ impl Tool for ListAttachments {
             })
             .collect();
         Ok(json!({ "attachments": attachments }))
+    }
+}
+
+pub struct GetAttachment;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GetAttachmentInput {
+    filename: String,
+}
+
+#[async_trait]
+impl Tool for GetAttachment {
+    fn name(&self) -> &'static str {
+        "get_attachment"
+    }
+    fn description(&self) -> &'static str {
+        "Fetch one received attachment: its id, content_type, file_name and size (bytes), and \
+         the file itself as base64. filename is an attachment id from list_attachments or a \
+         message's attachments. Nothing is sent."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "filename": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "An attachment id, from list_attachments or a message's attachments",
+                },
+            },
+            "required": ["filename"],
+            "additionalProperties": false,
+        })
+    }
+    fn writes(&self) -> bool {
+        false
+    }
+    async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
+        let GetAttachmentInput { filename } = parse(input)?;
+        let id = non_blank("filename", filename)?;
+        let attachment = stored_attachments(ctx)
+            .await?
+            .into_iter()
+            .map(|s| s.attachment)
+            .find(|a| a.id == id)
+            .with_context(|| {
+                format!("no stored message has an attachment with id \"{id}\"; list_attachments shows them")
+            })?;
+        let bytes = ctx.signal.attachment(&attachment).await?;
+        Ok(json!({
+            "id": attachment.id,
+            "content_type": attachment.content_type,
+            "file_name": attachment.file_name,
+            "size": attachment.size,
+            "base64": STANDARD.encode(bytes),
+        }))
     }
 }
 
@@ -391,5 +450,30 @@ mod tests {
             .map(|a| a["id"].as_str().unwrap())
             .collect();
         assert_eq!(ids, ["kept"], "{out}");
+    }
+
+    /// The file must come back byte for byte with its metadata, fetched by the
+    /// id list_attachments gave.
+    #[tokio::test]
+    async fn get_attachment_returns_metadata_and_the_bytes_as_base64() {
+        let ctx = ctx_of(|s| s.with_attachment("pic", vec![0xff, 0x00, 0xfe]));
+        ctx.store
+            .insert(&with_attachments(2, 100, &["pic"]))
+            .await
+            .unwrap();
+        let out = Registry::standard()
+            .call(&ctx, "get_attachment", json!({"filename": "pic"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            json!({
+                "id": "pic",
+                "content_type": "image/jpeg",
+                "file_name": "pic.jpg",
+                "size": 3,
+                "base64": "/wD+",
+            })
+        );
     }
 }
