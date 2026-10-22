@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use relay_core::prelude::*;
-use relay_signal::Outgoing;
+use relay_signal::{Outgoing, RequestResponse};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -264,6 +264,59 @@ impl Tool for SetExpirationTimer {
     }
 }
 
+pub struct SendMessageRequestResponse;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SendMessageRequestResponseInput {
+    recipient: String,
+    response: RequestResponse,
+}
+
+#[async_trait]
+impl Tool for SendMessageRequestResponse {
+    fn name(&self) -> &'static str {
+        "send_message_request_response"
+    }
+    fn description(&self) -> &'static str {
+        "Answer a message request from someone this account hasn't talked to. accept shares \
+         your profile (name, avatar) with them so they can see who you are, and counts as a \
+         new conversation against the daily limit. delete removes the conversation here and \
+         on your other devices; the sender isn't told. recipient is their phone number or \
+         service id. Blocking isn't supported here."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "recipient": contact_schema("The person whose request this answers"),
+                "response": {
+                    "type": "string",
+                    "enum": ["accept", "delete"],
+                    "description": "accept or delete",
+                },
+            },
+            "required": ["recipient", "response"],
+            "additionalProperties": false,
+        })
+    }
+    fn writes(&self) -> bool {
+        true
+    }
+    async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
+        let input: SendMessageRequestResponseInput = parse(input)?;
+        let to = Recipient::Contact(contact(ctx, &input.recipient).await?);
+        let response = input.response;
+        ctx.signal
+            .send(to, Outgoing::MessageRequestResponse { response })
+            .await?;
+        if response == RequestResponse::Delete {
+            ctx.store.delete_conversation(to).await?;
+        }
+        Ok(json!({ "response": response }))
+    }
+}
+
 pub struct SendReadReceipt;
 
 #[derive(Deserialize)]
@@ -405,7 +458,7 @@ mod tests {
 
     use std::{sync::Arc, time::Duration};
 
-    use relay_signal::{Account, FakeSignal, Group, RateLimited};
+    use relay_signal::{Account, FakeSignal, Group, RateLimited, RequestResponse};
     use relay_store::MemoryStore;
 
     use crate::{Registry, ToolContext, ToolError, testing::*};
@@ -642,6 +695,45 @@ mod tests {
                 Outgoing::ExpirationTimer { seconds }
             ))
         );
+    }
+
+    /// Accepting keeps the stranger's messages; deleting removes the
+    /// conversation here as it does on the account's other devices. Each
+    /// answer goes out as the matching request response.
+    #[tokio::test]
+    async fn answering_a_message_request_sends_it_and_delete_drops_the_local_conversation() {
+        let (ctx, signal) = ctx(AccessMode::Full, ProfileKind::Primary);
+        for stranger in [2, 3] {
+            ctx.store
+                .insert(&incoming(stranger, 100, "hi, can we talk?"))
+                .await
+                .unwrap();
+        }
+        let registry = Registry::standard();
+        for (stranger, response) in [(2, "accept"), (3, "delete")] {
+            let input = json!({"recipient": sid(stranger).to_string(), "response": response});
+            registry
+                .call(&ctx, "send_message_request_response", input)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            signal.sent(),
+            [
+                (Recipient::Contact(sid(2)), RequestResponse::Accept),
+                (Recipient::Contact(sid(3)), RequestResponse::Delete),
+            ]
+            .map(|(to, response)| (to, Outgoing::MessageRequestResponse { response }))
+        );
+        let left: Vec<_> = ctx
+            .store
+            .conversations()
+            .await
+            .unwrap()
+            .iter()
+            .map(|c| c.recipient)
+            .collect();
+        assert_eq!(left, [Recipient::Contact(sid(2))]);
     }
 
     /// One receipt covers every timestamp, each naming the sender's message,

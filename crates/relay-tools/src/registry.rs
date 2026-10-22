@@ -35,6 +35,7 @@ impl Registry {
             .with(send::SetTyping)
             .with(send::SetExpirationTimer)
             .with(send::SendReadReceipt)
+            .with(send::SendMessageRequestResponse)
             .with(mutate::ReactToMessage)
             .with(mutate::EditMessage)
             .with(mutate::DeleteMessage)
