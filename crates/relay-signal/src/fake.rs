@@ -15,7 +15,7 @@ use futures::{StreamExt, stream::BoxStream};
 use relay_core::prelude::*;
 use tokio::sync::mpsc;
 
-use crate::{Account, Contact, Group, Incoming, Outgoing, SignalBackend};
+use crate::{Account, Contact, Group, Incoming, Outgoing, RateLimited, SignalBackend};
 
 /// A fake registered account. Build one with `FakeSignal::new`, seed it with
 /// contacts, groups and attachments, then push incoming events at it.
@@ -33,6 +33,8 @@ struct State {
     groups: Vec<Group>,
     attachments: HashMap<String, Vec<u8>>,
     sent: Vec<(Recipient, Outgoing)>,
+    attempts: usize,
+    rate_limit_next_send: Option<RateLimited>,
 }
 
 impl FakeSignal {
@@ -73,6 +75,17 @@ impl FakeSignal {
         self.state().sent.clone()
     }
 
+    /// Sends that reached Signal so far, whether it accepted them or not.
+    pub fn attempts(&self) -> usize {
+        self.state().attempts
+    }
+
+    /// Makes the next send that reaches Signal fail with `limited`, as Signal's
+    /// rate limiting would.
+    pub fn rate_limit_next_send(&self, limited: RateLimited) {
+        self.state().rate_limit_next_send = Some(limited);
+    }
+
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().expect("fake signal state")
     }
@@ -90,7 +103,13 @@ impl SignalBackend for FakeSignal {
         {
             bail!("not a member of group {id}");
         }
-        self.state().sent.push((to, message));
+        let mut state = self.state();
+        state.attempts += 1;
+        if let Some(limited) = state.rate_limit_next_send.take() {
+            return Err(limited.into());
+        }
+        state.sent.push((to, message));
+        drop(state);
         Ok(MessageId {
             author: self.account.service_id,
             sent_at_ms: self.clock_ms.fetch_add(1, Ordering::Relaxed),
@@ -190,6 +209,29 @@ mod tests {
             matches!(second, Incoming::Read { .. }),
             "out of order: {second:?}"
         );
+    }
+
+    /// A rate-limited send must fail with the typed error callers match on,
+    /// reach Signal exactly once, and leave the next send unaffected, so tool
+    /// tests can tell "refused once" from "retried".
+    #[tokio::test]
+    async fn a_rate_limited_send_is_refused_once_and_counted_as_one_attempt() {
+        let signal = fake();
+        let limited = RateLimited {
+            message: "Rate limit exceeded".into(),
+            retry_after: Some(std::time::Duration::from_secs(30)),
+        };
+        signal.rate_limit_next_send(limited.clone());
+        let to = Recipient::Contact(ServiceId::new(Uuid::from_u128(2)));
+        let typing = Outgoing::Typing { started: true };
+        let err = signal
+            .send(to, typing.clone())
+            .await
+            .expect_err("a rate-limited send went through");
+        assert_eq!(err.downcast_ref::<RateLimited>(), Some(&limited), "{err:#}");
+        assert!(signal.sent().is_empty(), "refused send recorded as sent");
+        signal.send(to, typing.clone()).await.expect("next send");
+        assert_eq!(signal.attempts(), 2, "{:?}", signal.sent());
     }
 
     /// Sending to a group you're not in must fail, matching Signal.
