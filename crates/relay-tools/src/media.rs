@@ -232,4 +232,82 @@ mod tests {
             .expect("sent attachment stored");
         assert_eq!(json!(stored.message), out["id"], "{out}");
     }
+
+    /// Asserts `input` to send_attachment was refused with a message
+    /// containing `why`, and that no file was uploaded and nothing sent.
+    async fn refused(ctx: &ToolContext, signal: &FakeSignal, input: serde_json::Value, why: &str) {
+        let result = Registry::standard()
+            .call(ctx, "send_attachment", input.clone())
+            .await;
+        assert!(
+            matches!(&result, Err(e) if e.to_string().contains(why)),
+            "{input} was not refused for \"{why}\": {result:?}"
+        );
+        let first_upload = AttachmentRef {
+            id: "upload-1".into(),
+            content_type: String::new(),
+            file_name: None,
+            size: 0,
+        };
+        assert!(
+            signal.attachment(&first_upload).await.is_err(),
+            "{input} uploaded a file before being refused"
+        );
+        assert!(
+            signal.sent().is_empty(),
+            "{input} still sent: {:?}",
+            signal.sent()
+        );
+    }
+
+    /// One file outside the send folders refuses the whole call, before the
+    /// allowed file beside it is uploaded: a half-sent message would still
+    /// leak, and an upload already hands the bytes to Signal's servers.
+    #[tokio::test]
+    async fn a_path_outside_the_send_roots_refuses_the_call_before_any_upload() {
+        let dir = tree();
+        let (ctx, signal) = ctx_with_roots(&[&dir.path().join("outbox")]);
+        let input = json!({
+            "recipient": sid(2).to_string(),
+            "paths": [
+                dir.path().join("outbox/cat.png").to_str().unwrap(),
+                dir.path().join("secret").to_str().unwrap(),
+            ],
+        });
+        refused(&ctx, &signal, input, "outside the folders").await;
+    }
+
+    /// A `..` that climbs out of a send folder is judged by where it lands.
+    #[tokio::test]
+    async fn a_dot_dot_escape_from_a_send_root_is_refused() {
+        let dir = tree();
+        let (ctx, signal) = ctx_with_roots(&[&dir.path().join("outbox")]);
+        let escape = dir.path().join("outbox/../secret");
+        let input = json!({"recipient": sid(2).to_string(), "path": escape.to_str().unwrap()});
+        refused(&ctx, &signal, input, "outside the folders").await;
+    }
+
+    /// A symlink inside a send folder is judged by its target, or linking the
+    /// key into the outbox would send it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlink_escape_from_a_send_root_is_refused() {
+        let dir = tree();
+        let link = dir.path().join("outbox/innocent.png");
+        std::os::unix::fs::symlink(dir.path().join("secret"), &link).expect("symlink");
+        let (ctx, signal) = ctx_with_roots(&[&dir.path().join("outbox")]);
+        let input = json!({"recipient": sid(2).to_string(), "path": link.to_str().unwrap()});
+        refused(&ctx, &signal, input, "outside the folders").await;
+    }
+
+    /// Until the user picks a send folder no file is sendable, and the
+    /// refusal must say that is what's missing, not just that the path is bad.
+    #[tokio::test]
+    async fn with_no_send_folder_chosen_the_refusal_says_to_choose_one() {
+        let dir = tree();
+        let (ctx, signal) = ctx_with_roots(&[]);
+        let path = dir.path().join("outbox/cat.png");
+        let input = json!({"recipient": sid(2).to_string(), "path": path.to_str().unwrap()});
+        refused(&ctx, &signal, input, "choose a send folder under Advanced").await;
+    }
 }
