@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 
 use crate::{
     Tool, ToolContext, ToolError,
-    input::{Timestamp, contact, contact_schema, non_blank, parse},
+    input::{Timestamp, contact, contact_schema, group, group_schema, non_blank, parse},
     send::{quote, send_text},
 };
 
@@ -56,7 +56,7 @@ impl Tool for SendAttachment {
                 "recipient": contact_schema("Who to send to"),
                 "path": path_schema(),
                 "paths": paths_schema(),
-                "caption": {"type": "string", "minLength": 1, "description": "Text shown with the files"},
+                "caption": caption_schema(),
                 "quote_author": contact_schema("Author of the message being replied to"),
                 "quote_timestamp": Timestamp::schema("Send time of the message being replied to"),
             },
@@ -76,6 +76,68 @@ impl Tool for SendAttachment {
         let attachments = upload(ctx, &paths).await?;
         send_text(ctx, to, caption.unwrap_or_default(), quote, attachments).await
     }
+}
+
+pub struct SendGroupAttachment;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SendGroupAttachmentInput {
+    group_id: String,
+    path: Option<String>,
+    paths: Option<Vec<String>>,
+    caption: Option<String>,
+    quote_author: Option<String>,
+    quote_timestamp: Option<Timestamp>,
+}
+
+#[async_trait]
+impl Tool for SendGroupAttachment {
+    fn name(&self) -> &'static str {
+        "send_group_attachment"
+    }
+    fn description(&self) -> &'static str {
+        "Send one or more local files (photos, videos, documents, audio) to a Signal group you \
+         belong to, in a single message. Use send_attachment for one contact and \
+         send_group_message for text only. group_id comes from list_groups. path is one file, \
+         paths several sent together (at least one file, at most 32). Files must be inside a \
+         send folder the user chose under Advanced settings; with none chosen, no file can be \
+         sent, and anything outside them is refused before any file is uploaded. caption is \
+         text shown with the files. quote_author and quote_timestamp reply to a message. Not \
+         idempotent: repeating sends a duplicate. Saved to the local store. Returns the new \
+         message's id."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "group_id": group_schema(),
+                "path": path_schema(),
+                "paths": paths_schema(),
+                "caption": caption_schema(),
+                "quote_author": contact_schema("Author of the message being replied to"),
+                "quote_timestamp": Timestamp::schema("Send time of the message being replied to"),
+            },
+            "required": ["group_id"],
+            "additionalProperties": false,
+        })
+    }
+    fn writes(&self) -> bool {
+        true
+    }
+    async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
+        let input: SendGroupAttachmentInput = parse(input)?;
+        let to = Recipient::Group(group(&input.group_id)?);
+        let caption = input.caption.map(|c| non_blank("caption", c)).transpose()?;
+        let quote = quote(ctx, input.quote_author, input.quote_timestamp).await?;
+        let paths = files(input.path, input.paths)?;
+        let attachments = upload(ctx, &paths).await?;
+        send_text(ctx, to, caption.unwrap_or_default(), quote, attachments).await
+    }
+}
+
+fn caption_schema() -> Value {
+    json!({"type": "string", "minLength": 1, "description": "Text shown with the files"})
 }
 
 fn path_schema() -> Value {
@@ -152,7 +214,7 @@ fn admit(roots: &SendRoots, path: &Path) -> anyhow::Result<relay_signal::Sendabl
 mod tests {
     use std::{path::Path, sync::Arc};
 
-    use relay_signal::{Account, FakeSignal, Outgoing, SendRoots, SignalBackend};
+    use relay_signal::{Account, FakeSignal, Group, Outgoing, SendRoots, SignalBackend};
     use relay_store::MemoryStore;
     use serde_json::json;
 
@@ -309,5 +371,40 @@ mod tests {
         let path = dir.path().join("outbox/cat.png");
         let input = json!({"recipient": sid(2).to_string(), "path": path.to_str().unwrap()});
         refused(&ctx, &signal, input, "choose a send folder under Advanced").await;
+    }
+
+    /// A group send carries the files to the group itself, not to a member.
+    #[tokio::test]
+    async fn send_group_attachment_sends_the_files_to_the_group() {
+        let dir = tree();
+        let group = GroupId::new([7; 32]);
+        let (ctx, _) = ctx_with_roots(&[&dir.path().join("outbox")]);
+        let signal = Arc::new(
+            FakeSignal::new(ctx.signal.account().await.unwrap()).with_groups(vec![Group {
+                id: group,
+                title: "band".into(),
+                members: vec![sid(ME), sid(2)],
+                admins: vec![],
+            }]),
+        );
+        let ctx = ToolContext {
+            signal: signal.clone(),
+            ..ctx
+        };
+        let path = dir.path().join("outbox/cat.png");
+        Registry::standard()
+            .call(
+                &ctx,
+                "send_group_attachment",
+                json!({"group_id": group.to_string(), "paths": [path.to_str().unwrap()]}),
+            )
+            .await
+            .unwrap();
+        let sent = signal.sent();
+        let [(to, Outgoing::Text { attachments, .. })] = sent.as_slice() else {
+            panic!("expected one text with files, sent {sent:?}");
+        };
+        assert_eq!(*to, Recipient::Group(group));
+        assert_eq!(attachments.len(), 1, "{attachments:?}");
     }
 }

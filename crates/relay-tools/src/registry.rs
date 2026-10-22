@@ -50,6 +50,7 @@ impl Registry {
             .with(lookup::ListIdentities)
             .with(lookup::GetAvatar)
             .with(media::SendAttachment)
+            .with(media::SendGroupAttachment)
     }
 
     /// Applies account-safety limits to every send a tool makes.
