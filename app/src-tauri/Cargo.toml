@@ -8,4 +8,9 @@ license.workspace = true
 tauri-build = { version = "2.7.4", features = [] }
 
 [dependencies]
+qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
 tauri = { version = "2.12.5", features = [] }
+relay-core.workspace = true
+relay-setup.workspace = true
+serde.workspace = true
+serde_json.workspace = true

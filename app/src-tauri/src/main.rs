@@ -3,6 +3,12 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod input;
+#[cfg(target_os = "macos")]
+mod placement;
+mod session;
+mod view;
+
 fn main() {
     if let Err(e) = tauri::Builder::default().run(tauri::generate_context!()) {
         eprintln!("MCP Relay for Signal failed to start: {e}");
