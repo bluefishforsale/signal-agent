@@ -7,6 +7,8 @@ mod directory;
 mod input;
 mod limits;
 mod local;
+mod lookup;
+mod media;
 mod mutate;
 mod pins;
 mod polls;
@@ -20,7 +22,9 @@ mod testing;
 mod tool;
 mod webhook;
 
-pub use limits::{Clock, LimitExceeded, Limiter, Limits, SystemClock, begin_provisioning};
+pub use limits::{
+    Clock, LimitExceeded, Limiter, Limits, SystemClock, begin_provisioning, defer_provisioning,
+};
 pub use registry::Registry;
 pub use schedule::run_due;
 pub use settings::Settings;

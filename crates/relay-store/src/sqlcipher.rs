@@ -14,8 +14,8 @@ use sqlx::{
 };
 
 use crate::{
-    JobId, MessageStore, ScheduledJob, ScheduledSend, SearchQuery, StoreStats, StoredAttachment,
-    ensure_author,
+    JobId, JobState, MessageStore, ScheduledJob, ScheduledSend, SearchQuery, StoreStats,
+    StoredAttachment, ensure_author,
 };
 
 /// A profile's encrypted message history.
@@ -26,26 +26,7 @@ pub struct SqlCipherStore {
 impl SqlCipherStore {
     /// Opens or creates the store at `path`, failing if `key` doesn't decrypt it.
     pub async fn open(path: &Path, key: &StoreKey) -> anyhow::Result<Self> {
-        let hex: String = key.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
-        // NOTE: sqlx logs every statement it runs, including the PRAGMA key it
-        // sends on connect, and logs slow ones at WARN. Leaving either on writes
-        // the database key into the agent log.
-        let options = SqliteConnectOptions::from_str("sqlite:")?
-            .filename(path)
-            .pragma("key", format!("\"x'{hex}'\""))
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .log_statements(LevelFilter::Off)
-            .log_slow_statements(LevelFilter::Off, std::time::Duration::ZERO);
-        let pool = SqlitePoolOptions::new()
-            .connect_with(options)
-            .await
-            .with_context(|| {
-                format!(
-                    "unable to open message store \"{}\": wrong key or not a message store",
-                    path.display()
-                )
-            })?;
+        let pool = connect(path, key).await?;
         sqlx::migrate!()
             .run(&pool)
             .await
@@ -66,6 +47,30 @@ impl SqlCipherStore {
         tx.commit().await?;
         Ok(())
     }
+}
+
+/// A pool on the store at `path`, keyed but not yet migrated.
+async fn connect(path: &Path, key: &StoreKey) -> anyhow::Result<SqlitePool> {
+    let hex: String = key.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    // NOTE: sqlx logs every statement it runs, including the PRAGMA key it
+    // sends on connect, and logs slow ones at WARN. Leaving either on writes
+    // the database key into the agent log.
+    let options = SqliteConnectOptions::from_str("sqlite:")?
+        .filename(path)
+        .pragma("key", format!("\"x'{hex}'\""))
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .log_statements(LevelFilter::Off)
+        .log_slow_statements(LevelFilter::Off, std::time::Duration::ZERO);
+    SqlitePoolOptions::new()
+        .connect_with(options)
+        .await
+        .with_context(|| {
+            format!(
+                "unable to open message store \"{}\": wrong key or not a message store",
+                path.display()
+            )
+        })
 }
 
 /// A `SELECT` of every `MessageRow` column from `messages m`, followed by
@@ -129,12 +134,88 @@ impl TryFrom<MessageRow> for Message {
     }
 }
 
+/// A `scheduled_jobs` row as stored.
+#[derive(FromRow)]
+struct JobRow {
+    id: i64,
+    recipient: String,
+    body: String,
+    send_at_ms: i64,
+    state: String,
+    error: Option<String>,
+}
+
+impl TryFrom<JobRow> for ScheduledJob {
+    type Error = anyhow::Error;
+
+    fn try_from(row: JobRow) -> anyhow::Result<Self> {
+        let state = match (row.state.as_str(), row.error) {
+            ("pending", _) => JobState::Pending,
+            ("sending", _) => JobState::Sending,
+            ("failed", Some(error)) => JobState::Failed { error },
+            (state, error) => bail!("corrupt job state {state:?} with error {error:?}"),
+        };
+        Ok(ScheduledJob {
+            id: JobId(to_u64(row.id)?),
+            send: ScheduledSend {
+                recipient: parse_recipient(&row.recipient)?,
+                body: row.body,
+                send_at_ms: to_u64(row.send_at_ms)?,
+            },
+            state,
+        })
+    }
+}
+
+// NOTE: CROSS JOIN pins attachments as the outer loop, so SQLite walks
+// attachments_newest_first and stops at the limit. Left to choose, the planner
+// may scan messages and sort, which reads every message the profile has.
+const ATTACHMENT_PAGE: &str = "SELECT a.attachment, m.author, m.sent_at_ms, m.conversation \
+     FROM attachments a CROSS JOIN messages m ON m.id = a.message \
+     WHERE m.deleted = 0 \
+     ORDER BY a.sent_at_ms DESC, a.message, a.position LIMIT ? OFFSET ?";
+
+const ATTACHMENT_BY_ID: &str = "SELECT a.attachment, m.author, m.sent_at_ms, m.conversation \
+     FROM attachments a CROSS JOIN messages m ON m.id = a.message \
+     WHERE a.id = ? AND m.deleted = 0 \
+     ORDER BY a.message LIMIT 1";
+
+/// An `attachments` row joined to its message.
+#[derive(FromRow)]
+struct AttachmentRow {
+    attachment: String,
+    author: String,
+    sent_at_ms: i64,
+    conversation: String,
+}
+
+impl TryFrom<AttachmentRow> for StoredAttachment {
+    type Error = anyhow::Error;
+
+    fn try_from(row: AttachmentRow) -> anyhow::Result<Self> {
+        Ok(StoredAttachment {
+            attachment: serde_json::from_str(&row.attachment)
+                .with_context(|| format!("corrupt attachment column {:?}", row.attachment))?,
+            message: MessageId {
+                author: ServiceId::parse(&row.author)?,
+                sent_at_ms: to_u64(row.sent_at_ms)?,
+            },
+            conversation: parse_recipient(&row.conversation)?,
+        })
+    }
+}
+
 fn to_u64(n: i64) -> anyhow::Result<u64> {
     u64::try_from(n).with_context(|| format!("negative timestamp {n} in message store"))
 }
 
 fn to_i64(n: u64) -> anyhow::Result<i64> {
     i64::try_from(n).with_context(|| format!("timestamp {n} too large for the message store"))
+}
+
+/// The row id for `id`, or None for an id no stored job can have.
+fn job_key(id: JobId) -> Option<i64> {
+    i64::try_from(id.0).ok()
 }
 
 fn recipient_key(recipient: Recipient) -> String {
@@ -400,52 +481,136 @@ impl MessageStore for SqlCipherStore {
             newest_ms: newest.map(to_u64).transpose()?,
         })
     }
-    async fn delete_conversation(&self, _conversation: Recipient) -> anyhow::Result<u64> {
-        bail!("deleting a conversation is not implemented yet (lane L2b)")
+    // Read state lives on the message rows, so it goes with them.
+    async fn delete_conversation(&self, conversation: Recipient) -> anyhow::Result<u64> {
+        let key = recipient_key(conversation);
+        let mut tx = self.pool.begin().await?;
+        let deleted = sqlx::query("DELETE FROM messages WHERE conversation = ?")
+            .bind(&key)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM titles WHERE conversation = ?")
+            .bind(&key)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(deleted.rows_affected())
     }
 
-    async fn mark_admin_deleted(&self, _group: GroupId, _target: MessageId) -> anyhow::Result<()> {
-        bail!("admin deletes are not implemented yet (lane L2b)")
+    async fn mark_admin_deleted(&self, group: GroupId, target: MessageId) -> anyhow::Result<()> {
+        let updated = sqlx::query(
+            "UPDATE messages SET deleted = 1 \
+             WHERE author = ? AND sent_at_ms = ? AND conversation = ?",
+        )
+        .bind(target.author.to_string())
+        .bind(to_i64(target.sent_at_ms)?)
+        .bind(recipient_key(Recipient::Group(group)))
+        .execute(&self.pool)
+        .await?;
+        if updated.rows_affected() == 0 {
+            bail!("{target:?} is not a stored message in group {group}");
+        }
+        Ok(())
     }
 
-    async fn attachments(
-        &self,
-        _limit: u32,
-        _offset: u32,
-    ) -> anyhow::Result<Vec<StoredAttachment>> {
-        bail!("the attachment index is not implemented yet (lane L2b)")
+    async fn attachments(&self, limit: u32, offset: u32) -> anyhow::Result<Vec<StoredAttachment>> {
+        let rows: Vec<AttachmentRow> = sqlx::query_as(ATTACHMENT_PAGE)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(StoredAttachment::try_from).collect()
     }
 
-    async fn attachment(&self, _id: &str) -> anyhow::Result<Option<StoredAttachment>> {
-        bail!("the attachment index is not implemented yet (lane L2b)")
+    async fn attachment(&self, id: &str) -> anyhow::Result<Option<StoredAttachment>> {
+        let row: Option<AttachmentRow> = sqlx::query_as(ATTACHMENT_BY_ID)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(StoredAttachment::try_from).transpose()
     }
 
-    async fn next_poll_vote(&self, _poll: MessageId) -> anyhow::Result<u32> {
-        bail!("poll vote counts are not implemented yet (lane L2b)")
+    async fn next_poll_vote(&self, poll: MessageId) -> anyhow::Result<u32> {
+        let (count,): (i64,) = sqlx::query_as(
+            "INSERT INTO poll_votes (author, sent_at_ms, count) VALUES (?, ?, 1) \
+             ON CONFLICT (author, sent_at_ms) DO UPDATE SET count = count + 1 \
+             RETURNING count",
+        )
+        .bind(poll.author.to_string())
+        .bind(to_i64(poll.sent_at_ms)?)
+        .fetch_one(&self.pool)
+        .await?;
+        u32::try_from(count).with_context(|| format!("no votes left on poll {poll:?}"))
     }
 
-    async fn schedule(&self, _send: &ScheduledSend) -> anyhow::Result<JobId> {
-        bail!("scheduled sends are not implemented yet (lane L2b)")
+    async fn schedule(&self, send: &ScheduledSend) -> anyhow::Result<JobId> {
+        let (id,): (i64,) = sqlx::query_as(
+            "INSERT INTO scheduled_jobs (recipient, body, send_at_ms, state) \
+             VALUES (?, ?, ?, 'pending') RETURNING id",
+        )
+        .bind(recipient_key(send.recipient))
+        .bind(&send.body)
+        .bind(to_i64(send.send_at_ms)?)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(JobId(to_u64(id)?))
     }
 
     async fn scheduled(&self) -> anyhow::Result<Vec<ScheduledJob>> {
-        bail!("scheduled sends are not implemented yet (lane L2b)")
+        let rows: Vec<JobRow> = sqlx::query_as(
+            "SELECT id, recipient, body, send_at_ms, state, error FROM scheduled_jobs \
+             ORDER BY send_at_ms, id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(ScheduledJob::try_from).collect()
     }
 
-    async fn cancel_scheduled(&self, _id: JobId) -> anyhow::Result<bool> {
-        bail!("scheduled sends are not implemented yet (lane L2b)")
+    async fn cancel_scheduled(&self, id: JobId) -> anyhow::Result<bool> {
+        let Some(key) = job_key(id) else {
+            return Ok(false);
+        };
+        let deleted = sqlx::query("DELETE FROM scheduled_jobs WHERE id = ?")
+            .bind(key)
+            .execute(&self.pool)
+            .await?;
+        Ok(deleted.rows_affected() > 0)
     }
 
-    async fn take_due(&self, _now_ms: u64) -> anyhow::Result<Vec<ScheduledJob>> {
-        bail!("scheduled sends are not implemented yet (lane L2b)")
+    // NOTE: one UPDATE ... RETURNING, so the claim and the read are a single
+    // write. A SELECT then UPDATE would let two callers read the same pending
+    // job before either marked it, and both would send it.
+    async fn take_due(&self, now_ms: u64) -> anyhow::Result<Vec<ScheduledJob>> {
+        let rows: Vec<JobRow> = sqlx::query_as(
+            "UPDATE scheduled_jobs SET state = 'sending' \
+             WHERE state = 'pending' AND send_at_ms <= ? \
+             RETURNING id, recipient, body, send_at_ms, state, error",
+        )
+        // Every stored send_at_ms fits in an i64, so a later now is "all due".
+        .bind(i64::try_from(now_ms).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await?;
+        let mut due = rows
+            .into_iter()
+            .map(ScheduledJob::try_from)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        due.sort_by_key(|j| (j.send.send_at_ms, j.id));
+        Ok(due)
     }
 
-    async fn finish_scheduled(
-        &self,
-        _id: JobId,
-        _result: Result<(), String>,
-    ) -> anyhow::Result<()> {
-        bail!("scheduled sends are not implemented yet (lane L2b)")
+    async fn finish_scheduled(&self, id: JobId, result: Result<(), String>) -> anyhow::Result<()> {
+        let Some(key) = job_key(id) else {
+            return Ok(());
+        };
+        let query = match result {
+            Ok(()) => sqlx::query("DELETE FROM scheduled_jobs WHERE id = ?"),
+            Err(error) => {
+                sqlx::query("UPDATE scheduled_jobs SET state = 'failed', error = ? WHERE id = ?")
+                    .bind(error)
+            }
+        };
+        query.bind(key).execute(&self.pool).await?;
+        Ok(())
     }
 }
 
@@ -599,6 +764,80 @@ mod tests {
                 details.iter().all(|d| d != "SCAN messages"),
                 "full scan for {sql}: {details:?}"
             );
+        }
+        store.close().await.expect("close");
+    }
+
+    /// Receivers keep only a poll's highest vote count, so a count that
+    /// restarted at 1 after the agent restarts would make every later vote
+    /// invisible.
+    #[tokio::test]
+    async fn poll_vote_counts_survive_a_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("messages.db");
+        let key = StoreKey::from_bytes([4; 32]);
+        let poll = msg(1, "poll").id;
+        let store = SqlCipherStore::open(&path, &key).await.expect("open");
+        store.next_poll_vote(poll).await.expect("vote");
+        store.close().await.expect("close");
+        let store = SqlCipherStore::open(&path, &key).await.expect("reopen");
+        let count = store.next_poll_vote(poll).await.expect("vote");
+        assert_eq!(count, 2, "vote count restarted after reopen");
+        store.close().await.expect("close");
+    }
+
+    /// Stores from before the attachment index already hold attachments; the
+    /// migration must index them, or they vanish from the listing on upgrade.
+    #[tokio::test]
+    async fn upgrading_indexes_attachments_already_stored() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("messages.db");
+        let key = StoreKey::from_bytes([5; 32]);
+        let mut old = msg(1, "");
+        old.attachments = vec![AttachmentRef {
+            id: "before-upgrade".into(),
+            content_type: "image/png".into(),
+            file_name: None,
+            size: 1,
+        }];
+        let pool = connect(&path, &key).await.expect("connect");
+        sqlx::migrate!()
+            .run_to(1, &pool)
+            .await
+            .expect("migrate to 0001");
+        let round_one = SqlCipherStore { pool };
+        round_one.insert(&old).await.expect("insert");
+        round_one.close().await.expect("close");
+        let store = SqlCipherStore::open(&path, &key).await.expect("upgrade");
+        let found = store.attachment("before-upgrade").await.expect("lookup");
+        assert_eq!(
+            found.map(|a| a.message),
+            Some(old.id),
+            "attachment stored before the upgrade not indexed"
+        );
+        store.close().await.expect("close");
+    }
+
+    /// get_attachment and the attachment listing page through every
+    /// attachment the profile ever received, so each page must walk the index
+    /// in order and stop at the limit, never scan messages or sort them all.
+    #[tokio::test]
+    async fn attachment_queries_walk_the_index_without_a_full_scan() {
+        let (store, _dir) = open_temp().await;
+        for sql in [ATTACHMENT_PAGE, ATTACHMENT_BY_ID] {
+            let explain = sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}"));
+            let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(explain)
+                .bind("x")
+                .bind(0)
+                .fetch_all(&store.pool)
+                .await
+                .expect("explain");
+            let details: Vec<_> = plan.into_iter().map(|row| row.3).collect();
+            let indexed = details
+                .iter()
+                .all(|d| d.starts_with("SEARCH ") || d.contains(" USING INDEX "));
+            let sorts = details.iter().any(|d| d.contains("TEMP B-TREE"));
+            assert!(indexed && !sorts, "unindexed plan for {sql}: {details:?}");
         }
         store.close().await.expect("close");
     }

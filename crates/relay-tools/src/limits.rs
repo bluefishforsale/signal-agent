@@ -14,7 +14,8 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use relay_core::prelude::*;
 use relay_signal::{
-    Account, Contact, Device, Group, Identity, Incoming, Outgoing, SendableFile, SignalBackend,
+    Account, Contact, Device, Group, Identity, Incoming, Outgoing, RateLimited, SendableFile,
+    SignalBackend,
 };
 use relay_store::MessageStore;
 use serde::{Deserialize, Serialize};
@@ -38,6 +39,12 @@ pub struct Limits {
     pub new_recipients_per_day: u32,
     /// Minutes between attempts to link or register this profile.
     pub provisioning_backoff_minutes: NonZeroU32,
+    /// Numbers, usernames and avatars looked up back to back, refilling over
+    /// a minute.
+    pub lookup_burst_per_minute: NonZeroU32,
+    /// Numbers, usernames and avatars looked up back to back, refilling over
+    /// a day.
+    pub lookups_per_day: NonZeroU32,
 }
 
 impl Default for Limits {
@@ -47,6 +54,8 @@ impl Default for Limits {
             per_hour: NonZeroU32::new(200).expect("nonzero literal"),
             new_recipients_per_day: 20,
             provisioning_backoff_minutes: NonZeroU32::new(5).expect("nonzero literal"),
+            lookup_burst_per_minute: NonZeroU32::new(10).expect("nonzero literal"),
+            lookups_per_day: NonZeroU32::new(50).expect("nonzero literal"),
         }
     }
 }
@@ -95,6 +104,10 @@ struct State {
     first_contacts: Vec<(Recipient, u64)>,
     /// No first contacts before this time.
     first_contacts_paused_until_ms: u64,
+    /// No counted sends before this time, because Signal asked us to wait.
+    sends_paused_until_ms: u64,
+    lookup_minute: Bucket,
+    lookup_day: Bucket,
 }
 
 impl State {
@@ -109,6 +122,9 @@ impl State {
             hour: empty(),
             first_contacts: vec![],
             first_contacts_paused_until_ms: now + DAY_MS,
+            sends_paused_until_ms: 0,
+            lookup_minute: empty(),
+            lookup_day: empty(),
         }
     }
 }
@@ -123,8 +139,14 @@ struct Bucket {
 }
 
 impl Bucket {
-    /// How long until a token is free, or None when one is free now.
-    fn wait(&mut self, now: u64, capacity: NonZeroU32, window_ms: u64) -> Option<Duration> {
+    /// How long until `tokens` are free, or None when they're free now.
+    fn wait(
+        &mut self,
+        now: u64,
+        capacity: NonZeroU32,
+        window_ms: u64,
+        tokens: u64,
+    ) -> Option<Duration> {
         let capacity = u64::from(capacity.get());
         let full = capacity * window_ms;
         let refill = match self.last_ms {
@@ -133,12 +155,14 @@ impl Bucket {
         };
         self.level = self.level.saturating_add(refill).min(full);
         self.last_ms = Some(now);
-        let short = window_ms.checked_sub(self.level).filter(|s| *s > 0)?;
+        let short = (tokens * window_ms)
+            .checked_sub(self.level)
+            .filter(|s| *s > 0)?;
         Some(Duration::from_millis(short.div_ceil(capacity)))
     }
 
-    fn take(&mut self, window_ms: u64) {
-        self.level -= window_ms;
+    fn take(&mut self, window_ms: u64, tokens: u64) {
+        self.level -= tokens * window_ms;
     }
 }
 
@@ -187,6 +211,15 @@ impl Limiter {
         let known = !store.history(to, None, 1).await?.is_empty();
         let now = self.clock.now_ms();
         let mut state = self.state.lock().expect("limiter state");
+        if now < state.sends_paused_until_ms {
+            return Err(LimitExceeded {
+                limit: "Signal rate-limited a recent message, so sending is paused for as \
+                        long as Signal asked"
+                    .into(),
+                retry_after: Duration::from_millis(state.sends_paused_until_ms - now),
+            }
+            .into());
+        }
         let Limits {
             burst_per_minute,
             per_hour,
@@ -221,59 +254,125 @@ impl Limiter {
         // refused again by the other bucket.
         let waits = [
             (
-                state.minute.wait(now, burst_per_minute, MINUTE_MS),
+                state.minute.wait(now, burst_per_minute, MINUTE_MS, 1),
                 format!("at most {burst_per_minute} messages a minute"),
             ),
             (
-                state.hour.wait(now, per_hour, HOUR_MS),
+                state.hour.wait(now, per_hour, HOUR_MS, 1),
                 format!("at most {per_hour} messages an hour"),
             ),
         ];
         if let Some((Some(retry_after), limit)) = waits.into_iter().max_by_key(|(w, _)| *w) {
             return Err(LimitExceeded { limit, retry_after }.into());
         }
-        state.minute.take(MINUTE_MS);
-        state.hour.take(HOUR_MS);
+        state.minute.take(MINUTE_MS, 1);
+        state.hour.take(HOUR_MS, 1);
         if first {
             state.first_contacts.push((to, now));
         }
         // NOTE: saved before the send, so a crash mid-send costs a token
         // rather than handing one back.
-        if let Some(path) = &self.path {
-            write_atomically(path, &serde_json::to_vec(&*state)?)?;
+        self.save(&state)
+    }
+
+    /// Counts `lookups` numbers, usernames or avatars, or refuses them all.
+    fn admit_lookups(&self, lookups: usize) -> anyhow::Result<()> {
+        let now = self.clock.now_ms();
+        let mut state = self.state.lock().expect("limiter state");
+        let Limits {
+            lookup_burst_per_minute,
+            lookups_per_day,
+            ..
+        } = self.limits;
+        let most = lookup_burst_per_minute.min(lookups_per_day);
+        if lookups > most.get() as usize {
+            anyhow::bail!(
+                "{lookups} lookups at once is more than the account-safety limits ever \
+                 allow; ask about at most {most} at a time. Nothing was sent to Signal"
+            );
         }
-        Ok(())
+        let lookups = lookups as u64;
+        let waits = [
+            (
+                state
+                    .lookup_minute
+                    .wait(now, lookup_burst_per_minute, MINUTE_MS, lookups),
+                format!("at most {lookup_burst_per_minute} lookups a minute"),
+            ),
+            (
+                state.lookup_day.wait(now, lookups_per_day, DAY_MS, lookups),
+                format!("at most {lookups_per_day} lookups a day"),
+            ),
+        ];
+        if let Some((Some(retry_after), limit)) = waits.into_iter().max_by_key(|(w, _)| *w) {
+            return Err(LimitExceeded { limit, retry_after }.into());
+        }
+        state.lookup_minute.take(MINUTE_MS, lookups);
+        state.lookup_day.take(DAY_MS, lookups);
+        self.save(&state)
+    }
+
+    /// Holds every counted send until Signal's `limited` wait has passed.
+    fn pause_sends(&self, limited: &RateLimited) -> anyhow::Result<()> {
+        let until = self.clock.now_ms() + signal_wait_ms(limited);
+        let mut state = self.state.lock().expect("limiter state");
+        state.sends_paused_until_ms = state.sends_paused_until_ms.max(until);
+        self.save(&state)
+    }
+
+    fn save(&self, state: &State) -> anyhow::Result<()> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        write_atomically(path, &serde_json::to_vec(state)?)
     }
 }
+
+/// How long to hold off after `limited`, assuming five minutes when Signal
+/// didn't say.
+fn signal_wait_ms(limited: &RateLimited) -> u64 {
+    limited
+        .retry_after
+        .map_or(5 * MINUTE_MS, |wait| wait.as_millis() as u64)
+}
+
+// The provisioning file holds the earliest time of the next attempt, in ms.
 
 /// Records an attempt to link or register at `now_ms` in `path`, or refuses
 /// it when the previous attempt was within the backoff. Call it before every
 /// `Provisioner::link` and `Provisioner::request_code`.
 pub fn begin_provisioning(path: &Path, limits: &Limits, now_ms: u64) -> anyhow::Result<()> {
-    let last = match std::fs::read(path) {
-        Ok(bytes) => Some(
-            serde_json::from_slice::<u64>(&bytes)
-                .with_context(|| format!("unreadable provisioning file {}", path.display()))?,
-        ),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(e).with_context(|| format!("can't read {}", path.display())),
-    };
     let minutes = limits.provisioning_backoff_minutes;
-    if let Some(retry_after) = provisioning_wait(last, now_ms, minutes) {
+    let next = next_provisioning(path)?;
+    if let Some(wait) = next.checked_sub(now_ms).filter(|w| *w > 0) {
         return Err(LimitExceeded {
-            limit: format!("one link or registration attempt every {minutes} minutes"),
-            retry_after,
+            limit: format!(
+                "one link or registration attempt every {minutes} minutes, or longer when \
+                 Signal asks"
+            ),
+            retry_after: Duration::from_millis(wait),
         }
         .into());
     }
-    write_atomically(path, &serde_json::to_vec(&now_ms)?)
+    let next = now_ms + u64::from(minutes.get()) * MINUTE_MS;
+    write_atomically(path, &serde_json::to_vec(&next)?)
 }
 
-/// How long until another attempt is allowed after one at `last_ms`.
-fn provisioning_wait(last_ms: Option<u64>, now_ms: u64, minutes: NonZeroU32) -> Option<Duration> {
-    let until = last_ms? + u64::from(minutes.get()) * MINUTE_MS;
-    let wait = until.checked_sub(now_ms).filter(|w| *w > 0)?;
-    Some(Duration::from_millis(wait))
+/// Holds off the next link or registration attempt in `path` until Signal's
+/// `limited` wait from `now_ms` has passed. Call it when `Provisioner::link`,
+/// `request_code` or `verify_code` fails as rate-limited.
+pub fn defer_provisioning(path: &Path, limited: &RateLimited, now_ms: u64) -> anyhow::Result<()> {
+    let next = next_provisioning(path)?.max(now_ms + signal_wait_ms(limited));
+    write_atomically(path, &serde_json::to_vec(&next)?)
+}
+
+fn next_provisioning(path: &Path) -> anyhow::Result<u64> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .with_context(|| format!("unreadable provisioning file {}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(e).with_context(|| format!("can't read {}", path.display())),
+    }
 }
 
 /// The saved state at `path`, or a fresh one if there's none yet.
@@ -369,7 +468,15 @@ impl SignalBackend for Guarded {
         if counts(&message) {
             self.limiter.admit(self.store.as_ref(), to).await?;
         }
-        self.inner.send(to, message).await
+        let sent = self.inner.send(to, message).await;
+        // The pause holds in memory even when it can't be saved, and the
+        // caller still needs Signal's own refusal, not the save error.
+        if let Some(limited) = sent.as_ref().err().and_then(|e| e.downcast_ref())
+            && let Err(e) = self.limiter.pause_sends(limited)
+        {
+            tracing::warn!("{e:#}; the send pause won't survive a restart");
+        }
+        sent
     }
     async fn contacts(&self) -> anyhow::Result<Vec<Contact>> {
         self.inner.contacts().await
@@ -387,19 +494,21 @@ impl SignalBackend for Guarded {
     async fn upload(&self, file: &SendableFile) -> anyhow::Result<AttachmentRef> {
         self.inner.upload(file).await
     }
-    // NOTE: lookups reach Signal but no person, so they pass unmetered. Signal
-    // rate-limits contact discovery itself and the backend surfaces that; a
-    // lookup budget of our own is a follow-up, not part of this contract.
+    // NOTE: lookups reach no person, but Signal reads heavy contact discovery
+    // as scraping, so they spend a budget of their own, one per number asked.
     async fn discover(
         &self,
         numbers: &[String],
     ) -> anyhow::Result<Vec<(String, Option<ServiceId>)>> {
+        self.limiter.admit_lookups(numbers.len())?;
         self.inner.discover(numbers).await
     }
     async fn lookup_username(&self, username: &str) -> anyhow::Result<Option<ServiceId>> {
+        self.limiter.admit_lookups(1)?;
         self.inner.lookup_username(username).await
     }
     async fn avatar(&self, of: Recipient) -> anyhow::Result<Option<Vec<u8>>> {
+        self.limiter.admit_lookups(1)?;
         self.inner.avatar(of).await
     }
     async fn identities(&self) -> anyhow::Result<Vec<Identity>> {
@@ -882,6 +991,265 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("clean temp dir");
     }
 
+    /// Once Signal rate-limits a send, the next one must be refused here with
+    /// Signal's wait rather than reach Signal again, and go through once that
+    /// wait has passed.
+    #[tokio::test]
+    async fn after_signal_rate_limits_a_send_the_next_is_refused_locally_until_its_wait_passes() {
+        let (registry, clock) = limited(Limits::default());
+        let (ctx, signal) = ctx();
+        let input = json!({"recipient": sid(2).to_string(), "message": "hi"});
+        signal.rate_limit_next_send(relay_signal::RateLimited {
+            message: "slow down".into(),
+            retry_after: Some(Duration::from_secs(600)),
+        });
+        let result = registry.call(&ctx, "send_message", input.clone()).await;
+        assert!(
+            result.is_err(),
+            "Signal's refusal was swallowed: {result:?}"
+        );
+        clock.advance(1_000);
+        let result = registry.call(&ctx, "send_message", input.clone()).await;
+        let Some(e) = refused(&result) else {
+            panic!("a send inside Signal's wait was not refused locally: {result:?}");
+        };
+        assert_eq!(e.retry_after, Duration::from_secs(599), "{e}");
+        assert!(signal.sent().is_empty(), "a refused send reached Signal");
+        clock.advance(599_000);
+        let result = registry.call(&ctx, "send_message", input).await;
+        assert!(
+            result.is_ok(),
+            "send after Signal's wait refused: {result:?}"
+        );
+    }
+
+    /// Signal's wait must outlive the agent, or a client that can crash it
+    /// gets straight back to the endpoint Signal told us to leave alone; with
+    /// no Retry-After from Signal the pause is five minutes.
+    #[tokio::test]
+    async fn a_send_pause_without_a_retry_after_survives_a_restart() {
+        let dir = std::env::temp_dir().join(format!("relay-limits-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("limits.json");
+        let clock = Arc::new(FakeClock::default());
+        let start = || Limiter::new(Limits::default(), clock.clone()).persisted(path.clone());
+        let (ctx, signal) = ctx();
+        let input = json!({"recipient": sid(2).to_string(), "message": "hi"});
+        signal.rate_limit_next_send(relay_signal::RateLimited {
+            message: "slow down".into(),
+            retry_after: None,
+        });
+        let registry = Registry::standard().with_limiter(start());
+        let result = registry.call(&ctx, "send_message", input.clone()).await;
+        assert!(
+            result.is_err(),
+            "Signal's refusal was swallowed: {result:?}"
+        );
+        let registry = Registry::standard().with_limiter(start());
+        let result = registry.call(&ctx, "send_message", input.clone()).await;
+        let Some(e) = refused(&result) else {
+            panic!("a restart lifted Signal's pause: {result:?}");
+        };
+        assert_eq!(e.retry_after, Duration::from_millis(5 * MINUTE_MS), "{e}");
+        assert!(signal.sent().is_empty(), "a refused send reached Signal");
+        clock.advance(5 * MINUTE_MS);
+        let result = registry.call(&ctx, "send_message", input).await;
+        assert!(result.is_ok(), "send after the pause refused: {result:?}");
+        std::fs::remove_dir_all(&dir).expect("clean temp dir");
+    }
+
+    /// Counts the lookups that reach Signal.
+    struct Lookups {
+        inner: FakeSignal,
+        calls: AtomicU64,
+    }
+
+    impl Lookups {
+        fn new() -> Arc<Self> {
+            let inner = FakeSignal::new(Account {
+                service_id: sid(ME),
+                phone_number: None,
+                kind: ProfileKind::Primary,
+                device_name: "test".into(),
+            });
+            Arc::new(Self {
+                inner,
+                calls: AtomicU64::new(0),
+            })
+        }
+
+        fn calls(&self) -> u64 {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl SignalBackend for Lookups {
+        async fn account(&self) -> anyhow::Result<Account> {
+            self.inner.account().await
+        }
+        async fn send(&self, to: Recipient, message: Outgoing) -> anyhow::Result<MessageId> {
+            self.inner.send(to, message).await
+        }
+        async fn contacts(&self) -> anyhow::Result<Vec<Contact>> {
+            self.inner.contacts().await
+        }
+        async fn groups(&self) -> anyhow::Result<Vec<Group>> {
+            self.inner.groups().await
+        }
+        async fn attachment(&self, attachment: &AttachmentRef) -> anyhow::Result<Vec<u8>> {
+            self.inner.attachment(attachment).await
+        }
+        fn incoming(&self) -> BoxStream<'static, anyhow::Result<Incoming>> {
+            self.inner.incoming()
+        }
+        async fn upload(&self, file: &SendableFile) -> anyhow::Result<AttachmentRef> {
+            self.inner.upload(file).await
+        }
+        async fn discover(
+            &self,
+            numbers: &[String],
+        ) -> anyhow::Result<Vec<(String, Option<ServiceId>)>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.discover(numbers).await
+        }
+        async fn lookup_username(&self, username: &str) -> anyhow::Result<Option<ServiceId>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.lookup_username(username).await
+        }
+        async fn avatar(&self, of: Recipient) -> anyhow::Result<Option<Vec<u8>>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.avatar(of).await
+        }
+        async fn identities(&self) -> anyhow::Result<Vec<Identity>> {
+            self.inner.identities().await
+        }
+        async fn devices(&self) -> anyhow::Result<Vec<Device>> {
+            self.inner.devices().await
+        }
+    }
+
+    /// The backend `limiter` guards, and how many lookups reach Signal.
+    fn guarded_lookups(limiter: &Arc<Limiter>) -> (Arc<dyn SignalBackend>, Arc<Lookups>) {
+        let (ctx, _) = ctx();
+        let lookups = Lookups::new();
+        let ctx = ToolContext {
+            signal: lookups.clone(),
+            ..ctx
+        };
+        (guard(Some(limiter), &ctx).signal, lookups)
+    }
+
+    /// A client looping on a status or profile lookup must hit our own budget
+    /// and stop reaching Signal, which reads heavy lookups as scraping; each
+    /// refusal must say when the next lookup is free.
+    #[tokio::test]
+    async fn a_looping_lookup_is_refused_before_signal_once_the_burst_is_spent() {
+        let limiter = Arc::new(Limiter::new(
+            Limits::default(),
+            Arc::new(FakeClock::default()),
+        ));
+        let (guarded, lookups) = guarded_lookups(&limiter);
+        let mut refusals = vec![];
+        for _ in 0..60 {
+            if let Err(e) = guarded.lookup_username("alice.01").await {
+                refusals.push(e);
+            }
+        }
+        assert_eq!(lookups.calls(), 10, "lookups past the burst reached Signal");
+        let Some(e) = refusals
+            .first()
+            .and_then(|e| e.downcast_ref::<LimitExceeded>())
+        else {
+            panic!("the loop was not refused by the budget: {refusals:?}");
+        };
+        assert_eq!(e.retry_after, Duration::from_secs(6), "{e}");
+    }
+
+    /// Discovery must spend one lookup per number asked, so batching numbers
+    /// into one call can't get around the daily budget.
+    #[tokio::test]
+    async fn discover_spends_the_daily_lookup_budget_per_number() {
+        let clock = Arc::new(FakeClock::default());
+        let limiter = Arc::new(Limiter::new(Limits::default(), clock.clone()));
+        let (guarded, lookups) = guarded_lookups(&limiter);
+        let numbers: Vec<String> = (0..10).map(|n| format!("+1555000000{n}")).collect();
+        for i in 0..5 {
+            let result = guarded.discover(&numbers).await;
+            assert!(
+                result.is_ok(),
+                "batch {i} refused under the budget: {result:?}"
+            );
+            clock.advance(MINUTE_MS);
+        }
+        let result = guarded.discover(&numbers[..1]).await;
+        let Some(e) = result
+            .as_ref()
+            .err()
+            .and_then(|e| e.downcast_ref::<LimitExceeded>())
+        else {
+            panic!("the 51st number in a day was not refused: {result:?}");
+        };
+        assert_eq!(
+            e.retry_after,
+            Duration::from_millis(DAY_MS / 50 - 5 * MINUTE_MS),
+            "{e}"
+        );
+        assert_eq!(lookups.calls(), 5, "a refused discovery reached Signal");
+    }
+
+    /// A discovery bigger than the burst can never fit, so a retry time would
+    /// be a lie the client loops on: it must be refused as too large instead,
+    /// without reaching Signal or spending the budget.
+    #[tokio::test]
+    async fn a_discovery_bigger_than_the_burst_is_refused_as_too_large() {
+        let limiter = Arc::new(Limiter::new(
+            Limits::default(),
+            Arc::new(FakeClock::default()),
+        ));
+        let (guarded, lookups) = guarded_lookups(&limiter);
+        let numbers: Vec<String> = (0..11).map(|n| format!("+155500000{n:02}")).collect();
+        let result = guarded.discover(&numbers).await;
+        let Err(e) = &result else {
+            panic!("11 numbers fit a burst of 10: {result:?}");
+        };
+        assert!(
+            e.downcast_ref::<LimitExceeded>().is_none(),
+            "refused with a retry time it can never meet: {e:#}"
+        );
+        assert!(format!("{e:#}").contains("at most 10"), "{e:#}");
+        assert_eq!(lookups.calls(), 0, "an oversized discovery reached Signal");
+        let result = guarded.discover(&numbers[..10]).await;
+        assert!(result.is_ok(), "the refusal spent the budget: {result:?}");
+    }
+
+    /// Restarting the agent must not hand a looping client a fresh lookup
+    /// budget.
+    #[tokio::test]
+    async fn the_lookup_budget_survives_a_restart() {
+        let dir = std::env::temp_dir().join(format!("relay-limits-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("limits.json");
+        let clock = Arc::new(FakeClock::default());
+        let start =
+            || Arc::new(Limiter::new(Limits::default(), clock.clone()).persisted(path.clone()));
+        let (guarded, _) = guarded_lookups(&start());
+        for i in 0..10 {
+            let result = guarded.lookup_username("alice.01").await;
+            assert!(result.is_ok(), "lookup {i} refused: {result:?}");
+        }
+        let (guarded, lookups) = guarded_lookups(&start());
+        let result = guarded.lookup_username("alice.01").await;
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|e| e.downcast_ref::<LimitExceeded>().is_some()),
+            "a restart refilled the lookup burst: {result:?}"
+        );
+        assert_eq!(lookups.calls(), 0, "a refused lookup reached Signal");
+        std::fs::remove_dir_all(&dir).expect("clean temp dir");
+    }
+
     /// A settings file that names only some limits must keep the conservative
     /// defaults for the rest, and must not be able to switch a rate off.
     #[test]
@@ -897,6 +1265,8 @@ mod tests {
         for bad in [
             json!({"burst_per_minute": 0}),
             json!({"per_hour": 0}),
+            json!({"lookups_per_day": 0}),
+            json!({"lookup_burst_per_minute": 0}),
             json!({"per_houre": 5}),
         ] {
             let parsed = serde_json::from_value::<Limits>(bad.clone());
