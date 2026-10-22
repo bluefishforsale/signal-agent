@@ -176,6 +176,10 @@ impl Tool for ListAttachments {
 
 pub struct GetAttachment;
 
+/// The largest file get_attachment returns: 5 MiB, the most an image block in
+/// the Claude API accepts, and already about 7 MB once base64'd.
+const MAX_ATTACHMENT_BYTES: u64 = 5 * 1024 * 1024;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GetAttachmentInput {
@@ -190,7 +194,8 @@ impl Tool for GetAttachment {
     fn description(&self) -> &'static str {
         "Fetch one received attachment: its id, content_type, file_name and size (bytes), and \
          the file itself as base64. filename is an attachment id from list_attachments or a \
-         message's attachments. Nothing is sent."
+         message's attachments. Files over 5 MiB are refused rather than returned. Nothing is \
+         sent."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -220,6 +225,7 @@ impl Tool for GetAttachment {
             .with_context(|| {
                 format!("no stored message has an attachment with id \"{id}\"; list_attachments shows them")
             })?;
+        too_big(&id, attachment.size)?;
         let bytes = ctx.signal.attachment(&attachment).await?;
         Ok(json!({
             "id": attachment.id,
@@ -229,6 +235,15 @@ impl Tool for GetAttachment {
             "base64": STANDARD.encode(bytes),
         }))
     }
+}
+
+fn too_big(id: &str, size: u64) -> Result<(), ToolError> {
+    if size <= MAX_ATTACHMENT_BYTES {
+        return Ok(());
+    }
+    Err(ToolError::InvalidInput(format!(
+        "attachment \"{id}\" is {size} bytes, over get_attachment's 5 MiB cap"
+    )))
 }
 
 /// An attachment in stored history, with the message that carried it.
@@ -267,7 +282,7 @@ mod tests {
     use relay_signal::{Account, Contact, FakeSignal, Group};
     use relay_store::MemoryStore;
 
-    use crate::{Registry, ToolContext, testing::*};
+    use crate::{Registry, ToolContext, ToolError, testing::*};
     use relay_core::prelude::*;
 
     /// A read-only linked profile whose Signal knows `signal`'s seeded state.
@@ -474,6 +489,23 @@ mod tests {
                 "size": 3,
                 "base64": "/wD+",
             })
+        );
+    }
+
+    /// A 200 MB video base64'd into one MCP response would flood the client,
+    /// so anything declared over the cap is refused before it's downloaded.
+    #[tokio::test]
+    async fn get_attachment_refuses_a_file_declared_over_the_cap() {
+        let ctx = ctx_of(|s| s.with_attachment("video", vec![0; 3]));
+        let mut message = with_attachments(2, 100, &["video"]);
+        message.attachments[0].size = super::MAX_ATTACHMENT_BYTES + 1;
+        ctx.store.insert(&message).await.unwrap();
+        let result = Registry::standard()
+            .call(&ctx, "get_attachment", json!({"filename": "video"}))
+            .await;
+        assert!(
+            matches!(&result, Err(ToolError::InvalidInput(e)) if e.contains("5 MiB")),
+            "got {result:?}"
         );
     }
 }
