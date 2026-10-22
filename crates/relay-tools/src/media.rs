@@ -233,7 +233,7 @@ impl Tool for SendGroupSticker {
     }
 }
 
-fn sticker_id_schema() -> Value {
+pub(crate) fn sticker_id_schema() -> Value {
     json!({
         "type": "integer",
         "minimum": 0,

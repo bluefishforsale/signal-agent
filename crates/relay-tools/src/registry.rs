@@ -66,6 +66,7 @@ impl Registry {
             .with(media::SendSticker)
             .with(media::SendGroupSticker)
             .with(stickers::ListStickerPacks)
+            .with(stickers::GetSticker)
             .with(lookup::GetProfile)
             .with(lookup::GetUserStatus)
     }
