@@ -50,6 +50,7 @@ impl Registry {
             .with(pins::UnpinMessage)
             .with(polls::CreatePoll)
             .with(polls::VotePoll)
+            .with(polls::TerminatePoll)
     }
 
     /// Applies account-safety limits to every send a tool makes.

@@ -178,6 +178,58 @@ impl Tool for VotePoll {
     }
 }
 
+pub struct TerminatePoll;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TerminatePollInput {
+    recipient: String,
+    poll_timestamp: Timestamp,
+}
+
+#[async_trait]
+impl Tool for TerminatePoll {
+    fn name(&self) -> &'static str {
+        "terminate_poll"
+    }
+    fn description(&self) -> &'static str {
+        "Close a poll you created, so no one can vote on it any more. recipient is the \
+         conversation; poll_timestamp names your poll, as create_poll or get_conversation \
+         returns it, and it must be stored locally in that conversation. Only your own polls \
+         can be closed. Irreversible. Sends to Signal; nothing is stored locally."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "recipient": recipient_schema(),
+                "poll_timestamp": Timestamp::schema("Your poll to close"),
+            },
+            "required": ["recipient", "poll_timestamp"],
+            "additionalProperties": false,
+        })
+    }
+    fn writes(&self) -> bool {
+        true
+    }
+    async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
+        let input: TerminatePollInput = parse(input)?;
+        let to = recipient(ctx, &input.recipient).await?;
+        // NOTE: the poll is always this account's own. Signal's terminate names
+        // only a timestamp, so taking an author from the caller couldn't close
+        // anyone else's poll anyway, only pass a check meant to stop that.
+        let poll = MessageId {
+            author: ctx.signal.account().await?.service_id,
+            sent_at_ms: input.poll_timestamp.ms(),
+        };
+        check_target(ctx, to, poll).await?;
+        ctx.signal
+            .send(to, Outgoing::PollTerminate { poll })
+            .await?;
+        Ok(json!({ "status": "closed" }))
+    }
+}
+
 /// A poll option's position, from 0.
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(try_from = "u64")]
@@ -214,7 +266,7 @@ mod tests {
     use relay_signal::Outgoing;
     use serde_json::json;
 
-    use crate::{Registry, testing::*};
+    use crate::{Registry, ToolError, testing::*};
     use relay_core::prelude::*;
 
     /// A poll must reach the conversation with its options in order, and be
@@ -294,6 +346,51 @@ mod tests {
         assert!(
             counts.len() == 2 && counts[1] > counts[0],
             "vote counts {counts:?}"
+        );
+    }
+
+    /// Only a poll's creator can close it. The wire form names just a
+    /// timestamp, so the tool must aim at this account's own poll and refuse
+    /// before sending when the stored message there is someone else's.
+    #[tokio::test]
+    async fn terminate_poll_closes_only_this_accounts_own_poll() {
+        let (ctx, signal) = ctx(AccessMode::Full, ProfileKind::Linked);
+        let dm = Recipient::Contact(sid(2));
+        let mine = Message {
+            id: MessageId {
+                author: sid(ME),
+                sent_at_ms: 7,
+            },
+            sender: sid(ME),
+            from_me: true,
+            conversation: dm,
+            ..incoming(ME, 7, "Lunch?")
+        };
+        ctx.store.insert(&mine).await.unwrap();
+        ctx.store.insert(&incoming(2, 42, "Dinner?")).await.unwrap();
+        let registry = Registry::standard();
+        let theirs = registry
+            .call(
+                &ctx,
+                "terminate_poll",
+                json!({"recipient": sid(2).to_string(), "poll_timestamp": 42}),
+            )
+            .await;
+        assert!(
+            matches!(theirs, Err(ToolError::InvalidInput(_))),
+            "closing their poll gave {theirs:?}"
+        );
+        registry
+            .call(
+                &ctx,
+                "terminate_poll",
+                json!({"recipient": sid(2).to_string(), "poll_timestamp": 7}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            signal.sent(),
+            [(dm, Outgoing::PollTerminate { poll: mine.id })]
         );
     }
 }
