@@ -261,9 +261,30 @@ pub(crate) fn content_body(
             }),
             ..Default::default()
         })),
+        Outgoing::Pin {
+            target,
+            duration_secs,
+        } => ContentBody::DataMessage(data(DataMessage {
+            pin_message: Some(data_message::PinMessage {
+                target_author_aci_binary: Some(aci(target.author).service_id_binary()),
+                target_sent_timestamp: Some(target.sent_at_ms),
+                pin_duration: Some(match duration_secs {
+                    Some(secs) => {
+                        data_message::pin_message::PinDuration::PinDurationSeconds(secs.get())
+                    }
+                    None => data_message::pin_message::PinDuration::PinDurationForever(true),
+                }),
+            }),
+            ..Default::default()
+        })),
+        Outgoing::Unpin { target } => ContentBody::DataMessage(data(DataMessage {
+            unpin_message: Some(data_message::UnpinMessage {
+                target_author_aci_binary: Some(aci(target.author).service_id_binary()),
+                target_sent_timestamp: Some(target.sent_at_ms),
+            }),
+            ..Default::default()
+        })),
         Outgoing::Sticker { .. }
-        | Outgoing::Pin { .. }
-        | Outgoing::Unpin { .. }
         | Outgoing::PollCreate { .. }
         | Outgoing::PollVote { .. }
         | Outgoing::PollTerminate { .. } => {
@@ -894,6 +915,52 @@ mod tests {
                 other => unreachable!("not generated: {other:?}"),
             };
             prop_assert_eq!(got, Some(expected));
+        }
+    }
+
+    /// The DataMessage `content_body` puts on the wire for `message`.
+    fn data_of(message: &Outgoing) -> DataMessage {
+        match content_body(message, 9, None).expect("converts") {
+            ContentBody::DataMessage(data) => data,
+            other => panic!("{message:?} went out as {other:?}"),
+        }
+    }
+
+    proptest! {
+        /// A pin names its target by author and timestamp, as Signal's apps
+        /// match it, for the duration asked; no duration pins until unpinned,
+        /// which the wire spells as "forever", not as a missing duration.
+        #[test]
+        fn a_pin_names_its_target_and_no_duration_means_forever(
+            target in message_id_by(ALICE),
+            duration_secs in proptest::option::of(1u32..),
+        ) {
+            let duration_secs = duration_secs.and_then(std::num::NonZeroU32::new);
+            let pin = data_of(&Outgoing::Pin { target, duration_secs })
+                .pin_message
+                .expect("a pin message");
+            prop_assert_eq!(pin.target_author_aci_binary, Some(ALICE.as_bytes().to_vec()));
+            prop_assert_eq!(pin.target_sent_timestamp, Some(target.sent_at_ms));
+            let expected = match duration_secs {
+                Some(secs) => data_message::pin_message::PinDuration::PinDurationSeconds(secs.get()),
+                None => data_message::pin_message::PinDuration::PinDurationForever(true),
+            };
+            prop_assert_eq!(pin.pin_duration, Some(expected));
+        }
+    }
+
+    proptest! {
+        /// An unpin must name the same target a pin did, or the pin stays up.
+        #[test]
+        fn an_unpin_names_its_target_like_the_pin(target in message_id_by(ALICE)) {
+            let unpin = data_of(&Outgoing::Unpin { target })
+                .unpin_message
+                .expect("an unpin message");
+            let pin = data_of(&Outgoing::Pin { target, duration_secs: None })
+                .pin_message
+                .expect("a pin message");
+            prop_assert_eq!(unpin.target_author_aci_binary, pin.target_author_aci_binary);
+            prop_assert_eq!(unpin.target_sent_timestamp, pin.target_sent_timestamp);
         }
     }
 
