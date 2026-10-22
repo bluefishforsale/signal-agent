@@ -26,6 +26,7 @@ impl Registry {
             .with(read::SearchMessages)
             .with(local::ExportMessages)
             .with(local::MarkAsUnread)
+            .with(local::ClearLocalStore)
     }
 
     pub fn with(mut self, tool: impl Tool + 'static) -> Self {

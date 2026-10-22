@@ -134,6 +134,61 @@ impl Tool for MarkAsUnread {
     }
 }
 
+pub struct ClearLocalStore;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClearLocalStoreInput {
+    confirm: bool,
+}
+
+#[async_trait]
+impl Tool for ClearLocalStore {
+    fn name(&self) -> &'static str {
+        "clear_local_store"
+    }
+    fn description(&self) -> &'static str {
+        "Delete ALL messages from the local store. confirm must be exactly true, otherwise \
+         nothing is deleted and an error is returned. Local only: nothing is deleted from \
+         Signal, your phone or other devices. Irreversible except by importing or receiving \
+         again. Returns {deleted, status}. Use prune_store to drop only old messages."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "confirm": {
+                    "type": "boolean",
+                    "description": "Must be true to proceed; guards against accidental deletion",
+                },
+            },
+            "required": ["confirm"],
+            "additionalProperties": false,
+        })
+    }
+    // NOTE: true although nothing reaches Signal. This destroys history the
+    // account can't send back, so a read-only profile must not be able to.
+    fn writes(&self) -> bool {
+        true
+    }
+    async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
+        let ClearLocalStoreInput { confirm } = parse(input)?;
+        if !confirm {
+            return Err(ToolError::InvalidInput(
+                "clear_local_store deletes every stored message; pass confirm: true to proceed"
+                    .into(),
+            ));
+        }
+        let deleted = ctx.store.prune(EVERYTHING).await?;
+        Ok(json!({ "deleted": deleted, "status": "cleared" }))
+    }
+}
+
+/// A prune cutoff later than any stored message.
+// NOTE: not u64::MAX. The SQLCipher store binds the cutoff as an i64 and
+// refuses anything larger, so u64::MAX would fail the clear outright.
+const EVERYTHING: u64 = i64::MAX as u64;
+
 /// The most ids one call takes, matching the largest page a read tool returns.
 const MAX_IDS: usize = 500;
 
@@ -183,7 +238,7 @@ fn csv_field(s: &str) -> String {
 mod tests {
     use serde_json::{Value, json};
 
-    use crate::{Registry, testing::*};
+    use crate::{Registry, ToolError, testing::*};
     use relay_core::prelude::*;
 
     /// An export must hold exactly what the filters ask for, oldest first, in
@@ -263,5 +318,49 @@ mod tests {
             .map(|m| m["body"].clone())
             .collect();
         assert_eq!(bodies, [json!("a")], "{again}");
+    }
+
+    /// Wiping history must take an explicit yes: confirm false is refused
+    /// with a reason and leaves every message where it was.
+    #[tokio::test]
+    async fn clear_local_store_without_confirm_leaves_the_store_untouched() {
+        let (ctx, _) = ctx(AccessMode::Full, ProfileKind::Primary);
+        ctx.store
+            .insert(&incoming(2, 1000, "keep me"))
+            .await
+            .unwrap();
+        let result = Registry::standard()
+            .call(&ctx, "clear_local_store", json!({"confirm": false}))
+            .await;
+        let Err(ToolError::InvalidInput(why)) = result else {
+            panic!("unconfirmed clear gave {result:?}");
+        };
+        assert!(
+            why.contains("confirm"),
+            "reason doesn't mention confirm: {why}"
+        );
+        assert_eq!(
+            ctx.store.stats().await.unwrap().messages,
+            1,
+            "store changed"
+        );
+    }
+
+    /// A confirmed clear empties the store, however new the newest message,
+    /// and reports how many it removed.
+    #[tokio::test]
+    async fn clear_local_store_with_confirm_removes_every_message() {
+        let (ctx, _) = ctx(AccessMode::Full, ProfileKind::Primary);
+        ctx.store.insert(&incoming(2, 1000, "old")).await.unwrap();
+        ctx.store
+            .insert(&incoming(3, 4_102_444_799_000, "2099"))
+            .await
+            .unwrap();
+        let out = Registry::standard()
+            .call(&ctx, "clear_local_store", json!({"confirm": true}))
+            .await
+            .unwrap();
+        assert_eq!(out, json!({"deleted": 2, "status": "cleared"}));
+        assert_eq!(ctx.store.stats().await.unwrap().messages, 0, "{out}");
     }
 }
