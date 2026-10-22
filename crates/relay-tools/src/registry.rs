@@ -49,6 +49,7 @@ impl Registry {
             .with(pins::PinMessage)
             .with(pins::UnpinMessage)
             .with(polls::CreatePoll)
+            .with(polls::VotePoll)
     }
 
     /// Applies account-safety limits to every send a tool makes.
