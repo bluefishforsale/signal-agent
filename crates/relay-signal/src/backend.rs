@@ -1,7 +1,7 @@
 //! The contract the presage implementation fulfills. Kept to what the agent
 //! needs; protocol detail stays below this line.
 
-use std::num::NonZeroU32;
+use std::{num::NonZeroU32, time::Duration};
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -185,6 +185,30 @@ pub enum Incoming {
     IdentityChanged {
         contact: ServiceId,
     },
+}
+
+/// Signal refused a request as rate-limited, or wants proof that a person is
+/// behind the account before it accepts more. Nothing retries the request.
+// NOTE: this is the one typed error at the Signal seam, because tools and setup
+// must tell it apart: retrying a request Signal rate-limited is how accounts
+// get flagged. Everything else stays anyhow.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "Signal refused this as rate-limited, and it was not retried ({message}). {}",
+    wait_hint(*retry_after)
+)]
+pub struct RateLimited {
+    /// What Signal said.
+    pub message: String,
+    /// How long Signal asked to wait, when it said.
+    pub retry_after: Option<Duration>,
+}
+
+fn wait_hint(retry_after: Option<Duration>) -> String {
+    match retry_after {
+        Some(wait) => format!("Try again in {}s", wait.as_secs()),
+        None => "Wait a while before trying again".into(),
+    }
 }
 
 /// A registered account's live connection to Signal.

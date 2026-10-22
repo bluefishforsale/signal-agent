@@ -342,9 +342,9 @@ mod tests {
     use relay_signal::Outgoing;
     use serde_json::json;
 
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
-    use relay_signal::{Account, FakeSignal, Group};
+    use relay_signal::{Account, FakeSignal, Group, RateLimited};
     use relay_store::MemoryStore;
 
     use crate::{Registry, ToolContext, ToolError, testing::*};
@@ -607,6 +607,37 @@ mod tests {
             "got {result:?}"
         );
         assert!(signal.sent().is_empty(), "{:?}", signal.sent());
+        let stats = ctx.store.stats().await.unwrap();
+        assert_eq!(stats.messages, 0, "{stats:?}");
+    }
+
+    /// Signal rate-limiting a send must reach the MCP client as a clear error
+    /// with Signal's wait, after exactly one attempt: a tool that retried, or
+    /// stored the message as sent, would keep an AI client hammering Signal.
+    #[tokio::test]
+    async fn a_rate_limited_send_reports_signals_wait_after_one_attempt() {
+        let (ctx, signal) = ctx(AccessMode::Full, ProfileKind::Linked);
+        signal.rate_limit_next_send(RateLimited {
+            message: "Rate limit exceeded: retry after 30s".into(),
+            retry_after: Some(Duration::from_secs(30)),
+        });
+        let result = Registry::standard()
+            .call(
+                &ctx,
+                "send_message",
+                json!({"recipient": sid(2).to_string(), "message": "hi"}),
+            )
+            .await;
+        let Err(ToolError::Internal(e)) = &result else {
+            panic!("expected a refusal, got {result:?}");
+        };
+        assert!(e.downcast_ref::<RateLimited>().is_some(), "untyped: {e:#}");
+        let shown = result.unwrap_err().to_string();
+        assert!(
+            shown.contains("rate-limited") && shown.contains("30s"),
+            "client would see {shown:?}"
+        );
+        assert_eq!(signal.attempts(), 1, "{:?}", signal.sent());
         let stats = ctx.store.stats().await.unwrap();
         assert_eq!(stats.messages, 0, "{stats:?}");
     }

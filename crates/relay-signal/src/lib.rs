@@ -10,7 +10,7 @@ mod presage_backend;
 
 pub use backend::{
     Account, Contact, Device, Group, Identity, Incoming, LinkEvent, Outgoing, Provisioner,
-    RegistrationStep, SignalBackend, Trust,
+    RateLimited, RegistrationStep, SignalBackend, Trust,
 };
 pub use fake::FakeSignal;
 pub use files::{SendRoots, SendableFile};
@@ -19,6 +19,6 @@ pub use presage_backend::{PresageProvisioner, PresageSignal, Servers};
 pub mod prelude {
     pub use crate::{
         Account, Contact, Device, FakeSignal, Group, Identity, Incoming, LinkEvent, Outgoing,
-        Provisioner, RegistrationStep, SendRoots, SendableFile, SignalBackend, Trust,
+        Provisioner, RateLimited, RegistrationStep, SendRoots, SendableFile, SignalBackend, Trust,
     };
 }

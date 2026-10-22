@@ -1047,6 +1047,43 @@ mod tests {
         assert!(matches!(done, SetupState::Done { .. }), "{done:?}");
     }
 
+    /// Signal rate-limiting a code request must show Signal's own message and
+    /// wait, and must not be retried: not by the driver, and not by Retry,
+    /// which only goes back to the number screen. Asking again unprompted is
+    /// how a number gets flagged.
+    #[tokio::test]
+    async fn a_rate_limited_code_request_shows_signals_wait_and_is_not_resent() {
+        let limited = relay_signal::RateLimited {
+            message: "verification session rate limited; next SMS in 3600s".into(),
+            retry_after: Some(std::time::Duration::from_secs(3600)),
+        };
+        let world = World::new().code(Err(limited.into()));
+        let mut h = Harness::new(&world);
+        h.send(SetupEvent::AccountChosen {
+            choice: AccountChoice::OwnNumber,
+        })
+        .await;
+        let failed = h
+            .send(SetupEvent::NumberEntered {
+                number: NUMBER.into(),
+            })
+            .await;
+        let SetupState::Failed { message, .. } = &failed else {
+            panic!("a rate-limited request left {failed:?}");
+        };
+        assert!(
+            message.contains("next SMS in 3600s") && message.contains("Try again in 3600s"),
+            "Signal's wait not shown: {message}"
+        );
+        assert_eq!(h.send(SetupEvent::Retry).await, SetupState::EnterNumber);
+        let requests = world
+            .log()
+            .into_iter()
+            .filter(|e| e.starts_with("request code"))
+            .count();
+        assert_eq!(requests, 1, "{:?}", world.log());
+    }
+
     /// Every step of the own-number path that fails (requesting a code,
     /// verifying it, restarting Claude Desktop) can be retried, and a mistyped
     /// code is retried on the same Signal session rather than a new one.

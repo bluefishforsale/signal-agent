@@ -16,7 +16,8 @@ use relay_core::prelude::*;
 use tokio::sync::mpsc;
 
 use crate::{
-    Account, Contact, Device, Group, Identity, Incoming, Outgoing, SendableFile, SignalBackend,
+    Account, Contact, Device, Group, Identity, Incoming, Outgoing, RateLimited, SendableFile,
+    SignalBackend,
 };
 
 /// A fake registered account. Build one with `FakeSignal::new`, seed it with
@@ -35,6 +36,8 @@ struct State {
     groups: Vec<Group>,
     attachments: HashMap<String, Vec<u8>>,
     sent: Vec<(Recipient, Outgoing)>,
+    attempts: usize,
+    rate_limit_next_send: Option<RateLimited>,
     registered: HashMap<String, ServiceId>,
     usernames: HashMap<String, ServiceId>,
     avatars: HashMap<Recipient, Vec<u8>>,
@@ -114,6 +117,17 @@ impl FakeSignal {
         self.state().sent.clone()
     }
 
+    /// Sends that reached Signal so far, whether it accepted them or not.
+    pub fn attempts(&self) -> usize {
+        self.state().attempts
+    }
+
+    /// Makes the next send that reaches Signal fail with `limited`, as Signal's
+    /// rate limiting would.
+    pub fn rate_limit_next_send(&self, limited: RateLimited) {
+        self.state().rate_limit_next_send = Some(limited);
+    }
+
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().expect("fake signal state")
     }
@@ -166,7 +180,13 @@ impl SignalBackend for FakeSignal {
             bail!("not a member of group {id}");
         }
         self.refuse_what_signal_would(to, &message)?;
-        self.state().sent.push((to, message));
+        let mut state = self.state();
+        state.attempts += 1;
+        if let Some(limited) = state.rate_limit_next_send.take() {
+            return Err(limited.into());
+        }
+        state.sent.push((to, message));
+        drop(state);
         Ok(MessageId {
             author: self.account.service_id,
             sent_at_ms: self.clock_ms.fetch_add(1, Ordering::Relaxed),
@@ -351,7 +371,8 @@ mod tests {
     }
 
     /// Text can only carry attachments this backend issued; a made-up ref
-    /// would fail in the real backend's pointer decoding.
+    /// would fail in the real backend's pointer decoding, before reaching
+    /// Signal, so it must not count as an attempt either.
     #[tokio::test]
     async fn text_with_an_attachment_never_uploaded_fails() {
         let signal = fake();
@@ -365,6 +386,11 @@ mod tests {
         let result = signal.send(to, text_with(vec![forged])).await;
         assert!(result.is_err(), "sent a forged attachment");
         assert!(signal.sent().is_empty(), "failed send was recorded");
+        assert_eq!(
+            signal.attempts(),
+            0,
+            "a local refusal counted as an attempt"
+        );
     }
 
     /// A sticker needs its pack installed and the sticker in it, as the real
@@ -418,6 +444,29 @@ mod tests {
                 ("+15550000003".to_owned(), Some(bob)),
             ]
         );
+    }
+
+    /// A rate-limited send must fail with the typed error callers match on,
+    /// reach Signal exactly once, and leave the next send unaffected, so tool
+    /// tests can tell "refused once" from "retried".
+    #[tokio::test]
+    async fn a_rate_limited_send_is_refused_once_and_counted_as_one_attempt() {
+        let signal = fake();
+        let limited = RateLimited {
+            message: "Rate limit exceeded".into(),
+            retry_after: Some(std::time::Duration::from_secs(30)),
+        };
+        signal.rate_limit_next_send(limited.clone());
+        let to = Recipient::Contact(ServiceId::new(Uuid::from_u128(2)));
+        let typing = Outgoing::Typing { started: true };
+        let err = signal
+            .send(to, typing.clone())
+            .await
+            .expect_err("a rate-limited send went through");
+        assert_eq!(err.downcast_ref::<RateLimited>(), Some(&limited), "{err:#}");
+        assert!(signal.sent().is_empty(), "refused send recorded as sent");
+        signal.send(to, typing.clone()).await.expect("next send");
+        assert_eq!(signal.attempts(), 2, "{:?}", signal.sent());
     }
 
     /// Sending to a group you're not in must fail, matching Signal.
