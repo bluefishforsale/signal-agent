@@ -3,6 +3,7 @@
 
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD};
+use relay_signal::Contact;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -28,11 +29,12 @@ impl Tool for GetProfile {
         "get_profile"
     }
     fn description(&self) -> &'static str {
-        "Check one phone number against Signal's servers. number is E.164 and need not be a \
-         contact. Returns number, service_id (the Signal account's id, null when the number \
-         isn't registered or hides itself from discovery) and registered. The lookup carries \
-         no profile name; list_contacts has names for contacts and get_avatar their picture. \
-         Use get_user_status to check several numbers or usernames at once. Nothing is sent."
+        "Look up one phone number (E.164) among this account's known contacts. Returns \
+         number, service_id (the Signal account's id) and registered true for a contact. A \
+         number that isn't a known contact comes back with service_id and registered null and \
+         a note: asking Signal's servers about arbitrary numbers isn't supported in this \
+         version. list_contacts has contacts' names and get_avatar their picture. Use \
+         get_user_status to check several numbers or usernames at once. Nothing is sent."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -48,16 +50,8 @@ impl Tool for GetProfile {
     async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
         let GetProfileInput { number } = parse(input)?;
         let number = e164(number)?;
-        let found = ctx.signal.discover(std::slice::from_ref(&number)).await?;
-        let service_id = found
-            .into_iter()
-            .find_map(|(n, id)| (n == number).then_some(id))
-            .flatten();
-        Ok(json!({
-            "number": number,
-            "service_id": service_id.map(|id| id.to_string()),
-            "registered": service_id.is_some(),
-        }))
+        let contacts = ctx.signal.contacts().await?;
+        Ok(by_number(&contacts, number))
     }
 }
 
@@ -71,9 +65,9 @@ struct GetUserStatusInput {
 }
 
 impl GetUserStatus {
-    // NOTE: discovery reaches Signal's servers, which rate-limit it per
-    // account. Without a cap one looping client could spend that budget in a
-    // few calls and get the account's lookups throttled.
+    // NOTE: username lookups reach Signal's servers, which rate-limit them
+    // per account. Without a cap one looping client could spend that budget
+    // in a few calls and get the account's lookups throttled.
     const MAX_LOOKUPS: usize = 50;
 
     fn list_schema(items: Value, description: &str) -> Value {
@@ -111,9 +105,11 @@ impl Tool for GetUserStatus {
         "Check whether phone numbers or Signal usernames are registered on Signal, in one \
          batch. recipients are E.164 numbers and usernames are Signal usernames (alice.42); \
          give at least one of the two, each up to 50. Returns results, one per input in the \
-         order given, numbers first: number or username, service_id (null when not \
-         registered) and registered. A number that hides itself from discovery shows as not \
-         registered. Nothing is sent."
+         order given, numbers first: number or username, service_id and registered. Numbers \
+         are checked against this account's known contacts only; one that isn't a contact \
+         comes back with service_id and registered null and a note, because asking Signal \
+         about arbitrary numbers isn't supported in this version. Usernames are looked up on \
+         Signal's servers. Nothing is sent."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -149,16 +145,11 @@ impl Tool for GetUserStatus {
             .into_iter()
             .map(|u| non_blank("usernames", u))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut results = vec![];
-        if !numbers.is_empty() {
-            for (number, id) in ctx.signal.discover(&numbers).await? {
-                results.push(json!({
-                    "number": number,
-                    "service_id": id.map(|id| id.to_string()),
-                    "registered": id.is_some(),
-                }));
-            }
-        }
+        let contacts = ctx.signal.contacts().await?;
+        let mut results: Vec<_> = numbers
+            .into_iter()
+            .map(|n| by_number(&contacts, n))
+            .collect();
         for username in usernames {
             let id = ctx.signal.lookup_username(&username).await?;
             results.push(json!({
@@ -169,6 +160,30 @@ impl Tool for GetUserStatus {
         }
         Ok(json!({ "results": results }))
     }
+}
+
+/// What the account knows about `number`, from its contacts alone.
+// NOTE: never falls back to SignalBackend::discover. Contact discovery is off
+// in v2.0 (build cost, partial results, anti-abuse risk), so a stranger's
+// number gets an explicit "not supported" answer instead of an error or a
+// false "not registered".
+fn by_number(contacts: &[Contact], number: String) -> Value {
+    let Some(contact) = contacts
+        .iter()
+        .find(|c| c.phone_number.as_deref() == Some(number.as_str()))
+    else {
+        return json!({
+            "number": number,
+            "service_id": null,
+            "registered": null,
+            "note": "not a known contact; number lookup isn't supported in this version",
+        });
+    };
+    json!({
+        "number": number,
+        "service_id": contact.service_id.to_string(),
+        "registered": true,
+    })
 }
 
 pub struct ListDevices;
@@ -534,11 +549,24 @@ mod tests {
         );
     }
 
-    /// The point of get_profile is a number nobody in the contacts has yet,
-    /// so it must ask Signal rather than refuse a stranger's number.
+    fn known(n: u128, number: &str) -> Contact {
+        Contact {
+            service_id: sid(n),
+            name: None,
+            phone_number: Some(number.into()),
+        }
+    }
+
+    /// Number discovery isn't in this version, so a number resolves only
+    /// against the account's contacts. A stranger's number is an answer that
+    /// says so, not an error, and Signal's discovery is never asked even when
+    /// it would have known the number.
     #[tokio::test]
-    async fn get_profile_looks_up_a_number_that_is_not_a_contact() {
-        let ctx = ctx_of(|s| s.with_registered("+15550000009", sid(9)));
+    async fn get_profile_resolves_contacts_and_never_calls_discovery_for_strangers() {
+        let ctx = ctx_of(|s| {
+            s.with_contacts(vec![known(9, "+15550000009")])
+                .with_registered("+15550000008", sid(8))
+        });
         let registry = Registry::standard();
         let found = registry
             .call(&ctx, "get_profile", json!({"number": "+15550000009"}))
@@ -548,22 +576,29 @@ mod tests {
             found,
             json!({"number": "+15550000009", "service_id": sid(9).to_string(), "registered": true})
         );
-        let missing = registry
+        let stranger = registry
             .call(&ctx, "get_profile", json!({"number": "+15550000008"}))
             .await
             .unwrap();
         assert_eq!(
-            missing,
-            json!({"number": "+15550000008", "service_id": null, "registered": false})
+            stranger,
+            json!({
+                "number": "+15550000008",
+                "service_id": null,
+                "registered": null,
+                "note": "not a known contact; number lookup isn't supported in this version",
+            })
         );
     }
 
     /// One batch answers every number and username, in the order given, so a
-    /// client can line the answers up with what it asked.
+    /// client can line the answers up with what it asked. Numbers resolve
+    /// from contacts and usernames from Signal's username lookup.
     #[tokio::test]
     async fn get_user_status_answers_every_number_and_username_in_order() {
         let ctx = ctx_of(|s| {
-            s.with_registered("+15550000009", sid(9))
+            s.with_contacts(vec![known(9, "+15550000009")])
+                .with_registered("+15550000008", sid(8))
                 .with_username("ada.42", sid(4))
         });
         let out = Registry::standard()
@@ -580,7 +615,12 @@ mod tests {
         assert_eq!(
             out,
             json!({"results": [
-                {"number": "+15550000008", "service_id": null, "registered": false},
+                {
+                    "number": "+15550000008",
+                    "service_id": null,
+                    "registered": null,
+                    "note": "not a known contact; number lookup isn't supported in this version",
+                },
                 {"number": "+15550000009", "service_id": sid(9).to_string(), "registered": true},
                 {"username": "ada.42", "service_id": sid(4).to_string(), "registered": true},
                 {"username": "nobody.01", "service_id": null, "registered": false},
