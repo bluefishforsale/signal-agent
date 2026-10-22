@@ -71,16 +71,17 @@
     <section data-screen="solve_captcha" hidden>
       <h1>A quick check first</h1>
       <p>Signal wants to be sure you're a person before it sends the code.</p>
+      <div class="actions"><button class="primary" type="button" data-action="open_captcha">Open the check</button></div>
+      <p class="error" data-field="captcha_error" hidden></p>
+      <p class="note">If the check doesn't open, do it in your web browser instead:</p>
       <ol class="steps">
-        <li>In your web browser, open <strong class="selectable">signalcaptchas.org/registration/generate.html</strong></li>
+        <li>Open <strong class="selectable">signalcaptchas.org/registration/generate.html</strong></li>
         <li>Solve the puzzle.</li>
         <li>When the page shows <strong>Open Signal</strong>, right-click it, choose <strong>Copy Link</strong>, and paste it here.</li>
       </ol>
-      <!-- In-window capture of the signalcaptcha:// link replaces this paste (lane L10). -->
       <form data-action="solve_captcha">
         <input type="text" name="token" placeholder="signalcaptcha://…" autocomplete="off" spellcheck="false" required>
-        <p class="note">Soon this step will happen right here in this window.</p>
-        <div class="actions"><button class="primary" type="submit">Continue</button></div>
+        <div class="actions"><button type="submit">Continue</button></div>
       </form>
     </section>
 

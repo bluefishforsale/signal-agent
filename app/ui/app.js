@@ -83,6 +83,17 @@ const actions = {
   choose_access: () => send({ event: "access_chosen", access: checked("access") }),
   restart_desktop: () => send({ event: "restart_desktop" }),
   retry: () => send({ event: "retry" }),
+  open_captcha: async (button) => {
+    const error = document.querySelector('[data-field="captcha_error"]');
+    error.hidden = true;
+    try {
+      await invoke("open_captcha");
+    } catch (message) {
+      error.textContent = `The check couldn't open: ${message}. Use your web browser instead, below.`;
+      error.hidden = false;
+    }
+    button.disabled = false;
+  },
   move: async (button) => {
     const error = document.querySelector('[data-field="move_error"]');
     error.hidden = true;

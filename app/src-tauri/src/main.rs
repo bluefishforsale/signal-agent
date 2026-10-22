@@ -3,6 +3,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod captcha;
 mod input;
 #[cfg(feature = "mock-driver")]
 mod mock;
@@ -110,6 +111,17 @@ fn send(event: SetupEvent, session: State<'_, Session>, app: AppHandle) {
 }
 
 #[tauri::command]
+fn open_captcha(app: AppHandle) -> Result<(), String> {
+    let handle = app.clone();
+    captcha::open(&app, move |token| {
+        handle
+            .state::<Session>()
+            .send(SetupEvent::CaptchaSolved { token })
+    })
+    .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
 fn needs_move() -> bool {
     placement::misplaced_bundle().is_some()
 }
@@ -155,6 +167,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             current,
             send,
+            open_captcha,
             needs_move,
             move_to_applications
         ])
