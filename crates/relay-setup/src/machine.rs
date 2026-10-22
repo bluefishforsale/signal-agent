@@ -76,21 +76,44 @@ pub enum SetupState {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum SetupEvent {
-    AccountChosen { choice: AccountChoice },
-    LinkUri { uri: String },
+    AccountChosen {
+        choice: AccountChoice,
+    },
+    LinkUri {
+        uri: String,
+    },
     Linked,
-    NumberEntered { number: String },
+    NumberEntered {
+        number: String,
+    },
     CaptchaRequired,
-    CaptchaSolved { token: String },
+    CaptchaSolved {
+        token: String,
+    },
     CodeSent,
-    CodeEntered { code: String },
+    /// From `EnterCode`: the SMS didn't come, so ask again by phone call.
+    // Signal only offers a call after an SMS attempt, which is why this is an
+    // event from EnterCode rather than a choice at number entry.
+    CodeByVoice,
+    CodeEntered {
+        code: String,
+    },
     Registered,
-    AccessChosen { access: AccessMode },
-    HistoryProgress { imported: u64, total: Option<u64> },
+    AccessChosen {
+        access: AccessMode,
+    },
+    HistoryProgress {
+        imported: u64,
+        total: Option<u64>,
+    },
     HistoryDone,
-    ClientsConnected { clients: Vec<ClientOutcome> },
+    ClientsConnected {
+        clients: Vec<ClientOutcome>,
+    },
     RestartDesktop,
-    CommandFailed { message: String },
+    CommandFailed {
+        message: String,
+    },
     Retry,
 }
 
@@ -104,6 +127,7 @@ pub enum Command {
     RequestCode {
         number: String,
         captcha: Option<String>,
+        voice: bool,
     },
     VerifyCode {
         code: String,
@@ -145,7 +169,7 @@ pub fn transition(state: &SetupState, event: SetupEvent) -> (SetupState, Vec<Com
             },
         ) => (S::EnterNumber, Vec::new()),
         (S::EnterNumber, E::NumberEntered { number }) if !number.trim().is_empty() => {
-            request_code(number.trim(), None)
+            request_code(number.trim(), None, false)
         }
         (S::RequestingCode { number }, E::CaptchaRequired) => (
             S::SolveCaptcha {
@@ -154,7 +178,7 @@ pub fn transition(state: &SetupState, event: SetupEvent) -> (SetupState, Vec<Com
             Vec::new(),
         ),
         (S::SolveCaptcha { number }, E::CaptchaSolved { token }) => {
-            request_code(number, Some(token))
+            request_code(number, Some(token), false)
         }
         (S::RequestingCode { number }, E::CodeSent) => (
             S::EnterCode {
@@ -162,6 +186,7 @@ pub fn transition(state: &SetupState, event: SetupEvent) -> (SetupState, Vec<Com
             },
             Vec::new(),
         ),
+        (S::EnterCode { number }, E::CodeByVoice) => request_code(number, None, true),
         (S::EnterCode { number }, E::CodeEntered { code }) if !code.trim().is_empty() => (
             S::VerifyingCode {
                 number: number.clone(),
@@ -282,7 +307,7 @@ fn start_link(device_name: &str) -> (SetupState, Vec<Command>) {
     )
 }
 
-fn request_code(number: &str, captcha: Option<String>) -> (SetupState, Vec<Command>) {
+fn request_code(number: &str, captcha: Option<String>, voice: bool) -> (SetupState, Vec<Command>) {
     (
         SetupState::RequestingCode {
             number: number.to_owned(),
@@ -290,6 +315,7 @@ fn request_code(number: &str, captcha: Option<String>) -> (SetupState, Vec<Comma
         vec![Command::RequestCode {
             number: number.to_owned(),
             captcha,
+            voice,
         }],
     )
 }
@@ -546,7 +572,8 @@ mod tests {
             commands,
             vec![Command::RequestCode {
                 number: NUMBER.into(),
-                captcha: None
+                captcha: None,
+                voice: false,
             }]
         );
         let (again, commands) = transition(
@@ -596,9 +623,35 @@ mod tests {
             commands,
             vec![Command::RequestCode {
                 number: NUMBER.into(),
-                captcha: Some("signalcaptcha://abc".into())
+                captcha: Some("signalcaptcha://abc".into()),
+                voice: false,
             }]
         );
+    }
+
+    /// A code that never arrived by SMS can be asked for again by phone call,
+    /// once per press, and only from the code entry screen.
+    #[test]
+    fn asking_for_a_call_re_requests_the_code_by_voice() {
+        let entering = SetupState::EnterCode {
+            number: NUMBER.into(),
+        };
+        let (state, commands) = transition(&entering, SetupEvent::CodeByVoice);
+        assert_eq!(state, requesting());
+        assert_eq!(
+            commands,
+            vec![Command::RequestCode {
+                number: NUMBER.into(),
+                captcha: None,
+                voice: true,
+            }]
+        );
+        let (again, commands) = transition(&state, SetupEvent::CodeByVoice);
+        assert_eq!(again, state, "a second press moved setup on");
+        assert!(commands.is_empty(), "requested a second call: {commands:?}");
+        let (state, commands) = transition(&SetupState::EnterNumber, SetupEvent::CodeByVoice);
+        assert_eq!(state, SetupState::EnterNumber);
+        assert!(commands.is_empty(), "called before any SMS: {commands:?}");
     }
 
     /// A sent code asks for it, and an entered code is verified exactly once
@@ -782,6 +835,7 @@ mod tests {
             E::CaptchaRequired,
             E::CaptchaSolved { token: "t".into() },
             E::CodeSent,
+            E::CodeByVoice,
             E::CodeEntered { code: "1".into() },
             E::Registered,
             E::AccessChosen {
@@ -852,9 +906,12 @@ mod tests {
                 SetupState::EnterCode {
                     number: NUMBER.into(),
                 },
-                vec![E::CodeEntered {
-                    code: String::new(),
-                }],
+                vec![
+                    E::CodeEntered {
+                        code: String::new(),
+                    },
+                    E::CodeByVoice,
+                ],
             ),
             (
                 SetupState::VerifyingCode {
@@ -931,6 +988,7 @@ mod tests {
             Just(E::CaptchaRequired),
             text.clone().prop_map(|token| E::CaptchaSolved { token }),
             Just(E::CodeSent),
+            Just(E::CodeByVoice),
             text.clone().prop_map(|code| E::CodeEntered { code }),
             Just(E::Registered),
             access.prop_map(|access| E::AccessChosen { access }),

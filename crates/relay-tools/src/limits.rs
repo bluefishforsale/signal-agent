@@ -580,6 +580,77 @@ mod tests {
         assert_eq!(signal.sent().len(), 3, "{:?}", signal.sent());
     }
 
+    /// Everything a person sees in the conversation must spend the message
+    /// budget, whichever tool sends it: with the budget spent, a sticker,
+    /// pin, unpin, poll or admin delete must be refused before Signal.
+    #[tokio::test]
+    async fn every_visible_variant_spends_the_message_budget() {
+        let one = NonZeroU32::new(1).expect("nonzero literal");
+        let limiter = Arc::new(Limiter::new(
+            Limits {
+                burst_per_minute: one,
+                ..Limits::default()
+            },
+            Arc::new(FakeClock::default()),
+        ));
+        let (ctx, signal) = ctx();
+        let guarded = guard(Some(&limiter), &ctx).signal;
+        let group = Recipient::Group(GroupId::parse(GROUP).expect("valid group id"));
+        let target = MessageId {
+            author: sid(ME),
+            sent_at_ms: 1,
+        };
+        guarded
+            .send(group, Outgoing::Typing { started: true })
+            .await
+            .expect("typing is free");
+        guarded
+            .send(
+                group,
+                Outgoing::Text {
+                    body: "hi".into(),
+                    quote: None,
+                    attachments: vec![],
+                },
+            )
+            .await
+            .expect("first message within budget");
+        for visible in [
+            Outgoing::Sticker {
+                pack: StickerPackId::new([1; 16]),
+                sticker_id: 0,
+            },
+            Outgoing::Pin {
+                target,
+                duration_secs: None,
+            },
+            Outgoing::Unpin { target },
+            Outgoing::PollCreate {
+                question: "lunch?".into(),
+                options: vec!["yes".into(), "no".into()],
+                multi_select: false,
+            },
+            Outgoing::PollVote {
+                poll: target,
+                option_indexes: vec![0],
+                vote_count: 1,
+            },
+            Outgoing::PollTerminate { poll: target },
+            Outgoing::AdminDelete { target },
+        ] {
+            let result = guarded.send(group, visible.clone()).await;
+            let refused = result
+                .as_ref()
+                .err()
+                .and_then(|e| e.downcast_ref::<LimitExceeded>());
+            assert!(
+                refused.is_some(),
+                "{visible:?} skipped the limiter: {result:?}"
+            );
+        }
+        assert_eq!(signal.sent().len(), 2, "a refused send reached Signal");
+    }
+
     /// Only first contact with a stranger counts against the daily cap: a
     /// group counts once however often it's messaged, people already in the
     /// history don't count, and the cap frees up a day after each first contact.

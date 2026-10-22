@@ -146,17 +146,22 @@ impl Driver {
                 self.close_signal_store();
                 SetupEvent::Linked
             }
-            Command::RequestCode { number, captcha } => {
-                // NOTE: a captcha only comes after Signal asked for one, so it
-                // finishes the attempt in progress; gating it would leave the
-                // user stuck behind the backoff with a solved captcha.
-                if captcha.is_none() {
+            Command::RequestCode {
+                number,
+                captcha,
+                voice,
+            } => {
+                // NOTE: a captcha only comes after Signal asked for one, and a
+                // call only after an SMS, so both finish the attempt in
+                // progress; gating them would leave the user stuck behind the
+                // backoff. Signal paces calls itself and says when to retry.
+                if captcha.is_none() && !voice {
                     self.begin_provisioning()?;
                 }
                 let step = self
                     .provisioner()
                     .await?
-                    .request_code(&number, captcha.as_deref(), false)
+                    .request_code(&number, captcha.as_deref(), voice)
                     .await?;
                 match step {
                     RegistrationStep::CaptchaRequired => SetupEvent::CaptchaRequired,
@@ -794,6 +799,42 @@ mod tests {
             !log.contains(&"import history".to_owned()),
             "a new number imported history: {log:?}"
         );
+    }
+
+    /// A call asked for after the SMS belongs to the same attempt: it reaches
+    /// Signal with voice set, on the same session, inside the provisioning
+    /// backoff that would refuse a fresh attempt.
+    #[tokio::test]
+    async fn a_voice_call_after_the_sms_is_not_held_back_by_the_backoff() {
+        let world = World::new()
+            .code(Ok(RegistrationStep::CodeSent))
+            .code(Ok(RegistrationStep::CodeSent));
+        let mut h = Harness::new(&world);
+        h.send(SetupEvent::AccountChosen {
+            choice: AccountChoice::OwnNumber,
+        })
+        .await;
+        h.send(SetupEvent::NumberEntered {
+            number: NUMBER.into(),
+        })
+        .await;
+        let state = h.send(SetupEvent::CodeByVoice).await;
+        assert!(matches!(state, SetupState::EnterCode { .. }), "{state:?}");
+        let log = world.log();
+        let requests: Vec<_> = log
+            .iter()
+            .filter(|e| e.starts_with("request code"))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            requests,
+            [
+                "request code +15555550100 None voice=false",
+                "request code +15555550100 None voice=true",
+            ],
+            "{log:?}"
+        );
+        assert_eq!(world.opened_with().len(), 1, "session reopened: {log:?}");
     }
 
     /// A failed access save must stop clients connecting in the same batch,

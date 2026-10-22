@@ -20,6 +20,7 @@ pub fn from_page(event: SetupEvent) -> Option<SetupEvent> {
         }),
         E::AccountChosen { .. }
         | E::CodeEntered { .. }
+        | E::CodeByVoice
         | E::AccessChosen { .. }
         | E::RestartDesktop
         | E::Retry => Some(event),
