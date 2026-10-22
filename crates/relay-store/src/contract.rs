@@ -705,7 +705,7 @@ async fn failed_and_interrupted_jobs_are_never_sent_again() {
 #[tokio::test]
 async fn cancelling_a_job_removes_it_once() {
     let stores = Stores::open().await;
-    for (name, store) in stores.round_two() {
+    for (name, store) in stores.each() {
         let id = store.schedule(&later(1, 1)).await.expect("schedule");
         assert!(store.cancel_scheduled(id).await.expect("cancel"), "{name}");
         assert!(!store.cancel_scheduled(id).await.expect("cancel"), "{name}");

@@ -170,8 +170,9 @@ fn to_i64(n: u64) -> anyhow::Result<i64> {
     i64::try_from(n).with_context(|| format!("timestamp {n} too large for the message store"))
 }
 
-fn job_key(id: JobId) -> anyhow::Result<i64> {
-    i64::try_from(id.0).with_context(|| format!("no scheduled job {id:?}"))
+/// The row id for `id`, or None for an id no stored job can have.
+fn job_key(id: JobId) -> Option<i64> {
+    i64::try_from(id.0).ok()
 }
 
 fn recipient_key(recipient: Recipient) -> String {
@@ -517,8 +518,15 @@ impl MessageStore for SqlCipherStore {
         rows.into_iter().map(ScheduledJob::try_from).collect()
     }
 
-    async fn cancel_scheduled(&self, _id: JobId) -> anyhow::Result<bool> {
-        bail!("scheduled sends are not implemented yet (lane L2b)")
+    async fn cancel_scheduled(&self, id: JobId) -> anyhow::Result<bool> {
+        let Some(key) = job_key(id) else {
+            return Ok(false);
+        };
+        let deleted = sqlx::query("DELETE FROM scheduled_jobs WHERE id = ?")
+            .bind(key)
+            .execute(&self.pool)
+            .await?;
+        Ok(deleted.rows_affected() > 0)
     }
 
     // NOTE: one UPDATE ... RETURNING, so the claim and the read are a single
@@ -543,6 +551,9 @@ impl MessageStore for SqlCipherStore {
     }
 
     async fn finish_scheduled(&self, id: JobId, result: Result<(), String>) -> anyhow::Result<()> {
+        let Some(key) = job_key(id) else {
+            return Ok(());
+        };
         let query = match result {
             Ok(()) => sqlx::query("DELETE FROM scheduled_jobs WHERE id = ?"),
             Err(error) => {
@@ -550,7 +561,7 @@ impl MessageStore for SqlCipherStore {
                     .bind(error)
             }
         };
-        query.bind(job_key(id)?).execute(&self.pool).await?;
+        query.bind(key).execute(&self.pool).await?;
         Ok(())
     }
 }
