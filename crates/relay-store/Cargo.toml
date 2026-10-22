@@ -8,8 +8,36 @@ license.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 relay-core.workspace = true
+relay-secrets.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+sqlx = { version = "0.9.0", default-features = false, features = ["sqlite", "runtime-tokio", "migrate", "macros"] }
+# NOTE: every crate linking libsqlite3-sys declares exactly this, so Cargo's
+# feature unification yields one SQLCipher with one crypto backend whatever
+# else is in the graph (docs/slices.md, "One SQLCipher").
+log = "0.4.34"
+
+# NOTE: the fork's build.rs demands OpenSSL on Windows even with custom crypto,
+# and when both features are on it picks OpenSSL, so Windows runs SQLCipher on
+# OpenSSL and every other OS on RustCrypto. That is accepted (docs/slices.md):
+# the file format is standard SQLCipher either way, and the build is the same
+# whatever else is in the graph. Don't swap this for an OPENSSL_DIR trick;
+# sqlcipher_uses_the_declared_crypto_backend pins the result.
+[target.'cfg(windows)'.dependencies]
+libsqlite3-sys = { version = "0.36.0", features = ["bundled-sqlcipher-vendored-openssl"] }
+
+# NOTE: ARM Linux can't use custom crypto: the whisperfish fork's
+# sqlcipher_custom_crypto.rs hard-codes *const i8 where C's char is unsigned
+# there, so it doesn't compile. ARM Linux vendors OpenSSL like Windows does.
+# Revert once the c_char fix lands upstream (see docs/slices.md).
+[target.'cfg(not(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm"))))'.dependencies]
+libsqlite3-sys = { version = "0.36.0", features = ["bundled-sqlcipher-custom-crypto"] }
+
+[target.'cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm")))'.dependencies]
+libsqlite3-sys = { version = "0.36.0", features = ["bundled-sqlcipher-vendored-openssl"] }
 
 [dev-dependencies]
+proptest.workspace = true
+tempfile = "3.27.0"
 tokio.workspace = true
 uuid.workspace = true

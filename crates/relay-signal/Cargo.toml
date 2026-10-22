@@ -29,12 +29,21 @@ presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "
 # Nothing to register at startup: libsqlite3-sys itself exports the
 # rusqlite_custom_crypto_setup hook SQLCipher calls, so linking is enough.
 # store_refuses_to_open_with_the_wrong_key fails if encryption ever goes missing.
-libsqlite3-sys = { version = "0.36.0", features = ["bundled-sqlcipher-custom-crypto"] }
 
 # NOTE: at this libsqlite3-sys rev the Windows build.rs panics without
 # OPENSSL_DIR even with custom crypto, so Windows also vendors OpenSSL. relay-store
 # declares the same; keep the two identical (docs/slices.md).
 [target.'cfg(windows)'.dependencies]
+libsqlite3-sys = { version = "0.36.0", features = ["bundled-sqlcipher-vendored-openssl"] }
+
+# NOTE: ARM Linux can't use custom crypto: the whisperfish fork's
+# sqlcipher_custom_crypto.rs hard-codes *const i8 where C's char is unsigned
+# there, so it doesn't compile. ARM Linux vendors OpenSSL like Windows does.
+# Revert once the c_char fix lands upstream (see docs/slices.md).
+[target.'cfg(not(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm"))))'.dependencies]
+libsqlite3-sys = { version = "0.36.0", features = ["bundled-sqlcipher-custom-crypto"] }
+
+[target.'cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm")))'.dependencies]
 libsqlite3-sys = { version = "0.36.0", features = ["bundled-sqlcipher-vendored-openssl"] }
 
 [dev-dependencies]
