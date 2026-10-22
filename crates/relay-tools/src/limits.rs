@@ -34,6 +34,8 @@ pub struct Limits {
     /// Conversations with no history that may get a first message in any
     /// 24 hours. A group is one conversation.
     pub new_recipients_per_day: u32,
+    /// Minutes between attempts to link or register this profile.
+    pub provisioning_backoff_minutes: NonZeroU32,
 }
 
 impl Default for Limits {
@@ -42,6 +44,7 @@ impl Default for Limits {
             burst_per_minute: NonZeroU32::new(20).expect("nonzero literal"),
             per_hour: NonZeroU32::new(200).expect("nonzero literal"),
             new_recipients_per_day: 20,
+            provisioning_backoff_minutes: NonZeroU32::new(5).expect("nonzero literal"),
         }
     }
 }
@@ -156,6 +159,7 @@ impl Limiter {
             burst_per_minute,
             per_hour,
             new_recipients_per_day,
+            ..
         } = self.limits;
         state
             .first_contacts
@@ -196,6 +200,40 @@ impl Limiter {
         }
         Ok(())
     }
+}
+
+/// Records an attempt to link or register at `now_ms` in `path`, or refuses
+/// it when the previous attempt was within the backoff. Call it before every
+/// `Provisioner::link` and `Provisioner::request_code`.
+pub fn begin_provisioning(
+    path: &std::path::Path,
+    limits: &Limits,
+    now_ms: u64,
+) -> anyhow::Result<()> {
+    let last = match std::fs::read(path) {
+        Ok(bytes) => Some(
+            serde_json::from_slice::<u64>(&bytes)
+                .with_context(|| format!("unreadable provisioning file {}", path.display()))?,
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| format!("can't read {}", path.display())),
+    };
+    let minutes = limits.provisioning_backoff_minutes;
+    if let Some(retry_after) = provisioning_wait(last, now_ms, minutes) {
+        return Err(LimitExceeded {
+            limit: format!("one link or registration attempt every {minutes} minutes"),
+            retry_after,
+        }
+        .into());
+    }
+    write_atomically(path, &serde_json::to_vec(&now_ms)?)
+}
+
+/// How long until another attempt is allowed after one at `last_ms`.
+fn provisioning_wait(last_ms: Option<u64>, now_ms: u64, minutes: NonZeroU32) -> Option<Duration> {
+    let until = last_ms? + u64::from(minutes.get()) * MINUTE_MS;
+    let wait = until.checked_sub(now_ms).filter(|w| *w > 0)?;
+    Some(Duration::from_millis(wait))
 }
 
 // NOTE: a torn write would fail to load and keep the agent from starting, so
@@ -468,6 +506,60 @@ mod tests {
             let parsed = serde_json::from_value::<Limits>(bad.clone());
             assert!(parsed.is_err(), "accepted {bad}: {parsed:?}");
         }
+    }
+
+    struct CountingLinker(AtomicU64);
+
+    impl CountingLinker {
+        fn link(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A second link or registration inside the backoff window must be refused
+    /// before the provisioner is called, so Signal never sees it. The window
+    /// lives in a file so a restart doesn't reopen it, and it restarts at every
+    /// allowed attempt.
+    #[test]
+    fn a_second_provisioning_attempt_inside_the_backoff_is_refused_without_contacting_signal() {
+        let dir = std::env::temp_dir().join(format!("relay-limits-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("provisioning.json");
+        let limits = Limits::default();
+        let signal = CountingLinker(AtomicU64::new(0));
+        // The setup driver's call site: check the gate, then provision.
+        let attempt = |now_ms: u64| -> anyhow::Result<()> {
+            begin_provisioning(&path, &limits, now_ms)?;
+            signal.link();
+            Ok(())
+        };
+        let start = 1_700_000_000_000;
+        let backoff = 5 * MINUTE_MS;
+
+        attempt(start).expect("first attempt allowed");
+        let refusal = attempt(start + backoff - 1_000).expect_err("attempt inside backoff allowed");
+        let Some(e) = refusal.downcast_ref::<LimitExceeded>() else {
+            panic!("refusal is not a LimitExceeded: {refusal:#}");
+        };
+        assert_eq!(e.retry_after, Duration::from_secs(1), "{e}");
+        assert_eq!(
+            signal.0.load(Ordering::SeqCst),
+            1,
+            "refused attempt reached Signal"
+        );
+
+        attempt(start + backoff).expect("attempt after the backoff refused");
+        let refusal = attempt(start + backoff + 1);
+        assert!(
+            refusal.is_err(),
+            "the window did not restart at the last attempt"
+        );
+        assert_eq!(
+            signal.0.load(Ordering::SeqCst),
+            2,
+            "refused attempt reached Signal"
+        );
+        std::fs::remove_dir_all(&dir).expect("clean temp dir");
     }
 
     /// Sends counted by Signal-visible message, per window of `window_ms`,
