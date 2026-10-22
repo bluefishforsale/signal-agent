@@ -12,11 +12,13 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use relay_core::prelude::*;
 use relay_signal::{Account, Contact, Group, Incoming, Outgoing, SignalBackend};
+use relay_store::MessageStore;
 
 use crate::ToolContext;
 
 const MINUTE_MS: u64 = 60_000;
 const HOUR_MS: u64 = 60 * MINUTE_MS;
+const DAY_MS: u64 = 24 * HOUR_MS;
 
 /// How much a profile may send before tools refuse.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,6 +27,9 @@ pub struct Limits {
     pub burst_per_minute: NonZeroU32,
     /// Messages allowed back to back, refilling over an hour.
     pub per_hour: NonZeroU32,
+    /// Conversations with no history that may get a first message in any
+    /// 24 hours. A group is one conversation.
+    pub new_recipients_per_day: u32,
 }
 
 impl Default for Limits {
@@ -32,6 +37,7 @@ impl Default for Limits {
         Self {
             burst_per_minute: NonZeroU32::new(20).expect("nonzero literal"),
             per_hour: NonZeroU32::new(200).expect("nonzero literal"),
+            new_recipients_per_day: 20,
         }
     }
 }
@@ -74,6 +80,8 @@ pub struct Limiter {
 struct State {
     minute: Bucket,
     hour: Bucket,
+    /// Conversations first messaged in the last day, oldest first.
+    first_contacts: Vec<(Recipient, u64)>,
 }
 
 /// A token bucket in exact integer units: one token is `window_ms` units, and
@@ -117,27 +125,49 @@ impl Limiter {
 
 impl Limiter {
     /// Counts one message to `to`, or refuses it.
-    fn admit(&self, _to: Recipient) -> Result<(), LimitExceeded> {
+    async fn admit(&self, store: &dyn MessageStore, to: Recipient) -> anyhow::Result<()> {
+        let known = !store.history(to, None, 1).await?.is_empty();
         let now = self.clock.now_ms();
         let mut state = self.state.lock().expect("limiter state");
         let Limits {
             burst_per_minute,
             per_hour,
+            new_recipients_per_day,
         } = self.limits;
+        state
+            .first_contacts
+            .retain(|(_, at)| now.saturating_sub(*at) < DAY_MS);
+        let first = !known && !state.first_contacts.iter().any(|(r, _)| *r == to);
+        if first && state.first_contacts.len() >= new_recipients_per_day as usize {
+            let oldest = state.first_contacts.first().map_or(now, |(_, at)| *at);
+            return Err(LimitExceeded {
+                limit: format!(
+                    "at most {new_recipients_per_day} new conversations a day; \
+                     this one has no history yet"
+                ),
+                retry_after: Duration::from_millis(oldest + DAY_MS - now),
+            }
+            .into());
+        }
         if let Some(retry_after) = state.minute.wait(now, burst_per_minute, MINUTE_MS) {
             return Err(LimitExceeded {
                 limit: format!("at most {burst_per_minute} messages a minute"),
                 retry_after,
-            });
+            }
+            .into());
         }
         if let Some(retry_after) = state.hour.wait(now, per_hour, HOUR_MS) {
             return Err(LimitExceeded {
                 limit: format!("at most {per_hour} messages an hour"),
                 retry_after,
-            });
+            }
+            .into());
         }
         state.minute.take(MINUTE_MS);
         state.hour.take(HOUR_MS);
+        if first {
+            state.first_contacts.push((to, now));
+        }
         Ok(())
     }
 }
@@ -153,6 +183,7 @@ pub(crate) fn guard(limiter: &Arc<Limiter>, ctx: &ToolContext) -> ToolContext {
     ToolContext {
         signal: Arc::new(Guarded {
             inner: ctx.signal.clone(),
+            store: ctx.store.clone(),
             limiter: limiter.clone(),
         }),
         ..ctx.clone()
@@ -163,6 +194,7 @@ pub(crate) fn guard(limiter: &Arc<Limiter>, ctx: &ToolContext) -> ToolContext {
 // sends is limited without opting in, whatever its writes() says.
 struct Guarded {
     inner: Arc<dyn SignalBackend>,
+    store: Arc<dyn MessageStore>,
     limiter: Arc<Limiter>,
 }
 
@@ -173,7 +205,7 @@ impl SignalBackend for Guarded {
     }
     async fn send(&self, to: Recipient, message: Outgoing) -> anyhow::Result<MessageId> {
         if counts(&message) {
-            self.limiter.admit(to)?;
+            self.limiter.admit(self.store.as_ref(), to).await?;
         }
         self.inner.send(to, message).await
     }
@@ -210,8 +242,13 @@ mod tests {
     use proptest::prelude::*;
     use serde_json::json;
 
+    use relay_signal::FakeSignal;
+
     use super::*;
-    use crate::{Registry, ToolError, testing::*};
+    use crate::{
+        Registry, ToolError,
+        testing::{ME, incoming, sid},
+    };
 
     #[derive(Default)]
     struct FakeClock(AtomicU64);
@@ -234,6 +271,29 @@ mod tests {
         (registry, clock)
     }
 
+    const GROUP: &str = "abababababababababababababababababababababababababababababababab";
+
+    /// A full-access primary profile that belongs to `GROUP`.
+    fn ctx() -> (ToolContext, Arc<FakeSignal>) {
+        let (ctx, _) = crate::testing::ctx(AccessMode::Full, ProfileKind::Primary);
+        let account = Account {
+            service_id: sid(ME),
+            phone_number: None,
+            kind: ProfileKind::Primary,
+            device_name: "test".into(),
+        };
+        let signal = Arc::new(FakeSignal::new(account).with_groups(vec![Group {
+            id: GroupId::parse(GROUP).expect("valid group id"),
+            title: "g".into(),
+            members: vec![sid(ME), sid(2)],
+        }]));
+        let ctx = ToolContext {
+            signal: signal.clone(),
+            ..ctx
+        };
+        (ctx, signal)
+    }
+
     fn refused(result: &Result<serde_json::Value, ToolError>) -> Option<&LimitExceeded> {
         match result {
             Err(ToolError::Internal(e)) => e.downcast_ref(),
@@ -246,7 +306,7 @@ mod tests {
     #[tokio::test]
     async fn a_burst_past_the_minute_limit_is_refused_and_sends_nothing() {
         let (registry, clock) = limited(Limits::default());
-        let (ctx, signal) = ctx(AccessMode::Full, ProfileKind::Primary);
+        let (ctx, signal) = ctx();
         let input = json!({"recipient": sid(2).to_string(), "message": "hi"});
         for i in 0..20 {
             let result = registry.call(&ctx, "send_message", input.clone()).await;
@@ -263,6 +323,59 @@ mod tests {
         assert!(
             result.is_ok(),
             "send after the retry time refused: {result:?}"
+        );
+    }
+
+    /// Only first contact with a stranger counts against the daily cap: a
+    /// group counts once however often it's messaged, people already in the
+    /// history don't count, and the cap frees up a day after each first contact.
+    #[tokio::test]
+    async fn the_new_recipient_cap_counts_groups_once_and_resets_daily() {
+        let roomy = NonZeroU32::new(1_000).expect("nonzero literal");
+        let (registry, clock) = limited(Limits {
+            burst_per_minute: roomy,
+            per_hour: roomy,
+            ..Limits::default()
+        });
+        let (ctx, signal) = ctx();
+        ctx.store
+            .insert(&incoming(50, 1, "hey"))
+            .await
+            .expect("seed");
+        let dm = |n: u128| json!({"recipient": sid(n).to_string(), "message": "hi"});
+        let group = json!({"group_id": GROUP, "message": "hi"});
+        for _ in 0..3 {
+            let result = registry
+                .call(&ctx, "send_group_message", group.clone())
+                .await;
+            assert!(result.is_ok(), "group send refused: {result:?}");
+            clock.advance(1_000);
+        }
+        for n in 10..29 {
+            let result = registry.call(&ctx, "send_message", dm(n)).await;
+            assert!(
+                result.is_ok(),
+                "new recipient {n} refused under the cap: {result:?}"
+            );
+        }
+        let result = registry.call(&ctx, "send_message", dm(50)).await;
+        assert!(result.is_ok(), "known contact counted as new: {result:?}");
+        let before = signal.sent().len();
+        let result = registry.call(&ctx, "send_message", dm(30)).await;
+        let Some(e) = refused(&result) else {
+            panic!("21st new recipient in a day was not refused: {result:?}");
+        };
+        assert_eq!(
+            signal.sent().len(),
+            before,
+            "a refused first contact reached Signal"
+        );
+        assert_eq!(e.retry_after, Duration::from_millis(DAY_MS - 3_000), "{e}");
+        clock.advance(DAY_MS);
+        let result = registry.call(&ctx, "send_message", dm(30)).await;
+        assert!(
+            result.is_ok(),
+            "the cap did not reset after a day: {result:?}"
         );
     }
 
@@ -302,13 +415,13 @@ mod tests {
             let runtime = tokio::runtime::Builder::new_current_thread().build()?;
             let times = runtime.block_on(async {
                 let (registry, clock) = limited(limits);
-                let (ctx, signal) = ctx(AccessMode::Full, ProfileKind::Primary);
+                let (ctx, signal) = ctx();
                 let mut times = vec![];
                 for (pause, tool) in calls {
                     clock.advance(pause);
                     let (name, input) = match tool {
                         0 => ("send_message", json!({"recipient": sid(2).to_string(), "message": "hi"})),
-                        1 => ("send_group_message", json!({"group_id": "ab".repeat(32), "message": "hi"})),
+                        1 => ("send_group_message", json!({"group_id": GROUP, "message": "hi"})),
                         2 => ("send_note_to_self", json!({"message": "hi"})),
                         _ => ("set_typing", json!({"recipient": sid(2).to_string()})),
                     };
