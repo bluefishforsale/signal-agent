@@ -53,4 +53,15 @@ mod tests {
             assert_eq!(captcha_token(url), None, "token from {url:?}");
         }
     }
+
+    /// The webview reports navigations as parsed URLs, and a parser that
+    /// lowercased or re-encoded the opaque part would hand Signal a token it
+    /// rejects; mixed case and `_`/`-` must come through untouched.
+    #[test]
+    fn a_token_survives_the_webviews_url_parsing() {
+        for token in [HCAPTCHA, RECAPTCHA] {
+            let parsed = url::Url::parse(&format!("signalcaptcha://{token}")).expect("parse");
+            assert_eq!(captcha_token(parsed.as_str()).as_deref(), Some(token));
+        }
+    }
 }

@@ -11,6 +11,7 @@ relay-core.workspace = true
 relay-secrets.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, features = ["preserve_order"] }
+url = "2.5.8"
 
 [dev-dependencies]
 proptest.workspace = true
