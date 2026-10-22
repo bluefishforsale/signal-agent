@@ -543,7 +543,7 @@ async fn admin_deletes_stay_inside_the_named_group_and_leave_the_author_check_al
     let in_group = msg(1, 1, Recipient::Group(group), "member's message");
     let elsewhere = msg(1, 2, Recipient::Group(other), "other group");
     let stores = Stores::open().await;
-    for (name, store) in stores.round_two() {
+    for (name, store) in stores.each() {
         store.insert(&in_group).await.expect("insert");
         store.insert(&elsewhere).await.expect("insert");
         let wrong_group = store.mark_admin_deleted(group, elsewhere.id).await;

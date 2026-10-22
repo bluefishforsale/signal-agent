@@ -404,8 +404,20 @@ impl MessageStore for SqlCipherStore {
         bail!("deleting a conversation is not implemented yet (lane L2b)")
     }
 
-    async fn mark_admin_deleted(&self, _group: GroupId, _target: MessageId) -> anyhow::Result<()> {
-        bail!("admin deletes are not implemented yet (lane L2b)")
+    async fn mark_admin_deleted(&self, group: GroupId, target: MessageId) -> anyhow::Result<()> {
+        let updated = sqlx::query(
+            "UPDATE messages SET deleted = 1 \
+             WHERE author = ? AND sent_at_ms = ? AND conversation = ?",
+        )
+        .bind(target.author.to_string())
+        .bind(to_i64(target.sent_at_ms)?)
+        .bind(recipient_key(Recipient::Group(group)))
+        .execute(&self.pool)
+        .await?;
+        if updated.rows_affected() == 0 {
+            bail!("{target:?} is not a stored message in group {group}");
+        }
+        Ok(())
     }
 
     async fn attachments(
