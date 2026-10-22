@@ -3,6 +3,7 @@
 //! can't forget them.
 
 mod input;
+mod local;
 mod read;
 mod registry;
 #[cfg(test)]

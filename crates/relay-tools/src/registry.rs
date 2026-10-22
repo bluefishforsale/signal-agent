@@ -5,7 +5,7 @@ use std::sync::Arc;
 use relay_core::prelude::*;
 use serde_json::Value;
 
-use crate::{Tool, ToolContext, ToolError, read};
+use crate::{Tool, ToolContext, ToolError, local, read};
 
 /// The set of tools a profile serves.
 #[derive(Clone, Default)]
@@ -24,6 +24,7 @@ impl Registry {
             .with(read::GetUnread)
             .with(read::GetConversation)
             .with(read::SearchMessages)
+            .with(local::ExportMessages)
     }
 
     pub fn with(mut self, tool: impl Tool + 'static) -> Self {
@@ -184,6 +185,9 @@ mod tests {
     /// A value the property's schema accepts, so each probe below breaks
     /// exactly one field of an otherwise valid input.
     fn sample(name: &str, prop: &Value) -> Value {
+        if let Some(first) = prop["enum"].get(0) {
+            return first.clone();
+        }
         match prop["format"].as_str() {
             Some("signal-recipient" | "signal-service-id") => json!(sid(2).to_string()),
             Some("iso-datetime") => json!("2024-01-01T00:00:00Z"),
@@ -213,6 +217,14 @@ mod tests {
                     json!(format!("{}-", sid(2))),
                     json!("é".repeat(32)),
                 ];
+                if let Some(choices) = prop["enum"].as_array() {
+                    bad.push(json!("not-a-choice"));
+                    bad.extend(
+                        choices
+                            .iter()
+                            .filter_map(|c| Some(json!(c.as_str()?.to_uppercase()))),
+                    );
+                }
                 match prop["format"].as_str() {
                     Some("signal-recipient") => bad.extend(malformed_ids),
                     // A person-only field must also refuse a well-formed group id.
