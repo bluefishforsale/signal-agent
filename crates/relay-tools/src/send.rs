@@ -115,6 +115,7 @@ pub struct SendNoteToSelf;
 #[serde(deny_unknown_fields)]
 struct SendNoteToSelfInput {
     message: String,
+    quote_timestamp: Option<Timestamp>,
 }
 
 #[async_trait]
@@ -125,14 +126,16 @@ impl Tool for SendNoteToSelf {
     fn description(&self) -> &'static str {
         "Send a message to your own Note to Self chat, which syncs to all your Signal \
          devices. Use for reminders, bookmarks or drafts; use send_message to message anyone \
-         else. message is the text. Not idempotent. Saved to the local store. Returns the \
-         new message's id."
+         else. message is the text. To thread a follow-up under an earlier note, pass \
+         quote_timestamp (that note's sent_at_ms). Not idempotent. Saved to the local store. \
+         Returns the new message's id."
     }
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
                 "message": {"type": "string", "minLength": 1, "description": "Note text to save"},
+                "quote_timestamp": Timestamp::schema("Send time of the note being followed up on"),
             },
             "required": ["message"],
             "additionalProperties": false,
@@ -145,7 +148,11 @@ impl Tool for SendNoteToSelf {
         let input: SendNoteToSelfInput = parse(input)?;
         let body = non_blank("message", input.message)?;
         let me = ctx.signal.account().await?.service_id;
-        send_text(ctx, Recipient::Contact(me), body, None).await
+        let quote = input.quote_timestamp.map(|t| MessageId {
+            author: me,
+            sent_at_ms: t.ms(),
+        });
+        send_text(ctx, Recipient::Contact(me), body, quote).await
     }
 }
 
@@ -363,6 +370,30 @@ mod tests {
         let stored = ctx.store.history(me, None, 10).await.unwrap();
         assert_eq!(stored.len(), 1, "{stored:?}");
         assert_eq!(stored[0].id, id);
+    }
+
+    /// Every note is the account's own, so a follow-up names the earlier note
+    /// by send time alone and the quote's author must be this account.
+    #[tokio::test]
+    async fn send_note_to_self_threads_under_an_earlier_note_by_timestamp() {
+        let (ctx, signal) = ctx(AccessMode::Full, ProfileKind::Linked);
+        Registry::standard()
+            .call(
+                &ctx,
+                "send_note_to_self",
+                json!({"message": "and litter", "quote_timestamp": 42}),
+            )
+            .await
+            .unwrap();
+        let earlier = MessageId {
+            author: sid(ME),
+            sent_at_ms: 42,
+        };
+        let text = Outgoing::Text {
+            body: "and litter".into(),
+            quote: Some(earlier),
+        };
+        assert_eq!(signal.sent(), [(Recipient::Contact(sid(ME)), text)]);
     }
 
     /// Half a quote can't name a message; sending it as a plain message would
