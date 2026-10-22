@@ -284,10 +284,38 @@ pub(crate) fn content_body(
             }),
             ..Default::default()
         })),
-        Outgoing::Sticker { .. }
-        | Outgoing::PollCreate { .. }
-        | Outgoing::PollVote { .. }
-        | Outgoing::PollTerminate { .. } => {
+        Outgoing::PollCreate {
+            question,
+            options,
+            multi_select,
+        } => ContentBody::DataMessage(data(DataMessage {
+            poll_create: Some(data_message::PollCreate {
+                question: Some(question.clone()),
+                allow_multiple: Some(*multi_select),
+                options: options.clone(),
+            }),
+            ..Default::default()
+        })),
+        Outgoing::PollVote {
+            poll,
+            option_indexes,
+            vote_count,
+        } => ContentBody::DataMessage(data(DataMessage {
+            poll_vote: Some(data_message::PollVote {
+                target_author_aci_binary: Some(aci(poll.author).service_id_binary()),
+                target_sent_timestamp: Some(poll.sent_at_ms),
+                option_indexes: option_indexes.clone(),
+                vote_count: Some(*vote_count),
+            }),
+            ..Default::default()
+        })),
+        Outgoing::PollTerminate { poll } => ContentBody::DataMessage(data(DataMessage {
+            poll_terminate: Some(data_message::PollTerminate {
+                target_sent_timestamp: Some(poll.sent_at_ms),
+            }),
+            ..Default::default()
+        })),
+        Outgoing::Sticker { .. } => {
             bail!("sending {message:?} is not implemented yet (lane L1b)")
         }
     })
@@ -961,6 +989,64 @@ mod tests {
                 .expect("a pin message");
             prop_assert_eq!(unpin.target_author_aci_binary, pin.target_author_aci_binary);
             prop_assert_eq!(unpin.target_sent_timestamp, pin.target_sent_timestamp);
+        }
+    }
+
+    proptest! {
+        /// A poll goes out with its question, its options in the order given
+        /// (votes are indexes into them), and whether several may be chosen.
+        #[test]
+        fn a_poll_keeps_its_question_and_option_order(
+            question in ".{1,40}",
+            options in proptest::collection::vec(".{1,20}", 2..6),
+            multi_select in any::<bool>(),
+        ) {
+            let poll = data_of(&Outgoing::PollCreate {
+                question: question.clone(),
+                options: options.clone(),
+                multi_select,
+            })
+            .poll_create
+            .expect("a poll");
+            prop_assert_eq!(poll.question, Some(question));
+            prop_assert_eq!(poll.options, options);
+            prop_assert_eq!(poll.allow_multiple, Some(multi_select));
+        }
+    }
+
+    proptest! {
+        /// A vote names the poll by its author and timestamp and carries the
+        /// caller's counter untouched; receivers keep only the highest count,
+        /// so a rewritten counter would make a later vote lose to an earlier one.
+        #[test]
+        fn a_vote_names_its_poll_and_keeps_its_count(
+            poll in message_id_by(ALICE),
+            option_indexes in proptest::collection::vec(0u32..10, 0..4),
+            vote_count in 1u32..,
+        ) {
+            let vote = data_of(&Outgoing::PollVote {
+                poll,
+                option_indexes: option_indexes.clone(),
+                vote_count,
+            })
+            .poll_vote
+            .expect("a vote");
+            prop_assert_eq!(vote.target_author_aci_binary, Some(ALICE.as_bytes().to_vec()));
+            prop_assert_eq!(vote.target_sent_timestamp, Some(poll.sent_at_ms));
+            prop_assert_eq!(vote.option_indexes, option_indexes);
+            prop_assert_eq!(vote.vote_count, Some(vote_count));
+        }
+    }
+
+    proptest! {
+        /// Ending a poll names it by timestamp alone; receivers take the
+        /// sender as its author.
+        #[test]
+        fn ending_a_poll_names_its_timestamp(poll in message_id_by(ME)) {
+            let end = data_of(&Outgoing::PollTerminate { poll })
+                .poll_terminate
+                .expect("a poll end");
+            prop_assert_eq!(end.target_sent_timestamp, Some(poll.sent_at_ms));
         }
     }
 

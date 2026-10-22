@@ -201,6 +201,11 @@ impl SignalBackend for PresageSignal {
         {
             bail!("Signal only edits and deletes your own messages; {target:?} is someone else's");
         }
+        if let Outgoing::PollTerminate { poll } = &message
+            && poll.author != me
+        {
+            bail!("Signal only ends your own polls; {poll:?} is someone else's");
+        }
         let sent_at_ms = next_timestamp(&self.last_sent_at_ms, now_ms()?);
         let manager = self.manager.clone();
         self.worker
@@ -1037,6 +1042,32 @@ mod tests {
                 "{message:?} failed for the wrong reason: {err:#}"
             );
         }
+    }
+
+    /// Ending a poll names only its timestamp, which receivers pair with the
+    /// sender; ending someone else's poll would close one of ours, or nothing,
+    /// so it must fail here before reaching Signal.
+    #[tokio::test]
+    async fn ending_someone_elses_poll_is_refused() {
+        let (_dir, path) = temp_store();
+        register_linked(&path).await;
+        let signal = PresageSignal::open(&path, &KEY).await.expect("opens");
+        let alice = ServiceId::new(uuid::Uuid::from_u128(0xa11ce));
+        let theirs = MessageId {
+            author: alice,
+            sent_at_ms: 5,
+        };
+        let err = signal
+            .send(
+                Recipient::Contact(alice),
+                Outgoing::PollTerminate { poll: theirs },
+            )
+            .await
+            .expect_err("ended someone else's poll");
+        assert!(
+            err.to_string().contains("your own"),
+            "failed for the wrong reason: {err:#}"
+        );
     }
 
     /// Sending to a group the account isn't in must fail with a reason, before
