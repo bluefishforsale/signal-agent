@@ -51,6 +51,11 @@ impl SignalDesktop {
     pub fn new(dir: Option<PathBuf>, store: ProfileStore) -> Self {
         Self { dir, store }
     }
+
+    /// Desktop's data where Desktop keeps it on this OS.
+    pub fn usual_place(store: ProfileStore) -> Self {
+        Self::new(relay_history::signal_desktop_dir(), store)
+    }
 }
 
 #[async_trait]

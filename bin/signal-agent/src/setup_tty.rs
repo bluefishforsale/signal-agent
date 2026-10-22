@@ -15,6 +15,7 @@ use relay_secrets::StoreKey;
 use relay_setup::{
     claude::{ClaudeClient, Clients, ServerEntry},
     driver::{Driver, HistoryImport, LoginItem, OpenProvisioner, Services},
+    history::{ProfileStore, SignalDesktop},
     prelude::*,
 };
 use relay_signal::{PresageProvisioner, Provisioner, Servers};
@@ -23,14 +24,16 @@ use relay_signal::{PresageProvisioner, Provisioner, Servers};
 pub async fn run(profile: ProfileName) -> anyhow::Result<()> {
     let exe = std::env::current_exe().context("unable to locate this executable")?;
     let server = ServerEntry::for_profile(&profile, &exe, ["mcp", "--profile", &profile])?;
+    let paths = ProfilePaths::for_profile(&profile)?;
+    let store = ProfileStore::new(&profile, &paths, relay_secrets::platform_store()?);
     let services = Services {
         signal: Box::new(Presage),
         secrets: relay_secrets::platform_store()?,
         history: Box::new(NoHistoryYet),
+        desktop: Box::new(SignalDesktop::usual_place(store)),
         login: Box::new(AgentAtLogin),
         clients: Clients::system(),
     };
-    let paths = ProfilePaths::for_profile(&profile)?;
     let start = SetupState::start(&computer_name());
     let mut driver = Driver::new(start, profile, paths, server, services);
     drive(&mut driver, &mut terminal_input()?, &mut io::stdout()).await
@@ -159,6 +162,32 @@ fn render(state: &SetupState, out: &mut impl Write) -> io::Result<()> {
             Some(total) => writeln!(out, "  {imported} of {total} messages"),
             None => writeln!(out, "  {imported} messages"),
         },
+        SetupState::HistoryUnavailable { reason, .. } => writeln!(
+            out,
+            "\n{} Claude can still read every message from now on.",
+            match reason {
+                HistoryGap::NotSent => "Your phone didn't send any earlier messages.",
+                HistoryGap::RelinkRequested => {
+                    "Your phone couldn't send your earlier messages. To try again later, \
+                     remove this computer in Signal's Linked devices and run setup again."
+                }
+                HistoryGap::TimedOut => "Your phone didn't send your earlier messages in time.",
+            }
+        ),
+        SetupState::FindingDesktop { .. } => Ok(()),
+        SetupState::OfferDesktopImport { .. } => writeln!(
+            out,
+            "\nSignal Desktop is on this computer. Its messages can be imported too, which\n\
+             may bring in older ones your phone didn't send. Only its database is read."
+        ),
+        SetupState::ImportingDesktop { imported: 0, .. } => writeln!(
+            out,
+            "\nImporting from Signal Desktop. Your computer may ask to let this read\n\
+             Signal Desktop's key; allow it, or the import can't open the database."
+        ),
+        SetupState::ImportingDesktop { imported, .. } => {
+            writeln!(out, "  {imported} messages")
+        }
         SetupState::ConnectingClients { .. } => {
             writeln!(
                 out,
@@ -245,6 +274,26 @@ fn ask(
             };
             SetupEvent::AccessChosen { access }
         }
+        SetupState::HistoryUnavailable { .. } => {
+            prompt(input, out, "Press Enter to continue: ", |_| Ok(()))?;
+            SetupEvent::SkipHistory
+        }
+        SetupState::OfferDesktopImport { .. } => {
+            let import = prompt(
+                input,
+                out,
+                "Import Signal Desktop's messages too? [y/N]: ",
+                parse_no,
+            )?;
+            SetupEvent::DesktopImportChosen { import }
+        }
+        SetupState::Failed { retry, .. }
+            if matches!(**retry, SetupState::ImportingHistory { .. }) =>
+        {
+            let question = "Press Enter to try again, type s to skip your earlier messages, \
+                            or q to quit: ";
+            return prompt(input, out, question, parse_history_retry);
+        }
         SetupState::Failed { .. } => {
             let retry = prompt(
                 input,
@@ -304,11 +353,29 @@ fn parse_yes(answer: &str) -> Result<bool, &'static str> {
     }
 }
 
+fn parse_no(answer: &str) -> Result<bool, &'static str> {
+    match answer.to_ascii_lowercase().as_str() {
+        "y" | "yes" => Ok(true),
+        "" | "n" | "no" => Ok(false),
+        _ => Err("Type y or n, or press Enter for no."),
+    }
+}
+
 fn parse_retry(answer: &str) -> Result<bool, &'static str> {
     match answer.to_ascii_lowercase().as_str() {
         "" => Ok(true),
         "q" | "quit" => Ok(false),
         _ => Err("Press Enter to try again, or type q to quit."),
+    }
+}
+
+/// Retry or skip history, or `None` to quit.
+fn parse_history_retry(answer: &str) -> Result<Option<SetupEvent>, &'static str> {
+    match answer.to_ascii_lowercase().as_str() {
+        "" => Ok(Some(SetupEvent::Retry)),
+        "s" | "skip" => Ok(Some(SetupEvent::SkipHistory)),
+        "q" | "quit" => Ok(None),
+        _ => Err("Press Enter to try again, type s to skip, or q to quit."),
     }
 }
 
@@ -389,8 +456,11 @@ struct NoHistoryYet;
 
 #[async_trait]
 impl HistoryImport for NoHistoryYet {
-    async fn import(&self, _: &mut (dyn FnMut(u64, Option<u64>) + Send)) -> anyhow::Result<()> {
-        Ok(())
+    async fn import(
+        &self,
+        _: &mut (dyn FnMut(u64, Option<u64>) + Send),
+    ) -> anyhow::Result<Option<HistoryGap>> {
+        Ok(None)
     }
 }
 
@@ -594,6 +664,55 @@ mod tests {
         assert_eq!(event, None);
     }
 
+    /// Desktop import is opt-in, so Enter, the answer people give without
+    /// reading, must decline it.
+    #[test]
+    fn enter_declines_the_signal_desktop_import() {
+        let offer = SetupState::OfferDesktopImport {
+            access: AccessMode::Full,
+        };
+        let mut out = Vec::new();
+        for (answer, import) in [("\n", false), ("n\n", false), ("y\n", true)] {
+            let event = ask(&offer, &mut io::Cursor::new(answer), &mut out).expect("ask");
+            assert_eq!(
+                event,
+                Some(SetupEvent::DesktopImportChosen { import }),
+                "{answer:?}"
+            );
+        }
+        let out = String::from_utf8(out).expect("utf-8");
+        assert!(out.contains("[y/N]"), "{out}");
+    }
+
+    /// A history import that keeps failing must not trap a terminal user in
+    /// retry: its failure prompt offers skipping history, and only its own.
+    #[test]
+    fn a_failed_history_import_can_be_skipped_from_the_terminal() {
+        let failed = |retry| SetupState::Failed {
+            message: "archive expired".into(),
+            retry: Box::new(retry),
+        };
+        let history = failed(SetupState::ImportingHistory {
+            imported: 0,
+            total: None,
+            access: AccessMode::Full,
+        });
+        let mut out = Vec::new();
+        let event = ask(&history, &mut io::Cursor::new("s\n"), &mut out).expect("ask");
+        assert_eq!(event, Some(SetupEvent::SkipHistory));
+        assert!(String::from_utf8(out).expect("utf-8").contains("s to skip"));
+
+        let mut out = Vec::new();
+        let event = ask(
+            &failed(SetupState::EnterNumber),
+            &mut io::Cursor::new("s\n\n"),
+            &mut out,
+        )
+        .expect("ask");
+        assert_eq!(event, Some(SetupEvent::Retry));
+        assert!(!String::from_utf8(out).expect("utf-8").contains("s to skip"));
+    }
+
     struct Phone;
 
     #[async_trait]
@@ -655,6 +774,18 @@ mod tests {
         }
     }
 
+    struct NoDesktop;
+
+    #[async_trait]
+    impl relay_setup::driver::DesktopHistory for NoDesktop {
+        fn found(&self) -> bool {
+            false
+        }
+        async fn import(&self, _: &mut (dyn FnMut(u64) + Send)) -> anyhow::Result<()> {
+            bail!("no Signal Desktop here")
+        }
+    }
+
     struct Agent;
 
     impl LoginItem for Agent {
@@ -680,6 +811,7 @@ mod tests {
             signal: Box::new(Phone),
             secrets: Box::new(KeyFile::default()),
             history: Box::new(NoHistoryYet),
+            desktop: Box::new(NoDesktop),
             login: Box::new(Agent),
             clients,
         };
