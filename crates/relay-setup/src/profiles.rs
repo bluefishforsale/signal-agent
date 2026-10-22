@@ -58,12 +58,18 @@ impl Profiles {
 
     /// Adds the profile `name`, which must be a valid name not already in use.
     pub fn create(&self, name: &str) -> anyhow::Result<ProfileName> {
+        let profile = self.available(name)?;
+        self.add(self.load()?, profile)
+    }
+
+    /// `name` as a profile, if it is valid and not already in use; lists
+    /// nothing.
+    pub fn available(&self, name: &str) -> anyhow::Result<ProfileName> {
         let profile = ProfileName::new(name)?;
-        let registry = self.load()?;
-        if registry.profiles.contains(&profile) {
+        if self.load()?.profiles.contains(&profile) {
             bail!("a profile called \"{profile}\" already exists");
         }
-        self.add(registry, profile)
+        Ok(profile)
     }
 
     /// Lists `profile` if it isn't already.
@@ -213,6 +219,23 @@ mod tests {
             profiles.list().expect("list"),
             [name("personal"), name("bot")]
         );
+    }
+
+    /// The app's "Add another account" checks a typed name before setup
+    /// starts, but setup lists the profile only once it begins; checking must
+    /// not list it, or a name typed and abandoned would show as an account.
+    #[test]
+    fn checking_a_new_name_refuses_bad_and_taken_names_and_lists_nothing() {
+        let base = tempfile::tempdir().expect("temp data dir");
+        let profiles = Profiles::under(base.path().into());
+        profiles.ensure_default().expect("default profile");
+
+        assert_eq!(profiles.available("bot").expect("bot is free"), name("bot"));
+        for bad in ["personal", "Work Phone", "../etc", ""] {
+            let refused = profiles.available(bad);
+            assert!(refused.is_err(), "accepted {bad:?}: {refused:?}");
+        }
+        assert_eq!(profiles.list().expect("list"), [name("personal")]);
     }
 
     /// Two accounts on one machine must never touch each other's files, agent
