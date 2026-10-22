@@ -100,6 +100,69 @@ impl Tool for ListScheduledMessages {
     }
 }
 
+pub struct CancelScheduledMessage;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CancelScheduledMessageInput {
+    job_id: JobRef,
+}
+
+#[async_trait]
+impl Tool for CancelScheduledMessage {
+    fn name(&self) -> &'static str {
+        "cancel_scheduled_message"
+    }
+    fn description(&self) -> &'static str {
+        "Cancel a scheduled message so it's never sent, or clear a failed one from the list. \
+         job_id is the id schedule_message or list_scheduled_messages returns. A job already \
+         being sent still finishes that send. Returns {cancelled}: false when there was no \
+         such job."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "job_id": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": JobRef::MAX,
+                    "description": "The scheduled job's id",
+                },
+            },
+            "required": ["job_id"],
+            "additionalProperties": false,
+        })
+    }
+    fn writes(&self) -> bool {
+        true
+    }
+    async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
+        let CancelScheduledMessageInput { job_id } = parse(input)?;
+        let cancelled = ctx.store.cancel_scheduled(JobId(job_id.0)).await?;
+        Ok(json!({ "cancelled": cancelled }))
+    }
+}
+
+/// A job id as a client sends it: 1 to 2^53 - 1, the integers JSON carries exactly.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(try_from = "u64")]
+struct JobRef(u64);
+
+impl JobRef {
+    const MAX: u64 = (1 << 53) - 1;
+}
+
+impl TryFrom<u64> for JobRef {
+    type Error = String;
+    fn try_from(n: u64) -> Result<Self, String> {
+        match n {
+            1..=Self::MAX => Ok(Self(n)),
+            _ => Err(format!("job_id must be 1 to {}, got {n}", Self::MAX)),
+        }
+    }
+}
+
 /// Sends every scheduled message due at `now_ms` through `registry`'s send
 /// tools, once each, and records each outcome. Returns those outcomes.
 // NOTE: never retries. A send the limiter refused must not queue up to burst
@@ -298,5 +361,23 @@ mod tests {
         );
         assert_eq!(jobs[1]["id"], later["job_id"], "{out}");
         assert_eq!(jobs[1]["send"]["body"], json!("later"), "{out}");
+    }
+
+    /// A cancelled job must never fire, and cancelling it again must say
+    /// nothing was there rather than fail.
+    #[tokio::test]
+    async fn a_cancelled_job_never_fires() {
+        let (ctx, signal) = ctx(AccessMode::Full, ProfileKind::Primary);
+        let registry = Registry::standard();
+        let id = schedule_hi(&ctx).await;
+        for expected in [true, false] {
+            let out = registry
+                .call(&ctx, "cancel_scheduled_message", json!({"job_id": id}))
+                .await
+                .unwrap();
+            assert_eq!(out["cancelled"], json!(expected), "{out}");
+        }
+        assert!(run_due(&registry, &ctx, 1).await.unwrap().is_empty());
+        assert!(signal.sent().is_empty(), "sent {:?}", signal.sent());
     }
 }

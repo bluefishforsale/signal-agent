@@ -56,6 +56,7 @@ impl Registry {
             .with(webhook::GetWebhook)
             .with(schedule::ScheduleMessage)
             .with(schedule::ListScheduledMessages)
+            .with(schedule::CancelScheduledMessage)
     }
 
     /// Applies account-safety limits to every send a tool makes.
