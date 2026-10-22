@@ -3,13 +3,16 @@
 //! in for it in every test so no lane needs a real account.
 
 mod backend;
+mod convert;
 mod fake;
+mod presage_backend;
 
 pub use backend::{
     Account, Contact, Group, Incoming, LinkEvent, Outgoing, Provisioner, RegistrationStep,
     SignalBackend,
 };
 pub use fake::FakeSignal;
+pub use presage_backend::{PresageProvisioner, PresageSignal, Servers};
 
 pub mod prelude {
     pub use crate::{
