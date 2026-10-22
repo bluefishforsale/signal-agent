@@ -5,6 +5,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, bail};
+use reqwest::StatusCode;
 use serde::Deserialize;
 use url::Url;
 
@@ -66,24 +67,29 @@ impl ArchiveSource {
         url.query_pairs_mut()
             .append_pair("timeout", &secs.to_string());
         let (user, password) = &self.login;
-        let response = self
-            .http
-            .get(url)
-            .basic_auth(user, Some(password))
-            .send()
-            .await
-            .context("unable to ask Signal for the history archive")?;
-        if !response.status().is_success() {
-            bail!(
-                "Signal refused the history archive request: {}",
-                response.status()
-            );
+        loop {
+            let response = self
+                .http
+                .get(url.clone())
+                .basic_auth(user, Some(password))
+                .send()
+                .await
+                .context("unable to ask Signal for the history archive")?;
+            if response.status() == StatusCode::NO_CONTENT {
+                continue;
+            }
+            if !response.status().is_success() {
+                bail!(
+                    "Signal refused the history archive request: {}",
+                    response.status()
+                );
+            }
+            let ArchiveResponse::Ready { cdn, key } = response
+                .json()
+                .await
+                .context("Signal's answer about the history archive is unreadable")?;
+            return Ok(Waited::Ready { cdn, key });
         }
-        let ArchiveResponse::Ready { cdn, key } = response
-            .json()
-            .await
-            .context("Signal's answer about the history archive is unreadable")?;
-        Ok(Waited::Ready { cdn, key })
     }
 }
 
@@ -188,5 +194,30 @@ mod tests {
                 .contains("authorization: basic bwuumjpzzwnyzxq="),
             "{request}"
         );
+    }
+
+    fn empty(status: &str) -> Vec<u8> {
+        format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").into_bytes()
+    }
+
+    /// 204 is the server saying the phone hasn't answered yet, so the
+    /// device must ask again rather than give up.
+    #[tokio::test]
+    async fn no_content_means_ask_again() {
+        let server = FakeServer::start(vec![
+            empty("204 No Content"),
+            empty("204 No Content"),
+            json("200 OK", r#"{"cdn":2,"key":"k"}"#),
+        ])
+        .await;
+        let waited = source(&server).wait_for_archive().await.expect("waited");
+        assert_eq!(
+            waited,
+            Waited::Ready {
+                cdn: 2,
+                key: "k".into()
+            }
+        );
+        assert_eq!(server.requests().len(), 3, "{:?}", server.requests());
     }
 }
