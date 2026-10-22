@@ -559,14 +559,11 @@ mod tests {
 
     /// Number discovery isn't in this version, so a number resolves only
     /// against the account's contacts. A stranger's number is an answer that
-    /// says so, not an error, and Signal's discovery is never asked even when
-    /// it would have known the number.
+    /// says so, not an error, and Signal's discovery is never asked (the fake
+    /// refuses discovery, so asking would fail this test).
     #[tokio::test]
     async fn get_profile_resolves_contacts_and_never_calls_discovery_for_strangers() {
-        let ctx = ctx_of(|s| {
-            s.with_contacts(vec![known(9, "+15550000009")])
-                .with_registered("+15550000008", sid(8))
-        });
+        let ctx = ctx_of(|s| s.with_contacts(vec![known(9, "+15550000009")]));
         let registry = Registry::standard();
         let found = registry
             .call(&ctx, "get_profile", json!({"number": "+15550000009"}))
@@ -598,7 +595,6 @@ mod tests {
     async fn get_user_status_answers_every_number_and_username_in_order() {
         let ctx = ctx_of(|s| {
             s.with_contacts(vec![known(9, "+15550000009")])
-                .with_registered("+15550000008", sid(8))
                 .with_username("ada.42", sid(4))
         });
         let out = Registry::standard()

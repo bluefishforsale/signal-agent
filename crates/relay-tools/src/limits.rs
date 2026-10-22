@@ -1110,8 +1110,10 @@ mod tests {
             &self,
             numbers: &[String],
         ) -> anyhow::Result<Vec<(String, Option<ServiceId>)>> {
+            // FakeSignal refuses discovery, as production does in v2.0; the
+            // budget is still the limiter's to enforce, so answer here.
             self.calls.fetch_add(1, Ordering::SeqCst);
-            self.inner.discover(numbers).await
+            Ok(numbers.iter().map(|n| (n.clone(), None)).collect())
         }
         async fn lookup_username(&self, username: &str) -> anyhow::Result<Option<ServiceId>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
