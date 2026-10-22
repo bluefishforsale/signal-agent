@@ -4,10 +4,12 @@
 
 use std::time::Duration;
 
-use anyhow::{Context, bail};
-use reqwest::StatusCode;
+use anyhow::{Context, anyhow, bail};
+use reqwest::{StatusCode, header::RETRY_AFTER};
 use serde::Deserialize;
 use url::Url;
+
+use crate::RateLimited;
 
 /// Where the phone said its archive went, or why it sent none.
 #[derive(Debug, PartialEq, Eq)]
@@ -40,6 +42,24 @@ struct Patience {
 enum ArchiveResponse {
     Ready { cdn: u32, key: String },
     Failed { error: String },
+}
+
+/// Why Signal refused `response`, as the typed `RateLimited` for a 429.
+fn refused(response: &reqwest::Response, what: &str) -> anyhow::Error {
+    let status = response.status();
+    if status != StatusCode::TOO_MANY_REQUESTS {
+        return anyhow!("Signal refused {what}: {status}");
+    }
+    let retry_after = response
+        .headers()
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok()?.trim().parse().ok())
+        .map(Duration::from_secs);
+    RateLimited {
+        message: format!("{what}: {status}"),
+        retry_after,
+    }
+    .into()
 }
 
 /// A client for Signal's hosts, configured by `builder`.
@@ -82,10 +102,7 @@ impl ArchiveSource {
                 continue;
             }
             if !response.status().is_success() {
-                bail!(
-                    "Signal refused the history archive request: {}",
-                    response.status()
-                );
+                return Err(refused(&response, "the history archive request"));
             }
             let answer = response
                 .json()
@@ -243,5 +260,30 @@ mod tests {
             let waited = source(&server).wait_for_archive().await.expect(body);
             assert_eq!(waited, expected, "{body}");
         }
+    }
+
+    /// A 429 on the long-poll must come back as the typed RateLimited with
+    /// Signal's wait, and must not be asked again: retrying a rate-limited
+    /// request is how accounts get flagged.
+    #[tokio::test]
+    async fn a_rate_limited_poll_is_not_retried_and_carries_signals_wait() {
+        let server = FakeServer::start(vec![
+            b"HTTP/1.1 429 Too Many Requests\r\nretry-after: 90\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_vec(),
+            json("200 OK", r#"{"cdn":2,"key":"k"}"#),
+        ])
+        .await;
+        let error = source(&server)
+            .wait_for_archive()
+            .await
+            .expect_err("a 429 was not an error");
+        let limited = error
+            .downcast_ref::<RateLimited>()
+            .unwrap_or_else(|| panic!("not RateLimited: {error:#}"));
+        assert_eq!(
+            limited.retry_after,
+            Some(Duration::from_secs(90)),
+            "{limited:?}"
+        );
+        assert_eq!(server.requests().len(), 1, "{:?}", server.requests());
     }
 }
