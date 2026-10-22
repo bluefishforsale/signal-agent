@@ -1,5 +1,39 @@
-//! Cleans what the user pastes before setup sees it, since people copy links
-//! with stray spaces and the browser's scheme attached.
+//! Checks and cleans what the page sends before setup sees it: people paste
+//! links with stray spaces and the browser's scheme attached, and the page
+//! must never be able to claim a result only the driver can report.
+
+use relay_setup::prelude::*;
+
+/// `event` as setup should see it, or `None` when the page may not send it.
+pub fn from_page(event: SetupEvent) -> Option<SetupEvent> {
+    use SetupEvent as E;
+
+    match event {
+        E::CaptchaSolved { token } => Some(E::CaptchaSolved {
+            token: captcha_token(&token)?,
+        }),
+        E::NumberEntered { number } => Some(E::NumberEntered {
+            number: number
+                .chars()
+                .filter(|c| !c.is_whitespace() && !"()-.".contains(*c))
+                .collect(),
+        }),
+        E::AccountChosen { .. }
+        | E::CodeEntered { .. }
+        | E::AccessChosen { .. }
+        | E::RestartDesktop
+        | E::Retry => Some(event),
+        E::LinkUri { .. }
+        | E::Linked
+        | E::CaptchaRequired
+        | E::CodeSent
+        | E::Registered
+        | E::HistoryProgress { .. }
+        | E::HistoryDone
+        | E::ClientsConnected { .. }
+        | E::CommandFailed { .. } => None,
+    }
+}
 
 /// The captcha token inside a pasted `signalcaptcha://` link, or `None` when
 /// nothing usable was pasted.
@@ -39,6 +73,51 @@ mod tests {
     fn an_empty_paste_is_no_captcha() {
         for pasted in ["", "   ", "signalcaptcha://", " signalcaptcha:// "] {
             assert_eq!(captcha_token(pasted), None, "from {pasted:?}");
+        }
+    }
+
+    /// Results such as "linked" or "registered" come only from the driver; a
+    /// page that could send them could skip linking altogether.
+    #[test]
+    fn the_page_cannot_report_driver_results() {
+        for event in [
+            SetupEvent::LinkUri {
+                uri: "sgnl://x".into(),
+            },
+            SetupEvent::Linked,
+            SetupEvent::CaptchaRequired,
+            SetupEvent::CodeSent,
+            SetupEvent::Registered,
+            SetupEvent::HistoryProgress {
+                imported: 1,
+                total: None,
+            },
+            SetupEvent::HistoryDone,
+            SetupEvent::ClientsConnected {
+                clients: Vec::new(),
+            },
+            SetupEvent::CommandFailed {
+                message: "x".into(),
+            },
+        ] {
+            assert_eq!(from_page(event.clone()), None, "accepted {event:?}");
+        }
+    }
+
+    /// People type numbers the way they read them; Signal needs the bare
+    /// international form, so spacing and punctuation must not reach it.
+    #[test]
+    fn a_typed_number_reaches_setup_in_international_form() {
+        for typed in ["+1 (555) 555-0123", " +1.555.555.0123 ", "+15555550123"] {
+            assert_eq!(
+                from_page(SetupEvent::NumberEntered {
+                    number: typed.into()
+                }),
+                Some(SetupEvent::NumberEntered {
+                    number: "+15555550123".into()
+                }),
+                "from {typed:?}"
+            );
         }
     }
 }
