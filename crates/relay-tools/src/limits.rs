@@ -153,25 +153,26 @@ impl Limiter {
     /// Keeps the send budget and new-recipient count in `path`, so a restart
     /// doesn't reset them.
     // NOTE: an unreadable file must not stop the agent, which would also stop
-    // message capture. It's set aside for inspection and the limiter starts
-    // with every budget spent, failing safe on sending instead.
+    // message capture. The limiter starts with every budget spent instead, and
+    // that state replaces the file in one step: a moment with no file at all
+    // would let a restart load a fresh budget.
     pub fn persisted(mut self, path: PathBuf) -> Self {
         let state = match load(&path) {
             Ok(state) => state,
             Err(e) => {
                 let now = self.clock.now_ms();
-                let mut aside = path.clone().into_os_string();
-                aside.push(format!(".corrupt-{now}"));
-                match std::fs::rename(&path, &aside) {
-                    Ok(()) => tracing::warn!(
+                let state = State::exhausted(now);
+                match replace_damaged(&path, &state, now) {
+                    Ok(Some(aside)) => tracing::warn!(
                         "{e:#}; kept it as {} and paused sending until the limits refill",
-                        Path::new(&aside).display()
+                        aside.display()
                     ),
+                    Ok(None) => tracing::warn!("{e:#}; paused sending until the limits refill"),
                     Err(r) => tracing::warn!(
-                        "{e:#}; couldn't set it aside ({r}); paused sending until the limits refill"
+                        "{e:#}; left it in place ({r:#}) and paused sending until the limits refill"
                     ),
                 }
-                State::exhausted(now)
+                state
             }
         };
         *self.state.get_mut().expect("limiter state") = state;
@@ -278,9 +279,46 @@ fn load(path: &Path) -> anyhow::Result<State> {
     match std::fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .with_context(|| format!("unreadable limits file {}", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(State::default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match damaged_sibling(path) {
+            Some(aside) => anyhow::bail!(
+                "{} is missing but a damaged one was set aside as {}",
+                path.display(),
+                aside.display()
+            ),
+            None => Ok(State::default()),
+        },
         Err(e) => Err(e).with_context(|| format!("can't read {}", path.display())),
     }
+}
+
+/// A damaged limits file set aside next to `path`, if any.
+fn damaged_sibling(path: &Path) -> Option<PathBuf> {
+    let prefix = format!("{}.corrupt-", path.file_name()?.to_string_lossy());
+    std::fs::read_dir(path.parent()?)
+        .ok()?
+        .filter_map(Result::ok)
+        .find(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+        .map(|e| e.path())
+}
+
+/// Copies the damaged file at `path` aside, then replaces it with `state`,
+/// returning where the copy went. On any failure the damaged file stays where
+/// it is, so the next start takes the same exhausted path.
+fn replace_damaged(path: &Path, state: &State, now: u64) -> anyhow::Result<Option<PathBuf>> {
+    // A missing file was judged damaged because a set-aside copy exists, so
+    // there's nothing new to keep.
+    let aside = if path.exists() {
+        let mut aside = path.as_os_str().to_owned();
+        aside.push(format!(".corrupt-{now}"));
+        let aside = PathBuf::from(aside);
+        std::fs::copy(path, &aside)
+            .with_context(|| format!("can't copy it to {}", aside.display()))?;
+        Some(aside)
+    } else {
+        None
+    };
+    write_atomically(path, &serde_json::to_vec(state)?)?;
+    Ok(aside)
 }
 
 // NOTE: a torn write would pause sending for a day on the next start, so write
@@ -648,6 +686,60 @@ mod tests {
         assert_eq!(aside.len(), 1, "damaged file not kept aside");
         let kept = std::fs::read(aside[0].path()).expect("read kept file");
         assert_eq!(kept, b"{\"minute\": tru", "the damaged file was altered");
+        std::fs::remove_dir_all(&dir).expect("clean temp dir");
+    }
+
+    /// Setting a damaged file aside must not leave a gap where no limits file
+    /// exists, or a restart before the next send would load a fresh budget.
+    #[tokio::test]
+    async fn a_restart_right_after_a_damaged_limits_file_still_starts_exhausted() {
+        let dir = std::env::temp_dir().join(format!("relay-limits-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("limits.json");
+        std::fs::write(&path, b"garbage").expect("write damaged file");
+        let clock = Arc::new(FakeClock::default());
+        let start = || Limiter::new(Limits::default(), clock.clone()).persisted(path.clone());
+        drop(start());
+        let registry = Registry::standard().with_limiter(start());
+        let (ctx, signal) = ctx();
+        ctx.store
+            .insert(&incoming(2, 1, "hey"))
+            .await
+            .expect("seed");
+        let input = json!({"recipient": sid(2).to_string(), "message": "hi"});
+        let result = registry.call(&ctx, "send_message", input).await;
+        assert!(
+            refused(&result).is_some(),
+            "a restart after a damaged limits file got a fresh budget: {result:?}"
+        );
+        assert!(signal.sent().is_empty(), "a refused send reached Signal");
+        std::fs::remove_dir_all(&dir).expect("clean temp dir");
+    }
+
+    /// Deleting limits.json while a damaged copy sits beside it must not buy a
+    /// fresh budget either.
+    #[tokio::test]
+    async fn a_missing_limits_file_beside_a_set_aside_damaged_one_starts_exhausted() {
+        let dir = std::env::temp_dir().join(format!("relay-limits-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("limits.json");
+        std::fs::write(dir.join("limits.json.corrupt-1"), b"garbage").expect("write aside");
+        let limiter =
+            Limiter::new(Limits::default(), Arc::new(FakeClock::default())).persisted(path.clone());
+        let registry = Registry::standard().with_limiter(limiter);
+        let (ctx, signal) = ctx();
+        ctx.store
+            .insert(&incoming(2, 1, "hey"))
+            .await
+            .expect("seed");
+        let input = json!({"recipient": sid(2).to_string(), "message": "hi"});
+        let result = registry.call(&ctx, "send_message", input).await;
+        assert!(
+            refused(&result).is_some(),
+            "a missing limits file beside a damaged one got a fresh budget: {result:?}"
+        );
+        assert!(signal.sent().is_empty(), "a refused send reached Signal");
+        assert!(path.exists(), "the exhausted state wasn't written back");
         std::fs::remove_dir_all(&dir).expect("clean temp dir");
     }
 
