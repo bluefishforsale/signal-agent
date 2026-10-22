@@ -6,8 +6,8 @@ use relay_core::prelude::*;
 use serde_json::Value;
 
 use crate::{
-    Limiter, Tool, ToolContext, ToolError, admin, directory, limits, local, lookup, media, mutate,
-    pins, polls, read, schedule, send, stickers, webhook,
+    Limiter, Tool, ToolContext, ToolError, account, admin, directory, limits, local, lookup, media,
+    mutate, pins, polls, read, schedule, send, stickers, webhook,
 };
 
 /// The set of tools a profile serves.
@@ -70,6 +70,7 @@ impl Registry {
             .with(stickers::GetSticker)
             .with(lookup::GetProfile)
             .with(lookup::GetUserStatus)
+            .with(account::UpdateProfile)
     }
 
     /// Applies account-safety limits to every send a tool makes.
