@@ -249,6 +249,14 @@ async fn open_backend_and_store(
         bail!("profile \"{profile}\" has no database key; run setup for it again");
     };
     let paths = &config.paths;
+    // NOTE: presage creates a missing store on open. One made here would hold
+    // no account, yet look to the next start like a profile that has one.
+    if !paths.signal_store.exists() {
+        bail!(
+            "profile \"{profile}\" has no Signal account at \"{}\"; run setup to link or register it",
+            paths.signal_store.display()
+        );
+    }
     let signal = PresageSignal::open(&paths.signal_store, key.as_bytes())
         .await
         .with_context(|| format!("unable to open profile \"{profile}\"'s Signal account"))?;
@@ -332,6 +340,31 @@ pub(crate) mod tests {
         );
     }
 
+    /// A profile whose setup stopped before linking has a key but no account.
+    /// The agent must send the user back to setup, not leave an empty
+    /// encrypted store behind that looks like an account.
+    #[tokio::test]
+    async fn a_profile_never_linked_fails_without_creating_either_store() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = profile_paths(tmp.path());
+        std::fs::create_dir_all(&config.paths.root).expect("profile dir");
+        let secrets = relay_secrets::MemorySecretStore::default();
+        let key = relay_secrets::StoreKey::generate().expect("key");
+        secrets.set(&config.profile, &key).expect("save key");
+        let Err(e) = open_backend_and_store(&config, &secrets).await else {
+            panic!("opened a profile with no Signal account");
+        };
+        let message = format!("{e:#}");
+        assert!(
+            message.contains("\"personal\"") && message.contains("setup"),
+            "error doesn't send the user back to setup: {message}"
+        );
+        assert!(
+            !config.paths.signal_store.exists() && !config.paths.message_store.exists(),
+            "a store was created for a profile with no account"
+        );
+    }
+
     fn assert_network_is_dead() {
         for var in ["HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"] {
             assert_eq!(
@@ -410,6 +443,45 @@ pub(crate) mod tests {
         relay_store::SqlCipherStore::open(&config.paths.message_store, &key)
             .await
             .expect("the message store is encrypted with the profile's key");
+    }
+
+    /// A key that doesn't match a store (a replaced Keychain item, a restored
+    /// backup) must stop the agent with the files as they were, never swap in
+    /// a fresh empty store under the new key.
+    #[tokio::test]
+    async fn the_wrong_key_fails_closed_and_leaves_the_stores_untouched() {
+        let saved = relay_secrets::StoreKey::generate().expect("key");
+        let other = relay_secrets::StoreKey::generate().expect("key");
+        // Which key each existing store was encrypted with; None is no file.
+        for (signal_key, messages_key) in [(&other, None), (&saved, Some(&other))] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let config = profile_paths(tmp.path());
+            std::fs::create_dir_all(&config.paths.root).expect("profile dir");
+            linked_signal_store(&config.paths.signal_store, signal_key).await;
+            if let Some(key) = messages_key {
+                let store = relay_store::SqlCipherStore::open(&config.paths.message_store, key)
+                    .await
+                    .expect("message store");
+                store.close().await.expect("close");
+            }
+            let files = || {
+                [&config.paths.signal_store, &config.paths.message_store]
+                    .map(|f| std::fs::read(f).ok())
+            };
+            let before = files();
+            let secrets = relay_secrets::MemorySecretStore::default();
+            secrets.set(&config.profile, &saved).expect("save key");
+
+            let opened = open_backend_and_store(&config, &secrets).await;
+            let case = if messages_key.is_none() {
+                "signal"
+            } else {
+                "messages"
+            };
+            assert!(opened.is_err(), "{case}: opened under the wrong key");
+            drop(opened);
+            assert!(files() == before, "{case}: a store file changed");
+        }
     }
 
     /// An AI client that can crash or restart the agent must not get a fresh
