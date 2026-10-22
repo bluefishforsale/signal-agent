@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use crate::{
     Tool, ToolContext, ToolError,
-    input::{non_blank, parse, recipient, recipient_schema},
+    input::{group, group_schema, non_blank, parse},
 };
 
 pub struct ListContacts;
@@ -97,10 +97,10 @@ impl Tool for ListGroups {
     fn description(&self) -> &'static str {
         "List the Signal groups this account is a member of: id (pass it as the recipient of \
          group tools), name, member_count and members (service ids). group_id returns only that \
-         group; a contact's id matches no group. No messages sent."
+         group. No messages sent."
     }
     fn input_schema(&self) -> Value {
-        let mut group_id = recipient_schema();
+        let mut group_id = group_schema();
         group_id["description"] = json!("Return only this group (64 hex characters)");
         json!({
             "type": "object",
@@ -113,16 +113,13 @@ impl Tool for ListGroups {
     }
     async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
         let ListGroupsInput { group_id } = parse(input)?;
-        let only = match group_id {
-            Some(s) => Some(recipient(ctx, &s).await?),
-            None => None,
-        };
+        let only = group_id.as_deref().map(group).transpose()?;
         let groups: Vec<_> = ctx
             .signal
             .groups()
             .await?
             .iter()
-            .filter(|g| only.is_none_or(|r| r == Recipient::Group(g.id)))
+            .filter(|g| only.is_none_or(|id| id == g.id))
             .map(|g| {
                 json!({
                     "id": g.id.to_string(),
@@ -527,6 +524,20 @@ mod tests {
             matches!(&result, Err(ToolError::InvalidInput(e)) if e.contains("5 MiB")),
             "got {:?}",
             result.map(|_| "a file over the cap")
+        );
+    }
+
+    /// A person's id in group_id is a caller mistake; answering with no groups
+    /// would read as "you're in no such group" instead of "wrong kind of id".
+    #[tokio::test]
+    async fn list_groups_refuses_a_persons_id_as_group_id() {
+        let ctx = ctx_of(|s| s.with_groups(vec![group(0xaa, "Cats", &[ME, 2])]));
+        let result = Registry::standard()
+            .call(&ctx, "list_groups", json!({"group_id": sid(2).to_string()}))
+            .await;
+        assert!(
+            matches!(result, Err(ToolError::InvalidInput(_))),
+            "got {result:?}"
         );
     }
 }
