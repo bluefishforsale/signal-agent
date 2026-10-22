@@ -11,8 +11,10 @@ use presage::libsignal_service::prelude::{
 };
 use presage::{
     libsignal_service::{
+        Profile,
         content::{Content, ContentBody},
         groups_v2::Role,
+        profile_name::ProfileName,
         protocol,
         sender::AttachmentSpec,
         websocket::account::DeviceInfo,
@@ -29,7 +31,9 @@ use presage::{
 };
 use relay_core::prelude::*;
 
-use crate::{Account, Incoming, Outgoing};
+use crate::{
+    Account, Incoming, Outgoing, ProfileUpdate, RequestResponse, StickerInfo, StickerPack,
+};
 
 /// What `content` means to the agent, or `None` when it carries nothing the
 /// agent keeps (delivery receipts, calls, stories, key syncs). `me` is the
@@ -193,6 +197,27 @@ pub(crate) fn attachment_spec(path: &Path, length: usize) -> AttachmentSpec {
     }
 }
 
+pub(crate) fn sticker_pack_from(pack: &presage::store::StickerPack) -> anyhow::Result<StickerPack> {
+    let id: [u8; 16] =
+        pack.id.as_slice().try_into().with_context(|| {
+            format!("stored sticker pack id is {} bytes, not 16", pack.id.len())
+        })?;
+    Ok(StickerPack {
+        id: StickerPackId::new(id),
+        title: pack.manifest.title.clone(),
+        author: pack.manifest.author.clone(),
+        stickers: pack
+            .manifest
+            .stickers
+            .iter()
+            .map(|s| StickerInfo {
+                id: s.id,
+                emoji: s.emoji.clone(),
+            })
+            .collect(),
+    })
+}
+
 /// What to put on the wire for `message`, sent at `sent_at_ms`, carrying
 /// `group` when it goes to a group.
 pub(crate) fn content_body(
@@ -337,7 +362,92 @@ pub(crate) fn content_body(
         Outgoing::Sticker { .. } => {
             bail!("a sticker goes out through sticker_body, once its pack is looked up")
         }
+        Outgoing::MessageRequestResponse { .. } => {
+            bail!(
+                "a message request answer goes out through profile_key_update and request_response_sync"
+            )
+        }
+        Outgoing::ExpirationTimer { .. } if group.is_some() => {
+            bail!("a timer update only goes to a contact; a group's timer is a group change")
+        }
+        Outgoing::ExpirationTimer { seconds } => ContentBody::DataMessage(data(DataMessage {
+            expire_timer: Some(*seconds),
+            flags: Some(data_message::Flags::ExpirationTimerUpdate as u32),
+            ..Default::default()
+        })),
     })
+}
+
+/// The name, about text and about emoji to upload: `update` laid over
+/// `current`, since Signal replaces the whole profile on upload.
+pub(crate) fn merged_profile(
+    current: Profile,
+    update: ProfileUpdate,
+) -> anyhow::Result<(ProfileName<String>, Option<String>, Option<String>)> {
+    let (given, family) = match current.name {
+        Some(name) => (Some(name.given_name), name.family_name),
+        None => (None, None),
+    };
+    let Some(given_name) = update.given_name.or(given).filter(|g| !g.trim().is_empty()) else {
+        bail!("a Signal profile needs a given name");
+    };
+    let set = |new: Option<String>, old: Option<String>| match new {
+        Some(new) if new.is_empty() => None,
+        Some(new) => Some(new),
+        None => old,
+    };
+    Ok((
+        ProfileName {
+            given_name,
+            family_name: set(update.family_name, family),
+        },
+        set(update.about, current.about),
+        set(update.about_emoji, current.about_emoji),
+    ))
+}
+
+/// A message that only hands the recipient this account's profile key, which
+/// presage attaches to every data message it sends.
+pub(crate) fn profile_key_update(sent_at_ms: u64) -> ContentBody {
+    ContentBody::DataMessage(DataMessage {
+        timestamp: Some(sent_at_ms),
+        flags: Some(data_message::Flags::ProfileKeyUpdate as u32),
+        ..Default::default()
+    })
+}
+
+/// Tells this account's other devices how it answered `thread`'s message
+/// request.
+pub(crate) fn request_response_sync(
+    thread: ServiceId,
+    response: RequestResponse,
+) -> anyhow::Result<ContentBody> {
+    use sync_message::message_request_response::Type;
+    let r#type = match response {
+        RequestResponse::Accept => Type::Accept,
+        RequestResponse::Delete => Type::Delete,
+    };
+    Ok(ContentBody::SynchronizeMessage(SyncMessage {
+        content: Some(SyncContent::MessageRequestResponse(
+            sync_message::MessageRequestResponse {
+                thread_aci_binary: Some(aci(thread).service_id_binary()),
+                r#type: Some(r#type as i32),
+                ..Default::default()
+            },
+        )),
+        padding: Some(sync_padding()?),
+        ..Default::default()
+    }))
+}
+
+/// 1 to 512 random bytes, as Signal's apps pad sync messages so their size
+/// doesn't give away what they carry.
+fn sync_padding() -> anyhow::Result<Vec<u8>> {
+    let mut size = [0u8; 2];
+    getrandom::fill(&mut size).map_err(|e| anyhow::anyhow!("no OS randomness: {e}"))?;
+    let mut padding = vec![0; 1 + usize::from(u16::from_le_bytes(size) % 512)];
+    getrandom::fill(&mut padding).map_err(|e| anyhow::anyhow!("no OS randomness: {e}"))?;
+    Ok(padding)
 }
 
 /// What to put on the wire for sticker `sticker_id` of `pack`, whose image
@@ -1048,6 +1158,128 @@ mod tests {
             };
             prop_assert_eq!(pin.pin_duration, Some(expected));
         }
+    }
+
+    proptest! {
+        /// Signal's apps change a chat's timer only on a message flagged as a
+        /// timer update; without the flag the seconds are just the timer the
+        /// message itself expires under, and the chat setting stays put.
+        #[test]
+        fn a_timer_update_carries_the_seconds_and_the_update_flag(seconds in any::<u32>()) {
+            let update = data_of(&Outgoing::ExpirationTimer { seconds });
+            prop_assert_eq!(update.expire_timer, Some(seconds));
+            prop_assert_eq!(
+                update.flags,
+                Some(data_message::Flags::ExpirationTimerUpdate as u32)
+            );
+        }
+    }
+
+    proptest! {
+        /// Accepting a request must hand the requester our profile key in a
+        /// message flagged as a profile-key update, or their app keeps
+        /// showing us as a stranger.
+        #[test]
+        fn accepting_a_request_sends_a_flagged_profile_key_update(sent_at_ms in 1u64..) {
+            let ContentBody::DataMessage(update) = profile_key_update(sent_at_ms) else {
+                panic!("the profile key update is not a data message");
+            };
+            prop_assert_eq!(update.flags, Some(data_message::Flags::ProfileKeyUpdate as u32));
+            prop_assert_eq!(update.timestamp, Some(sent_at_ms));
+            prop_assert_eq!(update.body, None);
+        }
+    }
+
+    proptest! {
+        /// Our other devices match the answer to a conversation by the
+        /// requester's ACI, and must see the same answer we gave.
+        #[test]
+        fn the_request_answer_syncs_to_own_devices_naming_the_requester(
+            accept in any::<bool>(),
+        ) {
+            let response = if accept { RequestResponse::Accept } else { RequestResponse::Delete };
+            let ContentBody::SynchronizeMessage(sync) =
+                request_response_sync(ServiceId::new(ALICE), response).expect("converts")
+            else {
+                panic!("the answer is not a sync message");
+            };
+            let Some(SyncContent::MessageRequestResponse(answer)) = sync.content else {
+                panic!("the sync carries no message request response");
+            };
+            prop_assert_eq!(answer.thread_aci_binary, Some(ALICE.as_bytes().to_vec()));
+            let expected = if accept {
+                sync_message::message_request_response::Type::Accept
+            } else {
+                sync_message::message_request_response::Type::Delete
+            };
+            prop_assert_eq!(answer.r#type, Some(expected as i32));
+        }
+    }
+
+    /// Signal replaces the whole profile on upload, so a change to one field
+    /// must carry the others over unchanged, an empty string must remove an
+    /// optional field, and a name with no given name must never be uploaded.
+    #[test]
+    fn a_profile_update_keeps_unnamed_fields_and_empty_removes_one() {
+        let current = Profile {
+            name: Some(ProfileName {
+                given_name: "Ada".into(),
+                family_name: Some("Lovelace".into()),
+            }),
+            about: Some("engines".into()),
+            about_emoji: Some("⚙️".into()),
+            avatar: None,
+            unrestricted_unidentified_access: false,
+        };
+        let (name, about, emoji) = merged_profile(
+            current.clone(),
+            ProfileUpdate {
+                about: Some("looms".into()),
+                about_emoji: Some(String::new()),
+                ..ProfileUpdate::default()
+            },
+        )
+        .expect("merges");
+        assert_eq!(
+            (name.given_name.as_str(), name.family_name.as_deref()),
+            ("Ada", Some("Lovelace"))
+        );
+        assert_eq!((about.as_deref(), emoji), (Some("looms"), None));
+        for blank in ["", "  "] {
+            let update = ProfileUpdate {
+                given_name: Some(blank.into()),
+                ..ProfileUpdate::default()
+            };
+            assert!(
+                merged_profile(current.clone(), update).is_err(),
+                "{blank:?}"
+            );
+        }
+        let nameless = Profile {
+            name: None,
+            ..current
+        };
+        let update = ProfileUpdate {
+            about: Some("x".into()),
+            ..ProfileUpdate::default()
+        };
+        assert!(
+            merged_profile(nameless, update).is_err(),
+            "uploaded without a name"
+        );
+    }
+
+    /// A group's timer lives in the group's state, so a timer update sent as
+    /// a group message would be ignored by every member's app.
+    #[test]
+    fn a_timer_update_never_goes_to_a_group() {
+        let group = GroupContextV2 {
+            master_key: Some(vec![5; 32]),
+            revision: Some(1),
+            group_change: None,
+        };
+        let result = content_body(&Outgoing::ExpirationTimer { seconds: 60 }, 9, Some(&group));
+        assert!(result.is_err(), "group timer update converted: {result:?}");
     }
 
     proptest! {

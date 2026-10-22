@@ -1111,6 +1111,22 @@ pub(crate) mod tests {
         async fn devices(&self) -> anyhow::Result<Vec<relay_signal::Device>> {
             anyhow::bail!("offline")
         }
+        async fn sticker_packs(&self) -> anyhow::Result<Vec<relay_signal::StickerPack>> {
+            anyhow::bail!("offline")
+        }
+        async fn sticker(
+            &self,
+            _: StickerPackId,
+            _: u32,
+        ) -> anyhow::Result<Option<relay_signal::StickerImage>> {
+            anyhow::bail!("offline")
+        }
+        async fn install_sticker_pack(&self, _: StickerPackId, _: [u8; 32]) -> anyhow::Result<()> {
+            anyhow::bail!("offline")
+        }
+        async fn update_profile(&self, _: relay_signal::ProfileUpdate) -> anyhow::Result<()> {
+            anyhow::bail!("offline")
+        }
     }
 
     /// An agent that fails after its store opened must still close the store,

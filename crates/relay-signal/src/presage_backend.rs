@@ -46,8 +46,9 @@ use tracing::warn;
 
 use crate::{
     Account, Contact, Device, DiscoveryUnsupported, Group, HistoryTransfer, Identity, Incoming,
-    LinkEvent, Outgoing, Provisioner, RateLimited, RegistrationStep, SendableFile, SignalBackend,
-    Trust, convert, transfer::PendingTransfer,
+    LinkEvent, Outgoing, ProfileUpdate, Provisioner, RateLimited, RegistrationStep,
+    RequestResponse, SendableFile, SignalBackend, StickerImage, StickerPack, Trust, convert,
+    transfer::PendingTransfer,
 };
 
 type Job = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()>>> + Send>;
@@ -428,6 +429,79 @@ impl SignalBackend for PresageSignal {
             .map_err(|e| signal_error(e, "unable to list linked devices"))?;
         Ok(devices.iter().map(convert::device).collect())
     }
+
+    async fn sticker_packs(&self) -> anyhow::Result<Vec<StickerPack>> {
+        let store = self.manager.store().clone();
+        self.worker
+            .run(move || async move {
+                let mut packs = Vec::new();
+                for pack in store
+                    .sticker_packs()
+                    .await
+                    .context("unable to list sticker packs")?
+                {
+                    let pack = pack.context("unreadable sticker pack in the store")?;
+                    packs.push(convert::sticker_pack_from(&pack)?);
+                }
+                anyhow::Ok(packs)
+            })
+            .await?
+    }
+
+    async fn sticker(
+        &self,
+        pack: StickerPackId,
+        sticker_id: u32,
+    ) -> anyhow::Result<Option<StickerImage>> {
+        let store = self.manager.store().clone();
+        self.worker
+            .run(move || async move {
+                let Some(installed) = store
+                    .sticker_pack(pack.as_bytes())
+                    .await
+                    .context("unable to read sticker packs")?
+                else {
+                    return anyhow::Ok(None);
+                };
+                Ok(installed
+                    .manifest
+                    .stickers
+                    .into_iter()
+                    .find(|s| s.id == sticker_id)
+                    .and_then(|s| {
+                        Some(StickerImage {
+                            bytes: s.bytes?,
+                            content_type: s.content_type.unwrap_or_else(|| "image/webp".into()),
+                        })
+                    }))
+            })
+            .await?
+    }
+
+    async fn install_sticker_pack(&self, pack: StickerPackId, key: [u8; 32]) -> anyhow::Result<()> {
+        let mut manager = self.manager.clone();
+        self.worker
+            .run(move || async move { manager.install_sticker_pack(pack.as_bytes(), &key).await })
+            .await?
+            .map_err(|e| signal_error(e, format!("unable to install sticker pack {pack}")))
+    }
+
+    async fn update_profile(&self, update: ProfileUpdate) -> anyhow::Result<()> {
+        let mut manager = self.manager.clone();
+        self.worker
+            .run(move || async move {
+                let current = manager
+                    .retrieve_profile()
+                    .await
+                    .map_err(|e| signal_error(e, "unable to read this account's profile"))?;
+                let (name, about, emoji) = convert::merged_profile(current, update)?;
+                manager
+                    .update_profile(name, about, emoji)
+                    .await
+                    .map_err(|e| signal_error(e, "unable to update this account's profile"))
+            })
+            .await?
+    }
 }
 
 /// The largest attachment Signal's apps accept.
@@ -657,6 +731,32 @@ async fn send(
                 })?;
         }
         return Ok(());
+    }
+    if let Outgoing::MessageRequestResponse { response } = message {
+        let Recipient::Contact(contact) = to else {
+            bail!("a message request answer only goes to a contact, not group {to:?}");
+        };
+        if response == RequestResponse::Accept {
+            manager
+                .send_message(
+                    convert::aci(contact),
+                    convert::profile_key_update(sent_at_ms),
+                    sent_at_ms,
+                )
+                .await
+                .map_err(|e| {
+                    signal_error(e, format!("unable to share the profile with {contact}"))
+                })?;
+        }
+        let me = manager.registration_data().service_ids.aci();
+        return manager
+            .send_message(
+                me,
+                convert::request_response_sync(contact, response)?,
+                sent_at_ms,
+            )
+            .await
+            .map_err(|e| signal_error(e, "unable to tell this account's devices the answer"));
     }
     match to {
         Recipient::Contact(contact) => {
@@ -1418,6 +1518,93 @@ mod tests {
                 err.to_string().contains(reason),
                 "sticker {sticker_id}: unclear error: {err:#}"
             );
+        }
+    }
+
+    /// A message request comes from a person; answering one for a group
+    /// would mean joining or leaving it, a group change, so it must fail
+    /// before anything reaches Signal.
+    #[tokio::test]
+    async fn a_message_request_answer_to_a_group_is_refused_without_the_network() {
+        let (_dir, path) = temp_store();
+        register_linked(&path).await;
+        let signal = PresageSignal::open(&path, &KEY).await.expect("opens");
+        let err = signal
+            .send(
+                Recipient::Group(GroupId::new([3; 32])),
+                Outgoing::MessageRequestResponse {
+                    response: crate::RequestResponse::Accept,
+                },
+            )
+            .await
+            .expect_err("answered a request for a group");
+        assert!(
+            err.to_string().contains("only goes to a contact"),
+            "unclear error: {err:#}"
+        );
+    }
+
+    /// Sticker tools answer from the packs presage already stored, so listing
+    /// and reading them must work offline, and a sticker whose image never
+    /// downloaded must read as missing rather than as an empty image.
+    #[tokio::test]
+    async fn installed_sticker_packs_and_their_images_read_back_offline() {
+        let (_dir, path) = temp_store();
+        register_linked(&path).await;
+        let pack = StickerPackId::new([1; 16]);
+        seed(&path, move |mut store| async move {
+            let sticker = |id, emoji: Option<&str>, bytes| presage::store::Sticker {
+                id,
+                emoji: emoji.map(Into::into),
+                content_type: Some("image/png".into()),
+                bytes,
+            };
+            store
+                .add_sticker_pack(&presage::store::StickerPack {
+                    id: pack.as_bytes().to_vec(),
+                    key: vec![2; 32],
+                    manifest: presage::store::StickerPackManifest {
+                        title: "cats".into(),
+                        author: "me".into(),
+                        cover: None,
+                        stickers: vec![
+                            sticker(0, None, None),
+                            sticker(1, Some("🐈"), Some(vec![1, 2, 3])),
+                        ],
+                    },
+                })
+                .await
+                .expect("saved");
+        })
+        .await;
+        let signal = PresageSignal::open(&path, &KEY).await.expect("opens");
+        let packs = signal.sticker_packs().await.expect("lists");
+        assert_eq!(
+            packs,
+            [crate::StickerPack {
+                id: pack,
+                title: "cats".into(),
+                author: "me".into(),
+                stickers: vec![
+                    crate::StickerInfo { id: 0, emoji: None },
+                    crate::StickerInfo {
+                        id: 1,
+                        emoji: Some("🐈".into()),
+                    },
+                ],
+            }]
+        );
+        let image = signal.sticker(pack, 1).await.expect("reads");
+        assert_eq!(
+            image,
+            Some(crate::StickerImage {
+                content_type: "image/png".into(),
+                bytes: vec![1, 2, 3],
+            })
+        );
+        for (pack, sticker_id) in [(pack, 0), (pack, 9), (StickerPackId::new([2; 16]), 1)] {
+            let missing = signal.sticker(pack, sticker_id).await.expect("reads");
+            assert_eq!(missing, None, "pack {pack} sticker {sticker_id}");
         }
     }
 

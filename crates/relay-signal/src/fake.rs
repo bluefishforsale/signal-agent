@@ -17,7 +17,8 @@ use tokio::sync::mpsc;
 
 use crate::{
     Account, Contact, Device, DiscoveryUnsupported, Group, Identity, Incoming, Outgoing,
-    RateLimited, SendableFile, SignalBackend,
+    ProfileUpdate, RateLimited, SendableFile, SignalBackend, StickerImage, StickerInfo,
+    StickerPack,
 };
 
 /// A fake registered account. Build one with `FakeSignal::new`, seed it with
@@ -44,6 +45,7 @@ struct State {
     devices: Vec<Device>,
     sticker_packs: HashMap<StickerPackId, Vec<u32>>,
     uploads: u64,
+    profile_updates: Vec<ProfileUpdate>,
 }
 
 impl FakeSignal {
@@ -93,7 +95,8 @@ impl FakeSignal {
         self
     }
 
-    /// An installed sticker pack holding `sticker_ids`.
+    /// An installed sticker pack holding `sticker_ids`, titled with its id.
+    /// Each sticker's image is the bytes of "<pack>/<sticker_id>".
     pub fn with_sticker_pack(self, pack: StickerPackId, sticker_ids: Vec<u32>) -> Self {
         self.state().sticker_packs.insert(pack, sticker_ids);
         self
@@ -108,6 +111,11 @@ impl FakeSignal {
     /// Everything sent so far, in order.
     pub fn sent(&self) -> Vec<(Recipient, Outgoing)> {
         self.state().sent.clone()
+    }
+
+    /// Every profile change asked for so far, in order.
+    pub fn profile_updates(&self) -> Vec<ProfileUpdate> {
+        self.state().profile_updates.clone()
     }
 
     /// Sends that reached Signal so far, whether it accepted them or not.
@@ -148,6 +156,11 @@ impl FakeSignal {
             }
             Outgoing::AdminDelete { .. } if matches!(to, Recipient::Contact(_)) => {
                 bail!("an admin delete only goes to a group");
+            }
+            Outgoing::ExpirationTimer { .. } | Outgoing::MessageRequestResponse { .. }
+                if matches!(to, Recipient::Group(_)) =>
+            {
+                bail!("{message:?} only goes to a contact");
             }
             // The wire form names only the poll's timestamp, so it can only
             // ever close one of this account's own polls.
@@ -259,6 +272,55 @@ impl SignalBackend for FakeSignal {
     async fn devices(&self) -> anyhow::Result<Vec<Device>> {
         Ok(self.state().devices.clone())
     }
+
+    async fn sticker_packs(&self) -> anyhow::Result<Vec<StickerPack>> {
+        let mut packs: Vec<_> = self
+            .state()
+            .sticker_packs
+            .iter()
+            .map(|(id, stickers)| StickerPack {
+                id: *id,
+                title: id.to_string(),
+                author: String::new(),
+                stickers: stickers
+                    .iter()
+                    .map(|&id| StickerInfo { id, emoji: None })
+                    .collect(),
+            })
+            .collect();
+        packs.sort_by_key(|p| *p.id.as_bytes());
+        Ok(packs)
+    }
+
+    async fn sticker(
+        &self,
+        pack: StickerPackId,
+        sticker_id: u32,
+    ) -> anyhow::Result<Option<StickerImage>> {
+        let installed = self
+            .state()
+            .sticker_packs
+            .get(&pack)
+            .is_some_and(|stickers| stickers.contains(&sticker_id));
+        Ok(installed.then(|| StickerImage {
+            content_type: "image/webp".into(),
+            bytes: format!("{pack}/{sticker_id}").into_bytes(),
+        }))
+    }
+
+    async fn install_sticker_pack(
+        &self,
+        pack: StickerPackId,
+        _key: [u8; 32],
+    ) -> anyhow::Result<()> {
+        self.state().sticker_packs.entry(pack).or_default();
+        Ok(())
+    }
+
+    async fn update_profile(&self, update: ProfileUpdate) -> anyhow::Result<()> {
+        self.state().profile_updates.push(update);
+        Ok(())
+    }
 }
 
 fn tokio_stream_from<T: Send + 'static>(
@@ -270,6 +332,7 @@ fn tokio_stream_from<T: Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RequestResponse;
     use uuid::Uuid;
 
     fn fake() -> FakeSignal {
@@ -416,6 +479,37 @@ mod tests {
             .await
             .expect("own poll");
         assert_eq!(signal.sent().len(), 1);
+    }
+
+    /// Timer updates and message request answers only go to a person in the
+    /// real backend, so the fake must refuse both for a group, or a tool
+    /// could pass on a send that would never leave the machine.
+    #[tokio::test]
+    async fn contact_only_sends_to_a_group_fail() {
+        let group = GroupId::new([3; 32]);
+        let signal = fake().with_groups(vec![Group {
+            id: group,
+            title: "g".into(),
+            members: vec![],
+            admins: vec![],
+        }]);
+        let alice = Recipient::Contact(ServiceId::new(Uuid::from_u128(2)));
+        for contact_only in [
+            Outgoing::ExpirationTimer { seconds: 60 },
+            Outgoing::MessageRequestResponse {
+                response: RequestResponse::Accept,
+            },
+        ] {
+            let result = signal
+                .send(Recipient::Group(group), contact_only.clone())
+                .await;
+            assert!(result.is_err(), "sent {contact_only:?} to a group");
+            signal
+                .send(alice, contact_only)
+                .await
+                .expect("to a contact");
+        }
+        assert_eq!(signal.sent().len(), 2);
     }
 
     /// Production can't look numbers up in this version, so the fake must

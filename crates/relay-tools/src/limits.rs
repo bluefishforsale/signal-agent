@@ -14,8 +14,8 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use relay_core::prelude::*;
 use relay_signal::{
-    Account, Contact, Device, Group, Identity, Incoming, Outgoing, RateLimited, SendableFile,
-    SignalBackend,
+    Account, Contact, Device, Group, Identity, Incoming, Outgoing, ProfileUpdate, RateLimited,
+    RequestResponse, SendableFile, SignalBackend, StickerImage, StickerPack,
 };
 use relay_store::MessageStore;
 use serde::{Deserialize, Serialize};
@@ -45,6 +45,9 @@ pub struct Limits {
     /// Numbers, usernames and avatars looked up back to back, refilling over
     /// a day.
     pub lookups_per_day: NonZeroU32,
+    /// Changes to the account's own profile back to back, refilling over a
+    /// day.
+    pub account_changes_per_day: NonZeroU32,
 }
 
 impl Default for Limits {
@@ -56,6 +59,7 @@ impl Default for Limits {
             provisioning_backoff_minutes: NonZeroU32::new(5).expect("nonzero literal"),
             lookup_burst_per_minute: NonZeroU32::new(10).expect("nonzero literal"),
             lookups_per_day: NonZeroU32::new(50).expect("nonzero literal"),
+            account_changes_per_day: NonZeroU32::new(3).expect("nonzero literal"),
         }
     }
 }
@@ -108,6 +112,7 @@ struct State {
     sends_paused_until_ms: u64,
     lookup_minute: Bucket,
     lookup_day: Bucket,
+    account_changes: Bucket,
 }
 
 impl State {
@@ -125,6 +130,7 @@ impl State {
             sends_paused_until_ms: 0,
             lookup_minute: empty(),
             lookup_day: empty(),
+            account_changes: empty(),
         }
     }
 }
@@ -206,9 +212,15 @@ impl Limiter {
         self
     }
 
-    /// Counts one message to `to`, or refuses it.
-    async fn admit(&self, store: &dyn MessageStore, to: Recipient) -> anyhow::Result<()> {
-        let known = !store.history(to, None, 1).await?.is_empty();
+    /// Counts one message to `to`, or refuses it. A `first_contact` counts
+    /// against the new-recipient cap whatever the history holds.
+    async fn admit(
+        &self,
+        store: &dyn MessageStore,
+        to: Recipient,
+        first_contact: bool,
+    ) -> anyhow::Result<()> {
+        let known = !first_contact && !store.history(to, None, 1).await?.is_empty();
         let now = self.clock.now_ms();
         let mut state = self.state.lock().expect("limiter state");
         if now < state.sends_paused_until_ms {
@@ -309,6 +321,22 @@ impl Limiter {
         }
         state.lookup_minute.take(MINUTE_MS, lookups);
         state.lookup_day.take(DAY_MS, lookups);
+        self.save(&state)
+    }
+
+    /// Counts one change to the account's own profile, or refuses it.
+    fn admit_account_change(&self) -> anyhow::Result<()> {
+        let now = self.clock.now_ms();
+        let mut state = self.state.lock().expect("limiter state");
+        let per_day = self.limits.account_changes_per_day;
+        if let Some(retry_after) = state.account_changes.wait(now, per_day, DAY_MS, 1) {
+            return Err(LimitExceeded {
+                limit: format!("at most {per_day} profile changes a day"),
+                retry_after,
+            }
+            .into());
+        }
+        state.account_changes.take(DAY_MS, 1);
         self.save(&state)
     }
 
@@ -466,7 +494,15 @@ impl SignalBackend for Guarded {
     }
     async fn send(&self, to: Recipient, message: Outgoing) -> anyhow::Result<MessageId> {
         if counts(&message) {
-            self.limiter.admit(self.store.as_ref(), to).await?;
+            let first_contact = matches!(
+                message,
+                Outgoing::MessageRequestResponse {
+                    response: RequestResponse::Accept
+                }
+            );
+            self.limiter
+                .admit(self.store.as_ref(), to, first_contact)
+                .await?;
         }
         let sent = self.inner.send(to, message).await;
         // The pause holds in memory even when it can't be saved, and the
@@ -517,10 +553,33 @@ impl SignalBackend for Guarded {
     async fn devices(&self) -> anyhow::Result<Vec<Device>> {
         self.inner.devices().await
     }
+    async fn sticker_packs(&self) -> anyhow::Result<Vec<StickerPack>> {
+        self.inner.sticker_packs().await
+    }
+    async fn sticker(
+        &self,
+        pack: StickerPackId,
+        sticker_id: u32,
+    ) -> anyhow::Result<Option<StickerImage>> {
+        self.inner.sticker(pack, sticker_id).await
+    }
+    // A pack download reaches the CDN on a client-chosen link, like a lookup.
+    async fn install_sticker_pack(&self, pack: StickerPackId, key: [u8; 32]) -> anyhow::Result<()> {
+        self.limiter.admit_lookups(1)?;
+        self.inner.install_sticker_pack(pack, key).await
+    }
+    // NOTE: a change every contact sees, and the one a prompt injection would
+    // want, so it has its own small budget. A RateLimited from Signal goes
+    // back to the caller as is; nothing here retries it.
+    async fn update_profile(&self, update: ProfileUpdate) -> anyhow::Result<()> {
+        self.limiter.admit_account_change()?;
+        self.inner.update_profile(update).await
+    }
 }
 
 /// Messages a person sees count; typing indicators and read receipts are
-/// background chatter every Signal client sends freely.
+/// background chatter every Signal client sends freely. Deleting a message
+/// request reaches only this account's own devices.
 // Stickers, pins, unpins, poll creates, votes and closes, and admin deletes
 // all show up in the conversation for everyone in it, so they count like text.
 fn counts(message: &Outgoing) -> bool {
@@ -535,8 +594,16 @@ fn counts(message: &Outgoing) -> bool {
         | Outgoing::PollCreate { .. }
         | Outgoing::PollVote { .. }
         | Outgoing::PollTerminate { .. }
-        | Outgoing::AdminDelete { .. } => true,
-        Outgoing::Typing { .. } | Outgoing::ReadReceipt { .. } => false,
+        | Outgoing::AdminDelete { .. }
+        | Outgoing::ExpirationTimer { .. }
+        | Outgoing::MessageRequestResponse {
+            response: RequestResponse::Accept,
+        } => true,
+        Outgoing::Typing { .. }
+        | Outgoing::ReadReceipt { .. }
+        | Outgoing::MessageRequestResponse {
+            response: RequestResponse::Delete,
+        } => false,
     }
 }
 
@@ -691,7 +758,8 @@ mod tests {
 
     /// Everything a person sees in the conversation must spend the message
     /// budget, whichever tool sends it: with the budget spent, a sticker,
-    /// pin, unpin, poll or admin delete must be refused before Signal.
+    /// pin, unpin, poll, admin delete or timer change must be refused before
+    /// Signal.
     #[tokio::test]
     async fn every_visible_variant_spends_the_message_budget() {
         let one = NonZeroU32::new(1).expect("nonzero literal");
@@ -746,6 +814,7 @@ mod tests {
             },
             Outgoing::PollTerminate { poll: target },
             Outgoing::AdminDelete { target },
+            Outgoing::ExpirationTimer { seconds: 60 },
         ] {
             let result = guarded.send(group, visible.clone()).await;
             let refused = result
@@ -811,6 +880,125 @@ mod tests {
             result.is_ok(),
             "the cap did not reset after a day: {result:?}"
         );
+    }
+
+    /// A message request means the stranger already wrote, so their history
+    /// is no evidence we know them: accepting is a first contact and spends
+    /// the new-recipient cap, while deleting only tells our own devices and
+    /// spends nothing.
+    #[tokio::test]
+    async fn accepting_a_message_request_is_a_first_contact_and_deleting_one_is_free() {
+        let limiter = Arc::new(Limiter::new(
+            Limits {
+                new_recipients_per_day: 1,
+                ..Limits::default()
+            },
+            Arc::new(FakeClock::default()),
+        ));
+        let (ctx, signal) = ctx();
+        for stranger in [2, 3] {
+            ctx.store
+                .insert(&incoming(stranger, 1, "hi, it's me"))
+                .await
+                .expect("seed");
+        }
+        let guarded = guard(Some(&limiter), &ctx).signal;
+        let answer = |response| Outgoing::MessageRequestResponse { response };
+        guarded
+            .send(Recipient::Contact(sid(2)), answer(RequestResponse::Accept))
+            .await
+            .expect("first accept within the cap");
+        let result = guarded
+            .send(Recipient::Contact(sid(3)), answer(RequestResponse::Accept))
+            .await;
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|e| e.downcast_ref::<LimitExceeded>().is_some()),
+            "a second accept went past a cap of one: {result:?}"
+        );
+        guarded
+            .send(Recipient::Contact(sid(3)), answer(RequestResponse::Delete))
+            .await
+            .expect("a delete spent the new-recipient cap");
+        assert_eq!(signal.sent().len(), 2, "{:?}", signal.sent());
+    }
+
+    /// A profile change shows to every contact, so a looping or injected
+    /// client gets three a day by default: the fourth is refused before
+    /// Signal, and the budget frees up a day later.
+    #[tokio::test]
+    async fn a_fourth_profile_change_in_a_day_is_refused_before_signal() {
+        let clock = Arc::new(FakeClock::default());
+        let limiter = Arc::new(Limiter::new(Limits::default(), clock.clone()));
+        let (ctx, signal) = ctx();
+        let guarded = guard(Some(&limiter), &ctx).signal;
+        let rename = |n: u32| ProfileUpdate {
+            given_name: Some(format!("bot {n}")),
+            ..ProfileUpdate::default()
+        };
+        for n in 0..3 {
+            guarded
+                .update_profile(rename(n))
+                .await
+                .unwrap_or_else(|e| panic!("change {n} refused: {e:#}"));
+        }
+        let result = guarded.update_profile(rename(3)).await;
+        let Some(e) = result
+            .as_ref()
+            .err()
+            .and_then(|e| e.downcast_ref::<LimitExceeded>())
+        else {
+            panic!("a fourth change in a day went through: {result:?}");
+        };
+        assert_eq!(e.retry_after, Duration::from_millis(DAY_MS / 3), "{e}");
+        assert_eq!(
+            signal.profile_updates().len(),
+            3,
+            "a refused change reached Signal"
+        );
+        clock.advance(DAY_MS);
+        guarded
+            .update_profile(rename(4))
+            .await
+            .expect("the budget did not free up after a day");
+    }
+
+    /// Installing a sticker pack downloads it from Signal's CDN on a link a
+    /// client chose, so a looping client must run out of the lookup budget
+    /// before it can make the account fetch pack after pack.
+    #[tokio::test]
+    async fn installing_sticker_packs_spends_the_lookup_budget() {
+        let one = NonZeroU32::new(1).expect("nonzero literal");
+        let limiter = Arc::new(Limiter::new(
+            Limits {
+                lookup_burst_per_minute: one,
+                ..Limits::default()
+            },
+            Arc::new(FakeClock::default()),
+        ));
+        let (ctx, signal) = ctx();
+        let guarded = guard(Some(&limiter), &ctx).signal;
+        let (first, second) = (StickerPackId::new([1; 16]), StickerPackId::new([2; 16]));
+        guarded
+            .install_sticker_pack(first, [7; 32])
+            .await
+            .expect("first install within budget");
+        let result = guarded.install_sticker_pack(second, [7; 32]).await;
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|e| e.downcast_ref::<LimitExceeded>().is_some()),
+            "a second install went past a budget of one: {result:?}"
+        );
+        let installed: Vec<_> = signal
+            .sticker_packs()
+            .await
+            .expect("lists")
+            .iter()
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(installed, [first], "a refused install reached Signal");
     }
 
     /// Restarting the agent must not refill the send buckets, or a client that
@@ -1128,6 +1316,26 @@ mod tests {
         }
         async fn devices(&self) -> anyhow::Result<Vec<Device>> {
             self.inner.devices().await
+        }
+        async fn sticker_packs(&self) -> anyhow::Result<Vec<StickerPack>> {
+            self.inner.sticker_packs().await
+        }
+        async fn sticker(
+            &self,
+            pack: StickerPackId,
+            sticker_id: u32,
+        ) -> anyhow::Result<Option<StickerImage>> {
+            self.inner.sticker(pack, sticker_id).await
+        }
+        async fn install_sticker_pack(
+            &self,
+            pack: StickerPackId,
+            key: [u8; 32],
+        ) -> anyhow::Result<()> {
+            self.inner.install_sticker_pack(pack, key).await
+        }
+        async fn update_profile(&self, update: ProfileUpdate) -> anyhow::Result<()> {
+            self.inner.update_profile(update).await
         }
     }
 
