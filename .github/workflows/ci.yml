@@ -52,9 +52,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: ./.github/actions/setup-protoc
       - run: cargo clippy --all-targets -- -D warnings
       # NOTE: tests must never reach Signal's servers (a test fixture points at
       # staging, and one accidental dial already happened). clippy has fetched every
@@ -119,9 +117,7 @@ jobs:
           key: bundle-${{ matrix.target }}
           cache-all-crates: true
       # presage's libsignal-service generates its protobufs with prost-build.
-      - uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: ./.github/actions/setup-protoc
       - run: rustup target add ${{ matrix.rust-targets }}
         shell: bash
       - run: cargo install tauri-cli --version "^2" --locked
