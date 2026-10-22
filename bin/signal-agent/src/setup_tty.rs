@@ -224,7 +224,12 @@ fn ask(
             SetupEvent::NumberEntered { number }
         }
         SetupState::SolveCaptcha { .. } => {
-            let token = prompt(input, out, "Paste the link here: ", parse_captcha)?;
+            let token = prompt(
+                input,
+                out,
+                "Paste the link (or its token) here: ",
+                parse_captcha,
+            )?;
             SetupEvent::CaptchaSolved { token }
         }
         SetupState::EnterCode { .. } => {
@@ -320,10 +325,21 @@ fn parse_number(answer: &str) -> Result<String, &'static str> {
     Ok(number)
 }
 
-/// The token Signal needs from a pasted `signalcaptcha://` link.
+/// The token Signal needs, from a pasted `signalcaptcha://` link or the bare
+/// token people copy out of it.
 fn parse_captcha(answer: &str) -> Result<String, &'static str> {
-    relay_setup::captcha_token(answer)
-        .ok_or("Paste the whole link; it starts with signalcaptcha://.")
+    let token = if answer.starts_with("signalcaptcha://") {
+        relay_setup::captcha_token(answer).ok_or("That link has no token; copy it again.")?
+    } else if answer.starts_with("signal-") {
+        answer.to_owned()
+    } else {
+        return Err("Paste the whole link; it starts with signalcaptcha://.");
+    };
+    // A paste wrapped across lines over SSH leaves a space inside the token.
+    if token.contains(char::is_whitespace) {
+        return Err("That link looks cut off; copy it again.");
+    }
+    Ok(token)
 }
 
 /// The verification code, accepting the dash Signal's SMS shows in it.
@@ -509,7 +525,20 @@ mod tests {
             parse_captcha("signalcaptcha://signal-hcaptcha.5fad.registration.P1_eyJ"),
             Ok("signal-hcaptcha.5fad.registration.P1_eyJ".into())
         );
-        for bad in ["signal-hcaptcha.5fad", "signalcaptcha://"] {
+        for bad in ["signalcaptcha://", "signalcaptcha://signal-hcaptcha.5f ad"] {
+            assert!(parse_captcha(bad).is_err(), "{bad:?} accepted");
+        }
+    }
+
+    /// People often copy just the token out of the link; that works too, but
+    /// not any stray text that isn't a token.
+    #[test]
+    fn a_pasted_bare_captcha_token_is_accepted() {
+        assert_eq!(
+            parse_captcha("signal-recaptcha-v2.6LfB.registration.03AF"),
+            Ok("signal-recaptcha-v2.6LfB.registration.03AF".into())
+        );
+        for bad in ["+15555550100", "signal-hcaptcha.5f ad", "hcaptcha.5fad"] {
             assert!(parse_captcha(bad).is_err(), "{bad:?} accepted");
         }
     }
