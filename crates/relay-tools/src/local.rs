@@ -1,6 +1,8 @@
 //! Tools that manage the local message store itself: export, read state, and
 //! deleting history. None of them talk to Signal.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use async_trait::async_trait;
 use relay_core::prelude::*;
 use serde::Deserialize;
@@ -184,6 +186,84 @@ impl Tool for ClearLocalStore {
     }
 }
 
+pub struct PruneStore;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PruneStoreInput {
+    #[serde(default)]
+    days: Days,
+}
+
+/// How old a message must be to prune: 1 to 36500 days, 180 when not given.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(try_from = "u64")]
+struct Days(u64);
+
+impl Days {
+    const MAX: u64 = 36_500;
+}
+
+impl Default for Days {
+    fn default() -> Self {
+        Self(180)
+    }
+}
+
+impl TryFrom<u64> for Days {
+    type Error = String;
+    fn try_from(n: u64) -> Result<Self, String> {
+        if !(1..=Self::MAX).contains(&n) {
+            return Err(format!("days must be 1 to {}, got {n}", Self::MAX));
+        }
+        Ok(Self(n))
+    }
+}
+
+#[async_trait]
+impl Tool for PruneStore {
+    fn name(&self) -> &'static str {
+        "prune_store"
+    }
+    fn description(&self) -> &'static str {
+        "Delete messages older than a number of days from the local store. days (1 to 36500, \
+         default 180): messages sent before now minus this many days are deleted. Local only: \
+         nothing is deleted from Signal. Irreversible locally. Returns {deleted, \
+         older_than_days}. Use clear_local_store to wipe everything."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "days": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": Days::MAX,
+                    "default": 180,
+                    "description": "Delete messages older than this many days (default 180)",
+                },
+            },
+            "additionalProperties": false,
+        })
+    }
+    // NOTE: true for the same reason as clear_local_store: it destroys history.
+    fn writes(&self) -> bool {
+        true
+    }
+    async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
+        let PruneStoreInput { days } = parse(input)?;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(anyhow::Error::from)?
+            .as_millis() as u64;
+        let deleted = ctx
+            .store
+            .prune(now_ms.saturating_sub(days.0 * 86_400_000))
+            .await?;
+        Ok(json!({ "deleted": deleted, "older_than_days": days.0 }))
+    }
+}
+
 /// A prune cutoff later than any stored message.
 // NOTE: not u64::MAX. The SQLCipher store binds the cutoff as an i64 and
 // refuses anything larger, so u64::MAX would fail the clear outright.
@@ -362,5 +442,33 @@ mod tests {
             .unwrap();
         assert_eq!(out, json!({"deleted": 2, "status": "cleared"}));
         assert_eq!(ctx.store.stats().await.unwrap().messages, 0, "{out}");
+    }
+
+    /// Local deletes never reach Signal but still destroy history, so a
+    /// read-only profile must be refused every one of them, even confirmed,
+    /// with the store left as it was.
+    #[tokio::test]
+    async fn read_only_refuses_every_destructive_local_tool() {
+        let (ctx, _) = ctx(AccessMode::ReadOnly, ProfileKind::Primary);
+        ctx.store
+            .insert(&incoming(2, 1000, "keep me"))
+            .await
+            .unwrap();
+        let registry = Registry::standard();
+        for (name, input) in [
+            ("clear_local_store", json!({"confirm": true})),
+            ("prune_store", json!({"days": 1})),
+        ] {
+            let result = registry.call(&ctx, name, input).await;
+            assert!(
+                matches!(result, Err(ToolError::ReadOnly(_))),
+                "{name} in read-only mode gave {result:?}"
+            );
+        }
+        assert_eq!(
+            ctx.store.stats().await.unwrap().messages,
+            1,
+            "store changed"
+        );
     }
 }
