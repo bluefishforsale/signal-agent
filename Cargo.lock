@@ -2782,6 +2782,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-service-management",
  "relay-core",
+ "relay-setup",
  "relay-signal",
  "relay-store",
  "relay-tools",
@@ -4981,3 +4982,13 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+
+[[patch.unused]]
+name = "libsqlite3-sys"
+version = "0.36.0"
+source = "git+https://github.com/whisperfish/rusqlite?rev=2a42b3354c9194700d08aa070f70a131a470e7dc#2a42b3354c9194700d08aa070f70a131a470e7dc"
+
+[[patch.unused]]
+name = "quickcheck_async"
+version = "0.1.1"
+source = "git+https://github.com/nytopop/quickcheck_async?rev=76b13525ca93e0725e757f841fc6ccab8bae1913#76b13525ca93e0725e757f841fc6ccab8bae1913"
