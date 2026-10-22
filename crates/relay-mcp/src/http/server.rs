@@ -118,7 +118,125 @@ fn unauthorized() -> Response<Body> {
 
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
+    use relay_agent::Agent;
+    use relay_core::prelude::*;
+    use relay_signal::{Account, FakeSignal, Outgoing};
+    use relay_store::MemoryStore;
+    use relay_tools::{Registry, Tool, ToolContext, ToolError};
+    use rmcp::{
+        RoleClient, ServiceExt,
+        model::CallToolRequestParams,
+        service::RunningService,
+        transport::{
+            StreamableHttpClientTransport,
+            streamable_http_client::StreamableHttpClientTransportConfig,
+        },
+    };
+    use serde_json::{Value, json};
+    use uuid::Uuid;
+
     use super::*;
+
+    /// Sends its `body` to a fixed contact, so tests can see what reached Signal.
+    struct ProbeSend;
+
+    #[async_trait]
+    impl Tool for ProbeSend {
+        fn name(&self) -> &'static str {
+            "probe_send"
+        }
+        fn description(&self) -> &'static str {
+            "test-only write tool"
+        }
+        fn input_schema(&self) -> Value {
+            json!({"type": "object", "properties": {"body": {"type": "string"}}})
+        }
+        fn writes(&self) -> bool {
+            true
+        }
+        async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
+            let Some(body) = input.get("body").and_then(Value::as_str) else {
+                return Err(ToolError::InvalidInput("body is required".into()));
+            };
+            let to = Recipient::Contact(ServiceId::new(Uuid::from_u128(2)));
+            let outgoing = Outgoing::Text {
+                body: body.to_owned(),
+                quote: None,
+                attachments: vec![],
+            };
+            ctx.signal.send(to, outgoing).await?;
+            Ok(json!({}))
+        }
+    }
+
+    fn fake_signal() -> Arc<FakeSignal> {
+        Arc::new(FakeSignal::new(Account {
+            service_id: ServiceId::new(Uuid::from_u128(1)),
+            phone_number: None,
+            kind: ProfileKind::Primary,
+            device_name: "test".into(),
+        }))
+    }
+
+    /// A full-access agent serving `registry` on a fresh local endpoint.
+    async fn agent(dir: &std::path::Path, registry: Registry) -> (String, Arc<FakeSignal>) {
+        let name = if cfg!(windows) {
+            format!(r"\\.\pipe\signal-agent-test-{}", Uuid::new_v4())
+        } else {
+            dir.join("agent.sock").display().to_string()
+        };
+        let signal = fake_signal();
+        let agent = Agent::new(
+            signal.clone(),
+            Arc::new(MemoryStore::default()),
+            registry,
+            AccessMode::Full,
+        );
+        let listener = relay_agent::endpoint::Listener::bind(&name)
+            .await
+            .expect("bind agent");
+        tokio::spawn(agent.serve(listener, std::future::pending()));
+        (name, signal)
+    }
+
+    /// An MCP client as Claude Code runs it with `--transport http` and a
+    /// bearer header.
+    async fn remote(addr: SocketAddr, token: &str) -> RunningService<RoleClient, ()> {
+        let config = StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp"))
+            .auth_header(token);
+        let transport = StreamableHttpClientTransport::with_client(client(), config);
+        ().serve(transport).await.expect("initialize over http")
+    }
+
+    fn call(name: &'static str, args: Value) -> CallToolRequestParams {
+        let Value::Object(args) = args else {
+            panic!("test arguments must be an object")
+        };
+        CallToolRequestParams::new(name).with_arguments(args)
+    }
+
+    /// A full-scope token must reach the agent's tools end to end: listed,
+    /// callable, and a send lands in Signal exactly once.
+    #[tokio::test]
+    async fn a_full_token_lists_and_calls_tools_through_the_agent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (agent, signal) = agent(dir.path(), Registry::default().with(ProbeSend)).await;
+        let tokens = Tokens::at(&dir.path().join("http_tokens.json"));
+        let token = tokens.create("laptop", AccessMode::Full).expect("create");
+        let addr = start(tokens, agent).await;
+        let client = remote(addr, &token).await;
+        let tools = client.peer().list_tools(None).await.expect("tools/list");
+        let names: Vec<_> = tools.tools.iter().map(|t| t.name.to_string()).collect();
+        assert_eq!(names, ["probe_send"]);
+        let result = client
+            .peer()
+            .call_tool(call("probe_send", json!({"body": "hi"})))
+            .await
+            .expect("tools/call");
+        assert_ne!(result.is_error, Some(true), "call failed: {result:?}");
+        assert_eq!(signal.sent().len(), 1, "send did not reach Signal once");
+    }
 
     async fn start(tokens: Tokens, agent: String) -> SocketAddr {
         let listener = Listener::bind(([127, 0, 0, 1], 0).into())
