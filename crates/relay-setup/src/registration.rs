@@ -1,6 +1,43 @@
 //! Registering the agent's own number: catching the captcha token Signal's
 //! page hands back, so nobody copies a link by hand.
 
+use url::Url;
+
+/// Signal's captcha page for registering a number on the production servers.
+pub const CAPTCHA_PAGE: &str = "https://signalcaptchas.org/registration/generate.html";
+
+// Host, whether its subdomains count too, and the path prefix it is limited to.
+// NOTE: Google and gstatic serve far more than reCAPTCHA, so they are held to
+// its path; widening either turns the webview into a general browser.
+const CAPTCHA_HOSTS: &[(&str, bool, &str)] = &[
+    ("signalcaptchas.org", false, "/"),
+    ("hcaptcha.com", true, "/"),
+    ("www.google.com", false, "/recaptcha/"),
+    ("www.recaptcha.net", false, "/recaptcha/"),
+    ("www.gstatic.com", false, "/recaptcha/"),
+];
+
+/// Whether the captcha webview may load `url`.
+pub fn captcha_navigation_allowed(url: &str) -> bool {
+    let Ok(url) = Url::parse(url) else {
+        return false;
+    };
+    if url.as_str() == "about:blank" {
+        return true;
+    }
+    let Some(host) = url.host_str().filter(|_| url.scheme() == "https") else {
+        return false;
+    };
+    CAPTCHA_HOSTS.iter().any(|&(allowed, subdomains, path)| {
+        let host_ok = host == allowed
+            || (subdomains
+                && host
+                    .strip_suffix(allowed)
+                    .is_some_and(|sub| sub.ends_with('.')));
+        host_ok && url.path().starts_with(path)
+    })
+}
+
 /// The `signalcaptcha://` token in `url`, if `url` is the link Signal's
 /// captcha page navigates to when solved.
 pub fn captcha_token(url: &str) -> Option<String> {
@@ -62,6 +99,45 @@ mod tests {
         for token in [HCAPTCHA, RECAPTCHA] {
             let parsed = url::Url::parse(&format!("signalcaptcha://{token}")).expect("parse");
             assert_eq!(captcha_token(parsed.as_str()).as_deref(), Some(token));
+        }
+    }
+
+    /// The captcha webview shows a page from the open web inside our window,
+    /// so it may load Signal's captcha site and the captcha providers it
+    /// embeds over TLS and nothing else: no lookalike hosts, no plain HTTP,
+    /// no wandering off to the rest of google.com.
+    #[test]
+    fn the_captcha_webview_loads_only_signal_and_captcha_hosts() {
+        let allowed = [
+            CAPTCHA_PAGE,
+            "https://signalcaptchas.org/registration/generate.html?lang=de",
+            "https://hcaptcha.com/1/api.js?render=explicit",
+            "https://newassets.hcaptcha.com/captcha/v1/abc/static/hcaptcha.html#frame=checkbox",
+            "https://api.hcaptcha.com/checksiteconfig?v=abc",
+            "https://imgs.hcaptcha.com/tile.png",
+            "https://www.google.com/recaptcha/api.js",
+            "https://www.recaptcha.net/recaptcha/api2/anchor?k=abc",
+            "https://www.gstatic.com/recaptcha/releases/abc/recaptcha__en.js",
+            "about:blank",
+        ];
+        let refused = [
+            "http://signalcaptchas.org/registration/generate.html",
+            "https://signalcaptchas.org.evil.example/registration/generate.html",
+            "https://evilhcaptcha.com/captcha",
+            "https://hcaptcha.com.evil.example/captcha",
+            "https://www.google.com/search?q=signal",
+            "https://accounts.google.com/recaptcha/",
+            "https://www.gstatic.com/firebasejs/app.js",
+            "https://signalcaptchas.org@evil.example/",
+            "file:///etc/passwd",
+            "signalcaptcha://signal-hcaptcha.abc",
+            "not a url",
+        ];
+        for url in allowed {
+            assert!(captcha_navigation_allowed(url), "refused {url:?}");
+        }
+        for url in refused {
+            assert!(!captcha_navigation_allowed(url), "allowed {url:?}");
         }
     }
 }

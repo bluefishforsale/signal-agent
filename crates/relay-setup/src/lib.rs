@@ -10,7 +10,7 @@ mod uninstall;
 
 pub use machine::{AccountChoice, ClientOutcome, Command, SetupEvent, SetupState, transition};
 pub use profiles::Profiles;
-pub use registration::captcha_token;
+pub use registration::{CAPTCHA_PAGE, captcha_navigation_allowed, captcha_token};
 pub use uninstall::{Step, StepOutcome, run_steps, uninstall_steps};
 
 pub mod prelude {
