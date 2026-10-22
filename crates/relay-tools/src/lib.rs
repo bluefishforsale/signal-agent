@@ -6,6 +6,7 @@ mod input;
 mod local;
 mod read;
 mod registry;
+mod send;
 #[cfg(test)]
 mod testing;
 mod tool;
