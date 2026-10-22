@@ -48,6 +48,7 @@ The primary user is non-technical: they can download a file, double-click it, an
 10. No read-only default.
 11. No Signal logo or Signal-blue speech bubble in the icon, and no "Signal"-first product name.
 12. No bulk or broadcast send tool, ever: messaging many people at once is what gets accounts banned.
+13. No `set_webhook` MCP tool, a deliberate gap in 81-tool parity. A webhook forwards every incoming message to a URL, so a client that could set it would be one prompt injection away from silently exfiltrating the account. The webhook URL is set only by the human in Advanced settings; `get_webhook` stays as a read (contract round 2, #88).
 
 ## Acceptance criteria (v2.0)
 
