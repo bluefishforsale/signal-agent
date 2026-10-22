@@ -69,7 +69,8 @@ impl Tool for ReactToMessage {
         "Add or remove your emoji reaction on a message in a DM or group, to acknowledge \
          without replying. recipient is the conversation (as list_conversations names it, \
          group ids included); target_author and target_timestamp name the message, as \
-         get_conversation returns it. You have one reaction per message: a new emoji replaces \
+         get_conversation returns it; the message must be in the local store, in that \
+         conversation. You have one reaction per message: a new emoji replaces \
          the old one. remove=true retracts that emoji. Sends to Signal; nothing is stored \
          locally."
     }
@@ -102,6 +103,7 @@ impl Tool for ReactToMessage {
             author: contact(ctx, &input.target_author).await?,
             sent_at_ms: input.target_timestamp.0,
         };
+        check_target(ctx, to, target).await?;
         let remove = input.remove;
         ctx.signal
             .send(
@@ -140,8 +142,8 @@ impl Tool for EditMessage {
     fn description(&self) -> &'static str {
         "Replace the text of a message you sent, in a DM or group; recipients see it marked \
          edited. recipient is the conversation (group ids included); target_timestamp names \
-         your message, as get_conversation or a send result returns it; message is the new \
-         full text. Only your own messages can be edited. Sends to Signal, then overwrites the \
+         your message, as get_conversation or a send result returns it, and it must be stored \
+         locally in that conversation; message is the new full text. Only your own messages can be edited. Sends to Signal, then overwrites the \
          stored body (the old text isn't kept)."
     }
     fn input_schema(&self) -> Value {
@@ -170,6 +172,7 @@ impl Tool for EditMessage {
             author: me,
             sent_at_ms: input.target_timestamp.0,
         };
+        check_target(ctx, to, target).await?;
         let edit = Outgoing::Edit {
             target,
             body: body.clone(),
@@ -200,7 +203,8 @@ impl Tool for DeleteMessage {
     fn description(&self) -> &'static str {
         "Delete a message you sent to a contact for everyone in the chat (Signal 5.0+ \
          clients). recipient is the contact; target_timestamp names your message, as \
-         get_conversation or a send result returns it. Only your own messages can be deleted. \
+         get_conversation or a send result returns it, and it must be stored locally in that \
+         conversation. Only your own messages can be deleted. \
          Irreversible. Sends to Signal, then flags the stored copy deleted."
     }
     fn input_schema(&self) -> Value {
@@ -240,8 +244,8 @@ impl Tool for DeleteGroupMessage {
     fn description(&self) -> &'static str {
         "Delete a message you sent to a group for all members (Signal 5.0+ clients). \
          group_id is the group, as list_conversations returns it (a contact's id works too, \
-         and acts like delete_message); target_timestamp names your message. Only your own \
-         messages can be deleted. Irreversible. Sends to Signal, then flags the stored copy \
+         and acts like delete_message); target_timestamp names your message, which must be stored \
+         locally in that group. Only your own messages can be deleted. Irreversible. Sends to Signal, then flags the stored copy \
          deleted."
     }
     fn input_schema(&self) -> Value {
@@ -277,12 +281,43 @@ async fn delete_own(
         author: me,
         sent_at_ms: sent_at.0,
     };
+    check_target(ctx, to, target).await?;
     ctx.signal.send(to, Outgoing::Delete { target }).await?;
     ctx.store
         .mark_deleted(target, me)
         .await
         .context("Signal accepted the delete, but the stored copy wasn't flagged")?;
     Ok(json!({ "status": "deleted" }))
+}
+
+/// Refuses `target` unless it's a live stored message in `conversation`.
+// NOTE: recipient and target arrive as separate inputs. Without this check a
+// call could name a message from one chat and send the change to another,
+// leaking the edit's text there and rewriting the wrong stored message.
+async fn check_target(
+    ctx: &ToolContext,
+    conversation: Recipient,
+    target: MessageId,
+) -> Result<(), ToolError> {
+    let Some(message) = ctx.store.get(target).await? else {
+        return Err(ToolError::InvalidInput(format!(
+            "no stored message at {} by {}",
+            target.sent_at_ms, target.author
+        )));
+    };
+    if message.conversation != conversation {
+        return Err(ToolError::InvalidInput(format!(
+            "the message at {} isn't in that conversation",
+            target.sent_at_ms
+        )));
+    }
+    if message.deleted {
+        return Err(ToolError::InvalidInput(format!(
+            "the message at {} was deleted",
+            target.sent_at_ms
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -293,7 +328,7 @@ mod tests {
     use relay_store::MemoryStore;
     use serde_json::json;
 
-    use crate::{Registry, ToolContext, testing::*};
+    use crate::{Registry, ToolContext, ToolError, testing::*};
     use relay_core::prelude::*;
 
     /// A reaction must name the target by its author and timestamp and go to
@@ -301,13 +336,14 @@ mod tests {
     #[tokio::test]
     async fn react_to_message_sends_the_reaction_to_the_target_message() {
         let (ctx, signal) = ctx(AccessMode::Full, ProfileKind::Linked);
+        ctx.store.insert(&incoming(2, 42, "hi")).await.unwrap();
         Registry::standard()
             .call(
                 &ctx,
                 "react_to_message",
                 json!({
                     "recipient": sid(2).to_string(),
-                    "target_author": sid(3).to_string(),
+                    "target_author": sid(2).to_string(),
                     "target_timestamp": 42,
                     "emoji": "👍",
                 }),
@@ -315,7 +351,7 @@ mod tests {
             .await
             .unwrap();
         let target = MessageId {
-            author: sid(3),
+            author: sid(2),
             sent_at_ms: 42,
         };
         assert_eq!(
@@ -549,6 +585,7 @@ mod tests {
     #[tokio::test]
     async fn react_to_message_with_remove_sends_a_retraction() {
         let (ctx, signal) = ctx(AccessMode::Full, ProfileKind::Linked);
+        ctx.store.insert(&incoming(2, 42, "hi")).await.unwrap();
         let out = Registry::standard()
             .call(
                 &ctx,
@@ -572,5 +609,129 @@ mod tests {
             "{sent:?}"
         );
         assert_eq!(out["status"], json!("reaction removed"), "{out}");
+    }
+
+    /// An edit naming my message from another conversation must be refused
+    /// before sending, or the new text leaks into the wrong chat and the store
+    /// rewrites a message that chat never saw edited.
+    #[tokio::test]
+    async fn an_edit_naming_a_message_from_another_conversation_is_refused_and_nothing_is_sent() {
+        let (ctx, signal) = ctx(AccessMode::Full, ProfileKind::Linked);
+        let elsewhere = Recipient::Contact(sid(3));
+        ctx.store
+            .insert(&mine(elsewhere, 42, "for 3 only"))
+            .await
+            .unwrap();
+        let result = Registry::standard()
+            .call(
+                &ctx,
+                "edit_message",
+                json!({
+                    "recipient": sid(2).to_string(),
+                    "target_timestamp": 42,
+                    "message": "secret",
+                }),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(ToolError::InvalidInput(_))),
+            "got {result:?}"
+        );
+        assert!(signal.sent().is_empty(), "sent {:?}", signal.sent());
+        let stored = ctx.store.history(elsewhere, None, 10).await.unwrap();
+        assert_eq!(stored[0].body.as_deref(), Some("for 3 only"), "{stored:?}");
+    }
+
+    /// A delete naming my message from another conversation must be refused
+    /// before sending, or it erases a message the target chat can't see and
+    /// flags the wrong stored copy deleted.
+    #[tokio::test]
+    async fn a_delete_naming_a_message_from_another_conversation_is_refused_and_nothing_is_sent() {
+        let group = GroupId::new([7; 32]);
+        let (ctx, signal) = in_group(group);
+        let elsewhere = Recipient::Contact(sid(3));
+        ctx.store
+            .insert(&mine(elsewhere, 42, "for 3 only"))
+            .await
+            .unwrap();
+        for (tool, field, conversation) in [
+            ("delete_message", "recipient", sid(2).to_string()),
+            ("delete_group_message", "group_id", group.to_string()),
+        ] {
+            let result = Registry::standard()
+                .call(
+                    &ctx,
+                    tool,
+                    json!({field: conversation, "target_timestamp": 42}),
+                )
+                .await;
+            assert!(
+                matches!(result, Err(ToolError::InvalidInput(_))),
+                "{tool} gave {result:?}"
+            );
+        }
+        assert!(signal.sent().is_empty(), "sent {:?}", signal.sent());
+        let stored = ctx.store.history(elsewhere, None, 10).await.unwrap();
+        assert!(!stored[0].deleted, "{stored:?}");
+    }
+
+    /// A reaction may land on anyone's message, but only in the conversation
+    /// that holds it; aimed elsewhere it would reveal that message's existence
+    /// to a chat that never saw it.
+    #[tokio::test]
+    async fn a_reaction_naming_a_message_from_another_conversation_is_refused_and_nothing_is_sent()
+    {
+        let (ctx, signal) = ctx(AccessMode::Full, ProfileKind::Linked);
+        ctx.store
+            .insert(&incoming(3, 42, "to me only"))
+            .await
+            .unwrap();
+        let result = Registry::standard()
+            .call(
+                &ctx,
+                "react_to_message",
+                json!({
+                    "recipient": sid(2).to_string(),
+                    "target_author": sid(3).to_string(),
+                    "target_timestamp": 42,
+                    "emoji": "👍",
+                }),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(ToolError::InvalidInput(_))),
+            "got {result:?}"
+        );
+        assert!(signal.sent().is_empty(), "sent {:?}", signal.sent());
+    }
+
+    /// A deleted message is gone for everyone; editing it would send text
+    /// that resurrects it on clients and un-delete nothing locally.
+    #[tokio::test]
+    async fn an_edit_of_a_deleted_message_is_refused_and_nothing_is_sent() {
+        let (ctx, signal) = ctx(AccessMode::Full, ProfileKind::Linked);
+        let dm = Recipient::Contact(sid(2));
+        ctx.store.insert(&mine(dm, 42, "oops")).await.unwrap();
+        let target = MessageId {
+            author: sid(ME),
+            sent_at_ms: 42,
+        };
+        ctx.store.mark_deleted(target, sid(ME)).await.unwrap();
+        let result = Registry::standard()
+            .call(
+                &ctx,
+                "edit_message",
+                json!({
+                    "recipient": sid(2).to_string(),
+                    "target_timestamp": 42,
+                    "message": "back again",
+                }),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(ToolError::InvalidInput(_))),
+            "got {result:?}"
+        );
+        assert!(signal.sent().is_empty(), "sent {:?}", signal.sent());
     }
 }
