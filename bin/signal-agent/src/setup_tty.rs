@@ -699,11 +699,8 @@ mod tests {
             "{:?}",
             driver.state()
         );
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("personal").join("access.json"))
-                .expect("access saved"),
-            "\"full\""
-        );
+        let paths = ProfilePaths::under(dir.path().to_path_buf(), &ProfileName::default_profile());
+        assert_eq!(paths.load_access().expect("access saved"), AccessMode::Full);
     }
 
     /// Claude Desktop on macOS: osascript quits it, and fails the first time.

@@ -159,7 +159,7 @@ impl Driver {
                 SetupEvent::Registered
             }
             Command::SaveAccess { access } => {
-                save_access(&self.paths, access)?;
+                self.paths.save_access(access)?;
                 return Ok(());
             }
             Command::ImportHistory => {
@@ -233,15 +233,6 @@ fn apply(state: &mut SetupState, event: SetupEvent, show: Show<'_>) -> Vec<Comma
         show(state);
     }
     commands
-}
-
-// Interim location until relay-core owns the path and the agent reads it (#67).
-fn save_access(paths: &ProfilePaths, access: AccessMode) -> anyhow::Result<()> {
-    let path = paths.root.join("access.json");
-    fs::create_dir_all(&paths.root)
-        .with_context(|| format!("unable to create \"{}\"", paths.root.display()))?;
-    let json = serde_json::to_string(&access)?;
-    fs::write(&path, json).with_context(|| format!("unable to save \"{}\"", path.display()))
 }
 
 #[cfg(test)]
@@ -344,8 +335,9 @@ mod tests {
 
         /// The access mode on disk right now, as the agent would read it.
         fn saved_access(&self) -> String {
-            fs::read_to_string(self.paths().root.join("access.json"))
-                .unwrap_or_else(|_| "unsaved".into())
+            self.paths()
+                .load_access()
+                .map_or_else(|_| "unsaved".into(), |a| format!("{a:?}"))
         }
 
         fn push(&self, entry: impl Into<String>) {
@@ -659,9 +651,9 @@ mod tests {
             [
                 "close store",
                 "import history",
-                "start agent personal, access \"read_only\"",
+                "start agent personal, access ReadOnly",
                 "claude mcp add -s user signal-personal -- \
-                 /tmp/signal-agent mcp, access \"read_only\"",
+                 /tmp/signal-agent mcp, access ReadOnly",
             ]
             .map(|e| e.replace(
                 "/tmp/signal-agent",
@@ -729,7 +721,7 @@ mod tests {
                 "request code +15555550100 Some(\"tok\") voice=false",
                 "verify 123456",
                 "close store",
-                "start agent personal, access \"full\"",
+                "start agent personal, access Full",
             ],
             "{log:?}"
         );
@@ -778,7 +770,7 @@ mod tests {
         assert!(
             world
                 .log()
-                .contains(&"start agent personal, access \"read_only\"".to_owned()),
+                .contains(&"start agent personal, access ReadOnly".to_owned()),
             "{:?}",
             world.log()
         );
@@ -953,7 +945,7 @@ mod tests {
                 if let (SetupState::ChooseAccess { .. }, SetupEvent::AccessChosen { access }) =
                     (h.driver.state(), &event)
                 {
-                    chosen = Some(serde_json::to_string(access).expect("json"));
+                    chosen = Some(format!("{access:?}"));
                 }
                 let before = world.log().len();
                 runtime.block_on(h.send(event.clone()));

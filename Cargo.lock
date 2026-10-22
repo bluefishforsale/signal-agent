@@ -5388,6 +5388,7 @@ dependencies = [
  "relay-signal",
  "tempfile",
  "tokio",
+ "tracing",
  "tracing-subscriber",
  "uuid",
 ]
