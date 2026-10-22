@@ -7,10 +7,16 @@ license.workspace = true
 [build-dependencies]
 tauri-build = { version = "2.7.4", features = [] }
 
+[features]
+# A pretend driver that walks every setup screen, for development only.
+mock-driver = []
+
 [dependencies]
+anyhow.workspace = true
+dirs.workspace = true
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
-tauri = { version = "2.12.5", features = [] }
 relay-core.workspace = true
 relay-setup.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tauri = { version = "2.12.5", features = [] }

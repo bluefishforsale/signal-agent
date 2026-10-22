@@ -4,18 +4,146 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>MCP Relay for Signal</title>
-  <style>
-    :root { color-scheme: light dark; font-family: -apple-system, "Segoe UI", system-ui, sans-serif; }
-    body { margin: 0; display: grid; place-items: center; min-height: 100vh; }
-    main { max-width: 26rem; padding: 2rem; text-align: center; line-height: 1.5; }
-    h1 { font-size: 1.4rem; margin: 0 0 .5rem; }
-    p { opacity: .75; margin: 0; }
-  </style>
+  <link rel="stylesheet" href="style.css">
+  <script src="app.js" defer></script>
 </head>
 <body>
   <main>
-    <h1>MCP Relay for Signal</h1>
-    <p>Setup is coming soon. This build only proves the installer works.</p>
+    <!-- Each section is one screen, named after the setup state it draws. -->
+
+    <section data-screen="move" hidden>
+      <h1>Move to Applications</h1>
+      <p>This app needs to live in your Applications folder so Claude can always find it. It will move itself and open again.</p>
+      <p class="error" data-field="move_error" hidden></p>
+      <div class="actions"><button class="primary" data-action="move">Move to Applications</button></div>
+    </section>
+
+    <section data-screen="choose_account" hidden>
+      <h1>Connect Claude to Signal</h1>
+      <p>Claude will be able to read your Signal messages and, if you allow it, send them.</p>
+      <fieldset class="choices">
+        <legend>How should Claude use Signal?</legend>
+        <label class="choice">
+          <input type="radio" name="account" value="link_existing" checked>
+          <span><strong>Use my Signal account</strong>
+          <small>Link this computer to Signal on your phone. Takes about a minute.</small></span>
+        </label>
+        <label class="choice">
+          <input type="radio" name="account" value="own_number">
+          <span><strong>Give Claude its own number</strong>
+          <small>Use a separate phone number just for Claude. You'll need a number that can get a text.</small></span>
+        </label>
+      </fieldset>
+      <div class="actions"><button class="primary" data-action="choose_account">Continue</button></div>
+      <details class="advanced">
+        <summary>Advanced</summary>
+      </details>
+    </section>
+
+    <section data-screen="linking" hidden>
+      <h1>Scan this with your phone</h1>
+      <div class="qr" data-field="qr" aria-label="QR code to link this computer">
+        <div class="waiting"><span class="spinner"></span>Getting a code</div>
+      </div>
+      <ol class="steps">
+        <li>Open Signal on your phone.</li>
+        <li>Go to <strong>Settings</strong>, then <strong>Linked devices</strong>.</li>
+        <li>Tap <strong>Link new device</strong> and point your phone at this code.</li>
+      </ol>
+      <p class="note">Your phone will list this computer as <strong data-field="device_name"></strong>. The code refreshes by itself until you scan it.</p>
+    </section>
+
+    <section data-screen="enter_number" hidden>
+      <h1>Claude's phone number</h1>
+      <p>Enter the number Claude will use, starting with + and the country code.</p>
+      <form data-action="enter_number">
+        <input type="tel" name="number" placeholder="+1 555 555 0123" autocomplete="tel" required>
+        <p class="note">Signal will text a code to this number. If the number already uses Signal on another phone, that phone will be signed out.</p>
+        <div class="actions"><button class="primary" type="submit">Send code</button></div>
+      </form>
+    </section>
+
+    <section data-screen="requesting_code" hidden>
+      <h1>Asking Signal for a code</h1>
+      <p class="waiting"><span class="spinner"></span>Sending a code to <strong data-field="number"></strong></p>
+    </section>
+
+    <section data-screen="solve_captcha" hidden>
+      <h1>A quick check first</h1>
+      <p>Signal wants to be sure you're a person before it sends the code.</p>
+      <ol class="steps">
+        <li>In your web browser, open <strong class="selectable">signalcaptchas.org/registration/generate.html</strong></li>
+        <li>Solve the puzzle.</li>
+        <li>When the page shows <strong>Open Signal</strong>, right-click it, choose <strong>Copy Link</strong>, and paste it here.</li>
+      </ol>
+      <!-- In-window capture of the signalcaptcha:// link replaces this paste (lane L10). -->
+      <form data-action="solve_captcha">
+        <input type="text" name="token" placeholder="signalcaptcha://…" autocomplete="off" spellcheck="false" required>
+        <p class="note">Soon this step will happen right here in this window.</p>
+        <div class="actions"><button class="primary" type="submit">Continue</button></div>
+      </form>
+    </section>
+
+    <section data-screen="enter_code" hidden>
+      <h1>Enter the code</h1>
+      <p>Signal sent a code to <strong data-field="number"></strong>.</p>
+      <form data-action="enter_code">
+        <input type="text" name="code" inputmode="numeric" autocomplete="one-time-code" placeholder="123456" required>
+        <div class="actions"><button class="primary" type="submit">Continue</button></div>
+      </form>
+    </section>
+
+    <section data-screen="verifying_code" hidden>
+      <h1>Checking the code</h1>
+      <p class="waiting"><span class="spinner"></span>This takes a few seconds.</p>
+    </section>
+
+    <section data-screen="choose_access" hidden>
+      <h1>Let Claude send messages as you?</h1>
+      <fieldset class="choices">
+        <legend>What can Claude do?</legend>
+        <label class="choice">
+          <input type="radio" name="access" value="full" checked>
+          <span><strong>Yes</strong>
+          <small>Claude can read and send messages.</small></span>
+        </label>
+        <label class="choice">
+          <input type="radio" name="access" value="read_only">
+          <span><strong>No</strong>
+          <small>Claude can only read messages.</small></span>
+        </label>
+      </fieldset>
+      <p class="note">Claude could send something you didn't mean to, so read what it's about to send before you approve.</p>
+      <div class="actions"><button class="primary" data-action="choose_access">Continue</button></div>
+    </section>
+
+    <section data-screen="importing_history" hidden>
+      <h1>Bringing over your messages</h1>
+      <progress data-field="percent" max="100"></progress>
+      <p><strong data-field="imported"></strong> messages so far</p>
+      <p class="note">Signal shares about the last 45 days of messages. Keep your phone on and connected until this finishes.</p>
+    </section>
+
+    <section data-screen="connecting_clients" hidden>
+      <h1>Connecting Claude</h1>
+      <p class="waiting"><span class="spinner"></span>Adding Signal to your Claude apps.</p>
+    </section>
+
+    <section data-screen="done" hidden>
+      <h1>You're all set</h1>
+      <ul class="clients" data-field="clients"></ul>
+      <div data-field="restart">
+        <p>Restart Claude Desktop so it can see your messages.</p>
+        <div class="actions"><button class="primary" data-action="restart_desktop">Restart Claude Desktop</button></div>
+      </div>
+      <p data-field="no_restart">Open Claude and ask it about your messages.</p>
+    </section>
+
+    <section data-screen="failed" hidden>
+      <h1>Something went wrong</h1>
+      <p data-field="message"></p>
+      <div class="actions"><button class="primary" data-action="retry">Try again</button></div>
+    </section>
   </main>
 </body>
 </html>

@@ -42,6 +42,11 @@ impl Session {
         view(&self.state.lock().expect("setup state lock"))
     }
 
+    /// Redraws the current screen, as after input that changed nothing.
+    pub fn redraw(&self) {
+        (self.on_change)(&self.view());
+    }
+
     /// Applies `event` and starts whatever commands it calls for.
     pub fn handle(self: &Arc<Self>, event: SetupEvent) {
         let commands = {

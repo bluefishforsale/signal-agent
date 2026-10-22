@@ -3,7 +3,13 @@
 //! path that vanishes. So setup refuses to start until the app lives in an
 //! Applications folder.
 
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process,
+};
+
+use anyhow::{Context, bail};
 
 /// Where the running app is, as far as setup cares.
 #[derive(Debug, PartialEq, Eq)]
@@ -46,6 +52,58 @@ pub fn destination(bundle: &Path, applications_writable: bool, home: &Path) -> O
         home.join("Applications")
     };
     Some(dir.join(bundle.file_name()?))
+}
+
+/// The running app's bundle, when it must move before setup.
+pub fn misplaced_bundle() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let home = dirs::home_dir()?;
+    match placement(&exe, &home) {
+        Placement::Elsewhere { bundle } => Some(bundle),
+        Placement::Installed | Placement::Unbundled => None,
+    }
+}
+
+/// Copies `bundle` into an Applications folder and opens the copy. The
+/// original stays put: a translocated or disk-image copy can't be removed.
+pub fn move_to_applications(bundle: &Path) -> anyhow::Result<()> {
+    let home = dirs::home_dir().context("no home folder")?;
+    let dest = destination(bundle, writable(Path::new("/Applications")), &home)
+        .with_context(|| format!("no app name in \"{}\"", bundle.display()))?;
+    if let Some(dir) = dest.parent() {
+        fs::create_dir_all(dir)
+            .with_context(|| format!("unable to create \"{}\"", dir.display()))?;
+    }
+    // NOTE: a copy already there is an older install of this same app; ditto
+    // would merge into it and leave stale files inside the bundle.
+    if dest.exists() {
+        fs::remove_dir_all(&dest)
+            .with_context(|| format!("unable to replace \"{}\"", dest.display()))?;
+    }
+    run(process::Command::new("ditto").arg(bundle).arg(&dest))?;
+    // ditto keeps the quarantine flag, and a quarantined copy is translocated
+    // all over again. Gatekeeper already approved this launch. xattr exits
+    // non-zero when the flag is absent, so its status says nothing.
+    let _ = process::Command::new("xattr")
+        .args(["-dr", "com.apple.quarantine"])
+        .arg(&dest)
+        .status();
+    run(process::Command::new("open").arg("-n").arg(&dest))
+}
+
+fn writable(dir: &Path) -> bool {
+    let probe = dir.join(format!(".mcp-relay-write-check-{}", process::id()));
+    fs::File::create(&probe).is_ok() && fs::remove_file(&probe).is_ok()
+}
+
+fn run(command: &mut process::Command) -> anyhow::Result<()> {
+    let status = command
+        .status()
+        .with_context(|| format!("unable to run {command:?}"))?;
+    if !status.success() {
+        bail!("{command:?} failed: {status}");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
