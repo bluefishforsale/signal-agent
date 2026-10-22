@@ -374,6 +374,26 @@ pub(crate) fn device(info: &DeviceInfo) -> crate::Device {
     }
 }
 
+/// The safety number Signal's apps show for `me` and `them` with these keys.
+pub(crate) fn safety_number(
+    me: ServiceId,
+    my_key: &protocol::IdentityKey,
+    them: ServiceId,
+    their_key: &protocol::IdentityKey,
+) -> anyhow::Result<String> {
+    // Version 2 and 5200 iterations, keyed by ACI bytes, as Signal's apps do.
+    protocol::Fingerprint::new(
+        2,
+        5200,
+        me.uuid().as_bytes(),
+        my_key,
+        them.uuid().as_bytes(),
+        their_key,
+    )
+    .and_then(|fingerprint| fingerprint.display_string())
+    .map_err(|e| anyhow::anyhow!("unable to compute the safety number with {them}: {e}"))
+}
+
 pub(crate) fn contact_from(contact: &presage::model::contacts::Contact) -> crate::Contact {
     crate::Contact {
         service_id: ServiceId::new(contact.uuid),
@@ -1172,6 +1192,39 @@ mod tests {
                     last_seen_at_ms: last_seen_at_ms as u64,
                 }
             );
+        }
+    }
+
+    fn identity_key(seed: u8) -> protocol::IdentityKey {
+        let mut bytes = [seed; 33];
+        bytes[0] = 0x05;
+        protocol::IdentityKey::decode(&bytes).expect("a curve25519 public key")
+    }
+
+    proptest! {
+        // Each case hashes 5200 rounds four times; a few cases cover it.
+        #![proptest_config(ProptestConfig::with_cases(8))]
+        /// A safety number is compared by reading it aloud between two phones,
+        /// so both sides must compute the same 60 digits, and a new key on
+        /// either side must change them.
+        #[test]
+        fn both_sides_see_the_same_safety_number_and_a_new_key_changes_it(
+            mine in 1u8..=255,
+            theirs in 1u8..=255,
+            replaced in 1u8..=255,
+        ) {
+            prop_assume!(replaced != theirs);
+            let (me, alice) = (ServiceId::new(ME), ServiceId::new(ALICE));
+            let ours = safety_number(me, &identity_key(mine), alice, &identity_key(theirs))
+                .expect("computes");
+            let from_alice = safety_number(alice, &identity_key(theirs), me, &identity_key(mine))
+                .expect("computes");
+            prop_assert_eq!(ours.len(), 60);
+            prop_assert!(ours.bytes().all(|b| b.is_ascii_digit()), "{}", ours);
+            prop_assert_eq!(&ours, &from_alice);
+            let after = safety_number(me, &identity_key(mine), alice, &identity_key(replaced))
+                .expect("computes");
+            prop_assert_ne!(ours, after);
         }
     }
 

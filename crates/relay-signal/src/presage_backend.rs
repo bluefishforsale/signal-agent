@@ -46,7 +46,7 @@ use tracing::warn;
 
 use crate::{
     Account, Contact, Device, Group, Identity, Incoming, LinkEvent, Outgoing, Provisioner,
-    RateLimited, RegistrationStep, SendableFile, SignalBackend, convert,
+    RateLimited, RegistrationStep, SendableFile, SignalBackend, Trust, convert,
 };
 
 type Job = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()>>> + Send>;
@@ -369,7 +369,37 @@ impl SignalBackend for PresageSignal {
     }
 
     async fn identities(&self) -> anyhow::Result<Vec<Identity>> {
-        bail!("listing identities is not implemented yet (lane L1b)")
+        let me = self.account.service_id;
+        let store = self.manager.store().clone();
+        self.worker
+            .run(move || async move {
+                let keys = store.aci_protocol_store();
+                let mine = keys
+                    .get_identity_key_pair()
+                    .await
+                    .context("unable to read the account's identity key")?;
+                let mut identities = Vec::new();
+                for contact in store.contacts().await.context("unable to list contacts")? {
+                    let contact = contact.context("unreadable contact in the store")?;
+                    let them = ServiceId::new(contact.uuid);
+                    let address = protocol_address(SignalServiceId::from(convert::aci(them)))?;
+                    let Some(key) = keys
+                        .get_identity(&address)
+                        .await
+                        .with_context(|| format!("unable to read the identity key of {them}"))?
+                    else {
+                        continue;
+                    };
+                    identities.push(Identity {
+                        service_id: them,
+                        safety_number: convert::safety_number(me, mine.identity_key(), them, &key)?,
+                        trust: Trust::Unverified,
+                        changed: false,
+                    });
+                }
+                anyhow::Ok(identities)
+            })
+            .await?
     }
 
     async fn devices(&self) -> anyhow::Result<Vec<Device>> {
@@ -767,11 +797,9 @@ impl IdentityWatch {
     /// Whether `who`'s identity key differs from the last one seen.
     async fn changed(&mut self, store: &SqliteStore, who: SignalServiceId) -> bool {
         let name = who.service_id_string();
-        // Identity keys are per account; the device id is ignored by the lookup.
-        let Ok(device) = DeviceId::new(1) else {
+        let Ok(address) = protocol_address(who) else {
             return false;
         };
-        let address = ProtocolAddress::new(name.clone(), device);
         let current = match store.aci_protocol_store().get_identity(&address).await {
             Ok(Some(current)) => current,
             Ok(None) => return false,
@@ -784,6 +812,13 @@ impl IdentityWatch {
             .insert(name, current)
             .is_some_and(|previous| previous != current)
     }
+}
+
+/// The address `who`'s identity key is stored under.
+fn protocol_address(who: SignalServiceId) -> anyhow::Result<ProtocolAddress> {
+    // Identity keys are per account; the device id is ignored by the lookup.
+    let device = DeviceId::new(1).context("device 1 is out of range")?;
+    Ok(ProtocolAddress::new(who.service_id_string(), device))
 }
 
 /// Receives from Signal for as long as anyone holds the other end of `tx`,
@@ -968,6 +1003,7 @@ mod tests {
     use presage::{
         libsignal_service::{
             content::{ContentBody, Metadata},
+            protocol::IdentityKeyPair,
             websocket::registration::RegistrationSessionMetadataResponse,
         },
         manager::RegistrationData,
@@ -1383,6 +1419,71 @@ mod tests {
             .await
             .expect("group avatar");
         assert_eq!(group, Some(vec![4, 5]));
+    }
+
+    /// Identities are read from the store alone: each contact with a key gets
+    /// the safety number for that key, and a contact the account never
+    /// exchanged keys with is left out. Nothing here has verified anyone.
+    #[tokio::test]
+    async fn identities_list_each_stored_key_with_its_safety_number() {
+        let (_dir, path) = temp_store();
+        register_linked(&path).await;
+        let (alice, bob) = (uuid::Uuid::from_u128(0xa11ce), uuid::Uuid::from_u128(0xb0b));
+        let mine = presage::libsignal_service::protocol::PrivateKey::deserialize(&[9; 32])
+            .ok()
+            .and_then(|private| IdentityKeyPair::try_from(private).ok())
+            .expect("a key pair");
+        seed(&path, move |mut store| async move {
+            store
+                .set_aci_identity_key_pair(mine)
+                .await
+                .expect("own key");
+            for uuid in [alice, bob] {
+                store
+                    .save_contact(&presage::model::contacts::Contact {
+                        uuid,
+                        phone_number: None,
+                        name: String::new(),
+                        verified: Default::default(),
+                        profile_key: Vec::new(),
+                        expire_timer: 0,
+                        expire_timer_version: 2,
+                        inbox_position: 0,
+                        avatar: None,
+                    })
+                    .await
+                    .expect("contact");
+            }
+            let address = ProtocolAddress::new(
+                SignalServiceId::from(convert::aci(ServiceId::new(alice))).service_id_string(),
+                DeviceId::new(1).expect("device 1"),
+            );
+            store
+                .aci_protocol_store()
+                .save_identity(&address, &identity_key(1))
+                .await
+                .expect("alice's key");
+        })
+        .await;
+        let signal = PresageSignal::open(&path, &KEY).await.expect("opens");
+        let identities = signal.identities().await.expect("identities");
+        let alice = ServiceId::new(alice);
+        let me = ServiceId::parse(ME).expect("uuid");
+        assert_eq!(
+            identities,
+            vec![Identity {
+                service_id: alice,
+                safety_number: convert::safety_number(
+                    me,
+                    mine.identity_key(),
+                    alice,
+                    &identity_key(1)
+                )
+                .expect("computes"),
+                trust: crate::Trust::Unverified,
+                changed: false,
+            }]
+        );
     }
 
     /// Sending to a group the account isn't in must fail with a reason, before
