@@ -372,6 +372,7 @@ mod tests {
             id: GroupId::new([byte; 32]),
             title: title.into(),
             members: members.iter().map(|&n| sid(n)).collect(),
+            admins: vec![],
         }
     }
 

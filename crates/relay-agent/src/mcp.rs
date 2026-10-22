@@ -114,6 +114,7 @@ pub(crate) mod tests {
                     Outgoing::Text {
                         body: body.to_owned(),
                         quote: None,
+                        attachments: vec![],
                     },
                 )
                 .await?;

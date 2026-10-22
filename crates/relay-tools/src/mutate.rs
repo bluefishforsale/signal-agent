@@ -511,6 +511,7 @@ mod tests {
                 id: group,
                 title: "band".into(),
                 members: vec![sid(ME), sid(2)],
+                admins: vec![sid(ME)],
             }]),
         );
         let ctx = ToolContext {

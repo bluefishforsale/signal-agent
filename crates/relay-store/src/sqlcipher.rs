@@ -13,7 +13,10 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions},
 };
 
-use crate::{MessageStore, SearchQuery, StoreStats, ensure_author};
+use crate::{
+    JobId, MessageStore, ScheduledJob, ScheduledSend, SearchQuery, StoreStats, StoredAttachment,
+    WebhookUrl, ensure_author,
+};
 
 /// A profile's encrypted message history.
 pub struct SqlCipherStore {
@@ -396,6 +399,61 @@ impl MessageStore for SqlCipherStore {
             oldest_ms: oldest.map(to_u64).transpose()?,
             newest_ms: newest.map(to_u64).transpose()?,
         })
+    }
+    async fn delete_conversation(&self, _conversation: Recipient) -> anyhow::Result<u64> {
+        bail!("deleting a conversation is not implemented yet (lane L2b)")
+    }
+
+    async fn mark_admin_deleted(&self, _group: GroupId, _target: MessageId) -> anyhow::Result<()> {
+        bail!("admin deletes are not implemented yet (lane L2b)")
+    }
+
+    async fn attachments(
+        &self,
+        _limit: u32,
+        _offset: u32,
+    ) -> anyhow::Result<Vec<StoredAttachment>> {
+        bail!("the attachment index is not implemented yet (lane L2b)")
+    }
+
+    async fn attachment(&self, _id: &str) -> anyhow::Result<Option<StoredAttachment>> {
+        bail!("the attachment index is not implemented yet (lane L2b)")
+    }
+
+    async fn next_poll_vote(&self, _poll: MessageId) -> anyhow::Result<u32> {
+        bail!("poll vote counts are not implemented yet (lane L2b)")
+    }
+
+    async fn schedule(&self, _send: &ScheduledSend) -> anyhow::Result<JobId> {
+        bail!("scheduled sends are not implemented yet (lane L2b)")
+    }
+
+    async fn scheduled(&self) -> anyhow::Result<Vec<ScheduledJob>> {
+        bail!("scheduled sends are not implemented yet (lane L2b)")
+    }
+
+    async fn cancel_scheduled(&self, _id: JobId) -> anyhow::Result<bool> {
+        bail!("scheduled sends are not implemented yet (lane L2b)")
+    }
+
+    async fn take_due(&self, _now_ms: u64) -> anyhow::Result<Vec<ScheduledJob>> {
+        bail!("scheduled sends are not implemented yet (lane L2b)")
+    }
+
+    async fn finish_scheduled(
+        &self,
+        _id: JobId,
+        _result: Result<(), String>,
+    ) -> anyhow::Result<()> {
+        bail!("scheduled sends are not implemented yet (lane L2b)")
+    }
+
+    async fn webhook(&self) -> anyhow::Result<Option<WebhookUrl>> {
+        bail!("webhook config is not implemented yet (lane L2b)")
+    }
+
+    async fn set_webhook(&self, _url: Option<&WebhookUrl>) -> anyhow::Result<()> {
+        bail!("webhook config is not implemented yet (lane L2b)")
     }
 }
 

@@ -49,22 +49,7 @@ impl GroupId {
     }
 
     pub fn parse(s: &str) -> anyhow::Result<Self> {
-        let s = s.trim();
-        if s.len() != 64 {
-            bail!(
-                "group id \"{s}\" must be 64 hex characters, got {}",
-                s.len()
-            );
-        }
-        let mut bytes = [0u8; 32];
-        for (i, byte) in bytes.iter_mut().enumerate() {
-            let Some(pair) = s.get(i * 2..i * 2 + 2) else {
-                bail!("group id \"{s}\" is not hex");
-            };
-            *byte = u8::from_str_radix(pair, 16)
-                .with_context(|| format!("group id \"{s}\" is not hex"))?;
-        }
-        Ok(Self(bytes))
+        parse_hex(s, "group id").map(Self)
     }
 
     pub fn as_bytes(&self) -> &[u8; 32] {
@@ -85,6 +70,61 @@ impl fmt::Debug for GroupId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "GroupId({self})")
     }
+}
+
+/// An installed sticker pack's identifier: 16 bytes, written as 32 lowercase
+/// hex characters as in Signal's sticker links.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct StickerPackId([u8; 16]);
+
+impl StickerPackId {
+    pub fn new(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn parse(s: &str) -> anyhow::Result<Self> {
+        parse_hex(s, "sticker pack id").map(Self)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+}
+
+impl fmt::Display for StickerPackId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for StickerPackId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "StickerPackId({self})")
+    }
+}
+
+/// Exactly `N` bytes from `2 * N` hex characters, ignoring surrounding space.
+fn parse_hex<const N: usize>(s: &str, what: &str) -> anyhow::Result<[u8; N]> {
+    let s = s.trim();
+    if s.len() != N * 2 {
+        bail!(
+            "{what} \"{s}\" must be {} hex characters, got {}",
+            N * 2,
+            s.len()
+        );
+    }
+    let mut bytes = [0u8; N];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        let Some(pair) = s.get(i * 2..i * 2 + 2) else {
+            bail!("{what} \"{s}\" is not hex");
+        };
+        *byte =
+            u8::from_str_radix(pair, 16).with_context(|| format!("{what} \"{s}\" is not hex"))?;
+    }
+    Ok(bytes)
 }
 
 /// Who a message is to, or which conversation it belongs to.
@@ -122,6 +162,21 @@ mod tests {
         #[test]
         fn group_id_parse_never_panics_on_garbage(s in ".*") {
             let _ = GroupId::parse(&s);
+        }
+
+        /// A sticker pack id must survive its own text form, since tools take it
+        /// as the hex in a sticker link.
+        #[test]
+        fn sticker_pack_id_round_trips_through_hex(bytes in any::<[u8; 16]>()) {
+            let id = StickerPackId::new(bytes);
+            let parsed = StickerPackId::parse(&id.to_string()).expect("own display is valid");
+            prop_assert_eq!(parsed, id);
+        }
+
+        /// Arbitrary strings must never panic the sticker pack parser either.
+        #[test]
+        fn sticker_pack_id_parse_never_panics_on_garbage(s in ".*") {
+            let _ = StickerPackId::parse(&s);
         }
     }
 

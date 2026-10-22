@@ -11,6 +11,7 @@ relay-core.workspace = true
 relay-secrets.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+url = "2.5.8"
 sqlx = { version = "0.9.0", default-features = false, features = ["sqlite", "runtime-tokio", "migrate", "macros"] }
 # NOTE: every crate linking libsqlite3-sys declares exactly this, so Cargo's
 # feature unification yields one SQLCipher with one crypto backend whatever

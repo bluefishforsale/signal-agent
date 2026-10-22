@@ -315,6 +315,7 @@ async fn send_text(
             Outgoing::Text {
                 body: body.clone(),
                 quote,
+                attachments: vec![],
             },
         )
         .await?;
@@ -363,6 +364,7 @@ mod tests {
                 id: GroupId::new(GROUP),
                 title: "band".into(),
                 members: vec![sid(ME), sid(2)],
+                admins: vec![sid(ME)],
             }]),
         );
         let ctx = ToolContext {
@@ -401,6 +403,7 @@ mod tests {
         let text = Outgoing::Text {
             body: "soundcheck at 6".into(),
             quote: Some(quoted),
+            attachments: vec![],
         };
         assert_eq!(signal.sent(), [(to, text)]);
         let id: MessageId = serde_json::from_value(out["id"].clone()).unwrap();
@@ -427,6 +430,7 @@ mod tests {
         let text = Outgoing::Text {
             body: "hi".into(),
             quote: None,
+            attachments: vec![],
         };
         assert_eq!(signal.sent(), [(to, text)]);
         let id: MessageId = serde_json::from_value(out["id"].clone()).unwrap();
@@ -464,6 +468,7 @@ mod tests {
         let text = Outgoing::Text {
             body: "agreed".into(),
             quote: Some(quoted),
+            attachments: vec![],
         };
         assert_eq!(signal.sent(), [(to, text)]);
         let stored = ctx.store.history(to, None, 10).await.unwrap();
@@ -487,6 +492,7 @@ mod tests {
         let text = Outgoing::Text {
             body: "buy cat food".into(),
             quote: None,
+            attachments: vec![],
         };
         assert_eq!(signal.sent(), [(me, text)]);
         let id: MessageId = serde_json::from_value(out["id"].clone()).unwrap();
@@ -515,6 +521,7 @@ mod tests {
         let text = Outgoing::Text {
             body: "and litter".into(),
             quote: Some(earlier),
+            attachments: vec![],
         };
         assert_eq!(signal.sent(), [(Recipient::Contact(sid(ME)), text)]);
     }

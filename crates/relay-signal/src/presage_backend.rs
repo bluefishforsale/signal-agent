@@ -41,8 +41,8 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
 use crate::{
-    Account, Contact, Group, Incoming, LinkEvent, Outgoing, Provisioner, RegistrationStep,
-    SignalBackend, convert,
+    Account, Contact, Device, Group, Identity, Incoming, LinkEvent, Outgoing, Provisioner,
+    RegistrationStep, SendableFile, SignalBackend, convert,
 };
 
 type Job = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()>>> + Send>;
@@ -276,6 +276,32 @@ impl SignalBackend for PresageSignal {
         };
         futures::stream::once(start).flatten().boxed()
     }
+    async fn upload(&self, _file: &SendableFile) -> anyhow::Result<AttachmentRef> {
+        bail!("uploading attachments is not implemented yet (lane L1b)")
+    }
+
+    async fn discover(
+        &self,
+        _numbers: &[String],
+    ) -> anyhow::Result<Vec<(String, Option<ServiceId>)>> {
+        bail!("contact discovery is not implemented yet (lane L1b)")
+    }
+
+    async fn lookup_username(&self, _username: &str) -> anyhow::Result<Option<ServiceId>> {
+        bail!("username lookup is not implemented yet (lane L1b)")
+    }
+
+    async fn avatar(&self, _of: Recipient) -> anyhow::Result<Option<Vec<u8>>> {
+        bail!("avatars are not implemented yet (lane L1b)")
+    }
+
+    async fn identities(&self) -> anyhow::Result<Vec<Identity>> {
+        bail!("listing identities is not implemented yet (lane L1b)")
+    }
+
+    async fn devices(&self) -> anyhow::Result<Vec<Device>> {
+        bail!("listing devices is not implemented yet (lane L1b)")
+    }
 }
 
 /// Which Signal service an account lives on.
@@ -451,7 +477,7 @@ async fn send(
             by_author.entry(target.author).or_default().push(*target);
         }
         for (author, targets) in by_author {
-            let body = convert::content_body(&Outgoing::ReadReceipt { targets }, sent_at_ms, None);
+            let body = convert::content_body(&Outgoing::ReadReceipt { targets }, sent_at_ms, None)?;
             manager
                 .send_message(convert::aci(author), body, sent_at_ms)
                 .await
@@ -461,7 +487,7 @@ async fn send(
     }
     match to {
         Recipient::Contact(contact) => {
-            let body = convert::content_body(&message, sent_at_ms, None);
+            let body = convert::content_body(&message, sent_at_ms, None)?;
             manager
                 .send_message(convert::aci(contact), body, sent_at_ms)
                 .await
@@ -474,7 +500,7 @@ async fn send(
                 revision: Some(group.revision),
                 group_change: None,
             };
-            let body = convert::content_body(&message, sent_at_ms, Some(&context));
+            let body = convert::content_body(&message, sent_at_ms, Some(&context))?;
             manager
                 .send_message_to_group(&master_key, body, sent_at_ms)
                 .await
@@ -834,6 +860,7 @@ mod tests {
                 id: convert::group_id([4; 32]),
                 title: "cats".into(),
                 members: vec![ServiceId::new(me)],
+                admins: vec![],
             }]
         );
     }

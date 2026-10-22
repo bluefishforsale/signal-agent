@@ -1,10 +1,14 @@
 //! The contract the presage implementation fulfills. Kept to what the agent
 //! needs; protocol detail stays below this line.
 
+use std::num::NonZeroU32;
+
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use relay_core::prelude::*;
 use serde::{Deserialize, Serialize};
+
+use crate::SendableFile;
 
 /// The account a registered backend operates as.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,16 +33,57 @@ pub struct Group {
     pub id: GroupId,
     pub title: String,
     pub members: Vec<ServiceId>,
+    /// Members allowed to administer the group, including deleting other
+    /// members' messages for everyone.
+    pub admins: Vec<ServiceId>,
+}
+
+/// A stored identity key for one of the account's contacts.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Identity {
+    pub service_id: ServiceId,
+    /// The safety number shown in Signal's apps, as digits.
+    pub safety_number: String,
+    pub trust: Trust,
+    /// True when this key replaced an earlier one and hasn't been verified
+    /// since: the contact's safety number changed.
+    pub changed: bool,
+}
+
+/// How far an identity key is trusted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Trust {
+    Verified,
+    Unverified,
+    Untrusted,
+}
+
+/// A device linked to the account.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Device {
+    /// 1 is the primary.
+    pub id: u32,
+    pub name: Option<String>,
+    pub created_at_ms: u64,
+    pub last_seen_at_ms: u64,
 }
 
 /// Something to send. Reactions, edits and deletes reference the target by its
 /// `MessageId`, as Signal does.
+// NOTE: every variant here must be classified in relay-tools' limits.rs
+// `counts()`, whose match is exhaustive on purpose: a new variant that reaches
+// a person but slips past the send limiter is how an account gets flagged.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Outgoing {
+    /// `attachments` are refs `SignalBackend::upload` returned; an empty list
+    /// is a plain text message.
     Text {
         body: String,
         quote: Option<MessageId>,
+        #[serde(default)]
+        attachments: Vec<AttachmentRef>,
     },
     Reaction {
         target: MessageId,
@@ -57,6 +102,41 @@ pub enum Outgoing {
     },
     ReadReceipt {
         targets: Vec<MessageId>,
+    },
+    /// A sticker from a pack installed on the account.
+    Sticker {
+        pack: StickerPackId,
+        sticker_id: u32,
+    },
+    /// Pins `target` for everyone in the conversation, for `duration_secs` or
+    /// until unpinned when `None`.
+    Pin {
+        target: MessageId,
+        duration_secs: Option<NonZeroU32>,
+    },
+    Unpin {
+        target: MessageId,
+    },
+    PollCreate {
+        question: String,
+        options: Vec<String>,
+        multi_select: bool,
+    },
+    /// `vote_count` must exceed every earlier vote's on the same poll; Signal's
+    /// apps keep only the highest.
+    PollVote {
+        poll: MessageId,
+        option_indexes: Vec<u32>,
+        vote_count: u32,
+    },
+    /// Closes a poll this account created.
+    PollTerminate {
+        poll: MessageId,
+    },
+    /// Deletes another member's group message for everyone, on this account's
+    /// authority as a group admin. Only sendable to a group.
+    AdminDelete {
+        target: MessageId,
     },
 }
 
@@ -87,6 +167,15 @@ pub enum Incoming {
         target: MessageId,
         from: ServiceId,
     },
+    // NOTE: `from` claims to be a group admin. Whoever applies this must check
+    // `from` against the group's admins from `SignalBackend::groups` before
+    // calling `MessageStore::mark_admin_deleted`, or any member could erase
+    // anyone's messages from the local history.
+    AdminDelete {
+        group: GroupId,
+        target: MessageId,
+        from: ServiceId,
+    },
     Read {
         targets: Vec<MessageId>,
     },
@@ -109,6 +198,25 @@ pub trait SignalBackend: Send + Sync {
     /// Everything that arrives from now on. Called once by the agent, which is
     /// the only consumer.
     fn incoming(&self) -> BoxStream<'static, anyhow::Result<Incoming>>;
+
+    /// Encrypts and uploads `file` so an `Outgoing::Text` can carry it. Nobody
+    /// receives anything until that message is sent.
+    async fn upload(&self, file: &SendableFile) -> anyhow::Result<AttachmentRef>;
+    /// Which of `numbers` (E.164) are registered on Signal, in the order
+    /// given; `None` when a number isn't, or hides itself from discovery.
+    async fn discover(
+        &self,
+        numbers: &[String],
+    ) -> anyhow::Result<Vec<(String, Option<ServiceId>)>>;
+    /// The account a Signal username belongs to, if any.
+    async fn lookup_username(&self, username: &str) -> anyhow::Result<Option<ServiceId>>;
+    /// A contact's profile picture or a group's avatar as image bytes; `None`
+    /// when they have none.
+    async fn avatar(&self, of: Recipient) -> anyhow::Result<Option<Vec<u8>>>;
+    /// Every stored identity key for the account's contacts.
+    async fn identities(&self) -> anyhow::Result<Vec<Identity>>;
+    /// Every device linked to the account, as Signal's servers report them.
+    async fn devices(&self) -> anyhow::Result<Vec<Device>>;
 }
 
 /// Progress while linking as a secondary device.

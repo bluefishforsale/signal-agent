@@ -5,6 +5,7 @@
 mod contract;
 mod memory;
 mod sqlcipher;
+mod webhook;
 
 use anyhow::bail;
 use async_trait::async_trait;
@@ -13,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 pub use memory::MemoryStore;
 pub use sqlcipher::SqlCipherStore;
+pub use webhook::WebhookUrl;
 
 /// A full-text search with optional filters.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +37,49 @@ pub struct StoreStats {
     pub unread: u64,
     pub oldest_ms: Option<u64>,
     pub newest_ms: Option<u64>,
+}
+
+/// An attachment in stored history, with the message it came in.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredAttachment {
+    pub attachment: AttachmentRef,
+    pub message: MessageId,
+    pub conversation: Recipient,
+}
+
+/// A scheduled send's identifier, unique within one profile's store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct JobId(pub u64);
+
+/// A text message to send to one recipient later.
+// NOTE: one recipient, never a list. A scheduled fan-out is a broadcast send
+// with a delay, which PRD anti-goal 12 rules out.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduledSend {
+    pub recipient: Recipient,
+    pub body: String,
+    pub send_at_ms: u64,
+}
+
+/// Where a scheduled send stands.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum JobState {
+    Pending,
+    /// Claimed by `take_due` and not yet finished. A job left here by a crash
+    /// may or may not have reached Signal, so it is never sent again.
+    Sending,
+    Failed {
+        error: String,
+    },
+}
+
+/// A scheduled send as stored.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduledJob {
+    pub id: JobId,
+    pub send: ScheduledSend,
+    pub state: JobState,
 }
 
 /// One profile's message history.
@@ -89,6 +134,40 @@ pub trait MessageStore: Send + Sync {
         conversation: Option<Recipient>,
         since_ms: Option<u64>,
     ) -> anyhow::Result<Vec<Message>>;
+    /// Deletes every stored message in `conversation`, with its read state and
+    /// title, returning how many messages went. Local only.
+    async fn delete_conversation(&self, conversation: Recipient) -> anyhow::Result<u64>;
+    /// Flags `target` deleted on a group admin's authority. Fails unless
+    /// `target` is stored in `group`.
+    // NOTE: unlike mark_deleted this can't check the deleter, because the
+    // deleter isn't the author. Checking the deleter is one of the group's
+    // admins (`relay_signal::Group::admins`) is the caller's job, every time.
+    async fn mark_admin_deleted(&self, group: GroupId, target: MessageId) -> anyhow::Result<()>;
+    /// Attachments in stored history, newest message first, leaving out
+    /// messages deleted for everyone.
+    async fn attachments(&self, limit: u32, offset: u32) -> anyhow::Result<Vec<StoredAttachment>>;
+    /// One stored attachment by id, unless its message was deleted for everyone.
+    async fn attachment(&self, id: &str) -> anyhow::Result<Option<StoredAttachment>>;
+    /// The vote count for this account's next vote on `poll`: 1 for the
+    /// first, and higher than every earlier one after that.
+    async fn next_poll_vote(&self, poll: MessageId) -> anyhow::Result<u32>;
+
+    async fn schedule(&self, send: &ScheduledSend) -> anyhow::Result<JobId>;
+    /// Every job not yet sent, soonest first.
+    async fn scheduled(&self) -> anyhow::Result<Vec<ScheduledJob>>;
+    /// Removes a job whatever its state, returning false when there was none.
+    /// A job already `Sending` still finishes that send.
+    async fn cancel_scheduled(&self, id: JobId) -> anyhow::Result<bool>;
+    /// Claims every pending job due at `now_ms`, moving it to `Sending`, so no
+    /// two callers ever get the same job.
+    async fn take_due(&self, now_ms: u64) -> anyhow::Result<Vec<ScheduledJob>>;
+    /// Records how a claimed job's send went: success removes it, failure
+    /// keeps it as `Failed` for the user to see. Never re-queues it.
+    async fn finish_scheduled(&self, id: JobId, result: Result<(), String>) -> anyhow::Result<()>;
+
+    async fn webhook(&self) -> anyhow::Result<Option<WebhookUrl>>;
+    async fn set_webhook(&self, url: Option<&WebhookUrl>) -> anyhow::Result<()>;
+
     /// Releases the store's connections. The agent calls this before exiting.
     // NOTE: dropping the SQLCipher store without closing it first crashed the
     // process at exit (sqlite3FreeCodecArg, 24 of 40 runs in L2's testing), so

@@ -14,6 +14,12 @@ pub struct ProfilePaths {
     pub signal_store: PathBuf,
     pub message_store: PathBuf,
     pub agent_log: PathBuf,
+    /// The Advanced settings setup writes and the agent reads at start.
+    pub settings: PathBuf,
+    /// The send budget the agent persists across restarts.
+    pub limits: PathBuf,
+    /// When this profile last tried to link or register.
+    pub provisioning: PathBuf,
 }
 
 impl ProfilePaths {
@@ -31,6 +37,9 @@ impl ProfilePaths {
             signal_store: root.join("signal.db"),
             message_store: root.join("messages.db"),
             agent_log: root.join("agent.log"),
+            settings: root.join("settings.json"),
+            limits: root.join("limits.json"),
+            provisioning: root.join("provisioning.json"),
             root,
         }
     }

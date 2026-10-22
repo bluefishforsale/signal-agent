@@ -13,7 +13,9 @@ use anyhow::Context;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use relay_core::prelude::*;
-use relay_signal::{Account, Contact, Group, Incoming, Outgoing, SignalBackend};
+use relay_signal::{
+    Account, Contact, Device, Group, Identity, Incoming, Outgoing, SendableFile, SignalBackend,
+};
 use relay_store::MessageStore;
 use serde::{Deserialize, Serialize};
 
@@ -381,16 +383,50 @@ impl SignalBackend for Guarded {
     fn incoming(&self) -> BoxStream<'static, anyhow::Result<Incoming>> {
         self.inner.incoming()
     }
+    // An upload reaches no one until a counted Text carries it.
+    async fn upload(&self, file: &SendableFile) -> anyhow::Result<AttachmentRef> {
+        self.inner.upload(file).await
+    }
+    // NOTE: lookups reach Signal but no person, so they pass unmetered. Signal
+    // rate-limits contact discovery itself and the backend surfaces that; a
+    // lookup budget of our own is a follow-up, not part of this contract.
+    async fn discover(
+        &self,
+        numbers: &[String],
+    ) -> anyhow::Result<Vec<(String, Option<ServiceId>)>> {
+        self.inner.discover(numbers).await
+    }
+    async fn lookup_username(&self, username: &str) -> anyhow::Result<Option<ServiceId>> {
+        self.inner.lookup_username(username).await
+    }
+    async fn avatar(&self, of: Recipient) -> anyhow::Result<Option<Vec<u8>>> {
+        self.inner.avatar(of).await
+    }
+    async fn identities(&self) -> anyhow::Result<Vec<Identity>> {
+        self.inner.identities().await
+    }
+    async fn devices(&self) -> anyhow::Result<Vec<Device>> {
+        self.inner.devices().await
+    }
 }
 
 /// Messages a person sees count; typing indicators and read receipts are
 /// background chatter every Signal client sends freely.
+// Stickers, pins, unpins, poll creates, votes and closes, and admin deletes
+// all show up in the conversation for everyone in it, so they count like text.
 fn counts(message: &Outgoing) -> bool {
     match message {
         Outgoing::Text { .. }
         | Outgoing::Reaction { .. }
         | Outgoing::Edit { .. }
-        | Outgoing::Delete { .. } => true,
+        | Outgoing::Delete { .. }
+        | Outgoing::Sticker { .. }
+        | Outgoing::Pin { .. }
+        | Outgoing::Unpin { .. }
+        | Outgoing::PollCreate { .. }
+        | Outgoing::PollVote { .. }
+        | Outgoing::PollTerminate { .. }
+        | Outgoing::AdminDelete { .. } => true,
         Outgoing::Typing { .. } | Outgoing::ReadReceipt { .. } => false,
     }
 }
@@ -446,6 +482,7 @@ mod tests {
             id: GroupId::parse(GROUP).expect("valid group id"),
             title: "g".into(),
             members: vec![sid(ME), sid(2)],
+            admins: vec![sid(ME)],
         }]));
         let ctx = ToolContext {
             signal: signal.clone(),
