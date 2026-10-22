@@ -5,7 +5,7 @@ use std::sync::Arc;
 use relay_core::prelude::*;
 use serde_json::Value;
 
-use crate::{Tool, ToolContext, ToolError, local, mutate, read, send};
+use crate::{Tool, ToolContext, ToolError, directory, local, mutate, read, send};
 
 /// The set of tools a profile serves.
 #[derive(Clone, Default)]
@@ -33,6 +33,10 @@ impl Registry {
             .with(mutate::EditMessage)
             .with(mutate::DeleteMessage)
             .with(mutate::DeleteGroupMessage)
+            .with(directory::ListContacts)
+            .with(directory::ListGroups)
+            .with(directory::ListAttachments)
+            .with(directory::GetAttachment)
             .with(local::ExportMessages)
             .with(local::MarkAsUnread)
             .with(local::ClearLocalStore)
