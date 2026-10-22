@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 use crate::{
     Tool, ToolContext, ToolError,
-    input::{contact, contact_schema, non_blank, parse},
+    input::{Timestamp, contact, contact_schema, non_blank, parse},
 };
 
 pub struct SendMessage;
@@ -18,6 +18,8 @@ pub struct SendMessage;
 struct SendMessageInput {
     recipient: String,
     message: String,
+    quote_author: Option<String>,
+    quote_timestamp: Option<Timestamp>,
 }
 
 #[async_trait]
@@ -28,7 +30,8 @@ impl Tool for SendMessage {
     fn description(&self) -> &'static str {
         "Send a text message to one Signal contact. Use send_group_message for groups and \
          send_note_to_self for your own Note to Self. recipient is the contact's phone number \
-         or service id; message is the text. Not idempotent: repeating sends a duplicate. The \
+         or service id; message is the text. To reply, quote_author and quote_timestamp \
+         name the quoted message (its id's author and sent_at_ms). Not idempotent: repeating sends a duplicate. The \
          sent message is saved to the local store. Returns the new message's id, which \
          replies, reactions, edits and deletes reference."
     }
@@ -38,6 +41,8 @@ impl Tool for SendMessage {
             "properties": {
                 "recipient": contact_schema("Who to send to"),
                 "message": {"type": "string", "minLength": 1, "description": "Message text to send"},
+                "quote_author": contact_schema("Author of the message being replied to"),
+                "quote_timestamp": Timestamp::schema("Send time of the message being replied to"),
             },
             "required": ["recipient", "message"],
             "additionalProperties": false,
@@ -50,7 +55,27 @@ impl Tool for SendMessage {
         let input: SendMessageInput = parse(input)?;
         let to = Recipient::Contact(contact(ctx, &input.recipient).await?);
         let body = non_blank("message", input.message)?;
-        send_text(ctx, to, body).await
+        let quote = quote(ctx, input.quote_author, input.quote_timestamp).await?;
+        send_text(ctx, to, body, quote).await
+    }
+}
+
+/// The quoted message named by an author and send time, which must come
+/// together or not at all.
+async fn quote(
+    ctx: &ToolContext,
+    author: Option<String>,
+    timestamp: Option<Timestamp>,
+) -> Result<Option<MessageId>, ToolError> {
+    match (author, timestamp) {
+        (None, None) => Ok(None),
+        (Some(author), Some(timestamp)) => Ok(Some(MessageId {
+            author: contact(ctx, &author).await?,
+            sent_at_ms: timestamp.ms(),
+        })),
+        _ => Err(ToolError::InvalidInput(
+            "quote_author and quote_timestamp go together; give both or neither".into(),
+        )),
     }
 }
 
@@ -58,14 +83,19 @@ impl Tool for SendMessage {
 /// account's own message.
 // NOTE: Signal doesn't echo a device's own sends back to it, so a send that
 // skips the store never shows up in get_conversation or search_messages.
-async fn send_text(ctx: &ToolContext, to: Recipient, body: String) -> Result<Value, ToolError> {
+async fn send_text(
+    ctx: &ToolContext,
+    to: Recipient,
+    body: String,
+    quote: Option<MessageId>,
+) -> Result<Value, ToolError> {
     let id = ctx
         .signal
         .send(
             to,
             Outgoing::Text {
                 body: body.clone(),
-                quote: None,
+                quote,
             },
         )
         .await?;
@@ -78,7 +108,7 @@ async fn send_text(ctx: &ToolContext, to: Recipient, body: String) -> Result<Val
             received_at_ms: id.sent_at_ms,
             body: Some(body),
             attachments: vec![],
-            quote: None,
+            quote,
             edited: false,
             deleted: false,
         })
@@ -92,7 +122,7 @@ mod tests {
     use relay_signal::Outgoing;
     use serde_json::json;
 
-    use crate::{Registry, testing::*};
+    use crate::{Registry, ToolError, testing::*};
 
     /// A send must reach Signal as plain text to that one contact, return the
     /// id clients quote, edit or delete it by, and land in the local history,
@@ -121,5 +151,61 @@ mod tests {
         assert_eq!(stored[0].id, id);
         assert!(stored[0].from_me, "{stored:?}");
         assert_eq!(stored[0].body.as_deref(), Some("hi"));
+    }
+
+    /// A reply must carry the quoted message's id to Signal and keep it in
+    /// the stored copy, or the thread breaks on both ends.
+    #[tokio::test]
+    async fn send_message_quotes_the_message_named_by_author_and_timestamp() {
+        let (ctx, signal) = ctx(AccessMode::Full, ProfileKind::Linked);
+        Registry::standard()
+            .call(
+                &ctx,
+                "send_message",
+                json!({
+                    "recipient": sid(2).to_string(),
+                    "message": "agreed",
+                    "quote_author": sid(2).to_string(),
+                    "quote_timestamp": 1234,
+                }),
+            )
+            .await
+            .unwrap();
+        let quoted = MessageId {
+            author: sid(2),
+            sent_at_ms: 1234,
+        };
+        let to = Recipient::Contact(sid(2));
+        let text = Outgoing::Text {
+            body: "agreed".into(),
+            quote: Some(quoted),
+        };
+        assert_eq!(signal.sent(), [(to, text)]);
+        let stored = ctx.store.history(to, None, 10).await.unwrap();
+        assert_eq!(stored[0].quote, Some(quoted), "{stored:?}");
+    }
+
+    /// Half a quote can't name a message; sending it as a plain message would
+    /// silently drop the reply the caller asked for.
+    #[tokio::test]
+    async fn send_message_refuses_half_a_quote_without_sending() {
+        let (ctx, signal) = ctx(AccessMode::Full, ProfileKind::Linked);
+        let registry = Registry::standard();
+        for half in [
+            json!({"quote_author": sid(2).to_string()}),
+            json!({"quote_timestamp": 1234}),
+        ] {
+            let mut input = json!({"recipient": sid(2).to_string(), "message": "hi"});
+            input
+                .as_object_mut()
+                .unwrap()
+                .extend(half.as_object().unwrap().clone());
+            let result = registry.call(&ctx, "send_message", input.clone()).await;
+            assert!(
+                matches!(result, Err(ToolError::InvalidInput(_))),
+                "{input} gave {result:?}"
+            );
+        }
+        assert!(signal.sent().is_empty(), "{:?}", signal.sent());
     }
 }
