@@ -411,6 +411,7 @@ jobs:
           pattern: dist-*
           path: dist
           merge-multiple: true
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends minisign
       - name: Updater signatures, latest.json and SHA256SUMS
         if: github.event_name == 'push'
         env:
@@ -422,6 +423,7 @@ jobs:
         run: |
           $TAURI_CLI signer generate --ci --password "" --write-keys "$RUNNER_TEMP/throwaway.key"
           TAURI_SIGNING_PRIVATE_KEY_PATH="$RUNNER_TEMP/throwaway.key" TAURI_SIGNING_PRIVATE_KEY_PASSWORD="" \
+            UPDATER_PUBKEY="$(cat "$RUNNER_TEMP/throwaway.key.pub")" \
             scripts/release-manifest.sh dist "$VERSION" "$BASE_URL"
       - uses: actions/upload-artifact@v4
         with:

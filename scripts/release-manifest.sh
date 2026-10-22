@@ -7,8 +7,12 @@
 # updater would reject the download.
 #
 # Usage: release-manifest.sh <dist dir> <version> <download base url>
-# Expects TAURI_CLI (the tauri command) and an updater key in TAURI_SIGNING_*.
+# Expects TAURI_CLI (the tauri command), an updater key in TAURI_SIGNING_*, and
+# minisign. UPDATER_PUBKEY overrides the public key the app ships with, for a
+# dry run signed with a throwaway key.
 set -euo pipefail
+
+pubkey=${UPDATER_PUBKEY:-$(jq -r .plugins.updater.pubkey "$(dirname "$0")/../app/src-tauri/tauri.conf.json")}
 
 dist=$1
 version=$2
@@ -19,9 +23,18 @@ mac="signal-agent-$version-macos-universal.app.tar.gz"
 win_x64="signal-agent-$version-windows-x64-setup.exe"
 win_arm64="signal-agent-$version-windows-arm64-setup.exe"
 
+# NOTE: the installed app accepts an update only if its signature checks out
+# against the pubkey in tauri.conf.json. Verifying with that same key here
+# turns a key mismatch into a failed release instead of an update nobody can
+# install.
+base64 -d <<<"$pubkey" >updater.pub
 for payload in "$mac" "$win_x64" "$win_arm64"; do
   $TAURI_CLI signer sign --app-version "$version" "$payload" >/dev/null
+  base64 -d <"$payload.sig" >"$payload.minisig"
+  minisign -Vq -p updater.pub -m "$payload" -x "$payload.minisig"
+  rm "$payload.minisig"
 done
+rm updater.pub
 
 # The universal app serves both Mac architectures.
 jq -n \

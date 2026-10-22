@@ -55,11 +55,27 @@ What you hand over from Microsoft:
 
 Two constraints the pipeline is built around. The signing action runs only on Windows x64 runners and doesn't support Windows ARM runners, so the ARM64 build is compiled on an ARM runner and signed on an x64 runner. And a brand-new publisher can still see a SmartScreen warning until Microsoft has seen enough clean installs, which is acceptable under PRD acceptance criterion 3.
 
+## Tauri updater key
+
+The in-app updater installs a release only if its payload carries a signature from this key, on top of the Apple and Microsoft signatures (PRD goal 10). The private half signs releases in CI; the public half ships inside the app. GitHub secrets can't be read back, so keep a copy of the private key in the usual secret store too: if it's lost, every installed copy can only be updated by downloading a new installer by hand.
+
+1. **Generate the key pair** on your Mac, with a strong password when asked:
+   `npx --yes @tauri-apps/cli@2.12.4 signer generate -w ~/.tauri/signal-agent-updater.key`
+   (or `cargo tauri signer generate -w ...` if you have the Tauri CLI). It writes the private key to that path and the public key beside it as `signal-agent-updater.key.pub`.
+2. **Commit the public key.** Replace the `UNSET: ...` value of `plugins.updater.pubkey` in `app/src-tauri/tauri.conf.json` with the single line in `signal-agent-updater.key.pub`. Until that lands, the release preflight refuses to run, because a release signed with a key the app doesn't trust can never be installed as an update.
+3. **Hand over the private half** as the two secrets below, then move the key file into the secret store and delete it from `~/.tauri`.
+
+| Secret | What it is |
+|---|---|
+| `TAURI_SIGNING_PRIVATE_KEY` | The contents of `signal-agent-updater.key` |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | The password from step 1 |
+
+Every release then signs the macOS `.app.tar.gz` and both Windows installers with it, checks each signature against the committed public key with `minisign`, and writes `latest.json`, the feed the app reads. A mismatch fails the release before anything is attached.
+
 ## Done for you
 
 You don't need to do these; the agent handles them once the values above exist:
 
-- The Tauri updater signing key pair, made with `cargo tauri signer generate`, stored as `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. The public half is committed in the app config.
 - `KEYCHAIN_PASSWORD`, a random value for the temporary keychain CI creates on the macOS runner.
 - The `release` GitHub environment, limited to `v*` tags, holding all of the above as environment secrets, so ordinary pushes and pull requests never see them.
 
