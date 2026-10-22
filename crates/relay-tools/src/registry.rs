@@ -51,6 +51,7 @@ impl Registry {
             .with(lookup::GetAvatar)
             .with(media::SendAttachment)
             .with(media::SendGroupAttachment)
+            .with(media::SendSticker)
     }
 
     /// Applies account-safety limits to every send a tool makes.
@@ -224,6 +225,7 @@ mod tests {
         match prop["format"].as_str() {
             Some("signal-recipient" | "signal-service-id") => json!(sid(2).to_string()),
             Some("signal-group-id") => json!("ab".repeat(32)),
+            Some("signal-sticker-pack") => json!("ab".repeat(16)),
             Some("iso-datetime") => json!("2024-01-01T00:00:00Z"),
             Some(other) => panic!("{name}: no sample for format \"{other}\"; add one here"),
             None => match prop["type"].as_str() {
@@ -274,6 +276,12 @@ mod tests {
                         bad.extend(malformed_ids);
                         bad.push(json!(sid(2).to_string()));
                     }
+                    Some("signal-sticker-pack") => bad.extend([
+                        json!("g".repeat(32)),
+                        json!("ab".repeat(15)),
+                        json!("ab".repeat(32)),
+                        json!(sid(2).to_string()),
+                    ]),
                     Some("iso-datetime") => bad.extend([
                         json!("yesterday"),
                         json!("2024-13-01"),

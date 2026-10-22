@@ -7,13 +7,16 @@ use std::path::Path;
 use anyhow::bail;
 use async_trait::async_trait;
 use relay_core::prelude::*;
-use relay_signal::SendRoots;
+use relay_signal::{Outgoing, SendRoots};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
     Tool, ToolContext, ToolError,
-    input::{Timestamp, contact, contact_schema, group, group_schema, non_blank, parse},
+    input::{
+        Timestamp, contact, contact_schema, group, group_schema, non_blank, parse, sticker_pack,
+        sticker_pack_schema,
+    },
     send::{quote, send_text},
 };
 
@@ -134,6 +137,91 @@ impl Tool for SendGroupAttachment {
         let attachments = upload(ctx, &paths).await?;
         send_text(ctx, to, caption.unwrap_or_default(), quote, attachments).await
     }
+}
+
+pub struct SendSticker;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SendStickerInput {
+    recipient: String,
+    pack_id: String,
+    sticker_id: u32,
+}
+
+#[async_trait]
+impl Tool for SendSticker {
+    fn name(&self) -> &'static str {
+        "send_sticker"
+    }
+    fn description(&self) -> &'static str {
+        "Send one sticker from a sticker pack installed on this account to one Signal contact; \
+         it shows as a sticker, not a file. Use send_group_sticker for groups and \
+         send_attachment for ordinary images. recipient is the contact's phone number or \
+         service id. pack_id is the pack's id (32 hex characters) and sticker_id the sticker's \
+         number within it; a pack that isn't installed, or a sticker it doesn't hold, is an \
+         error. Not idempotent: repeating sends a duplicate. Saved to the local store as \
+         [sticker pack_id:sticker_id]. Returns the new message's id."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "recipient": contact_schema("Who to send to"),
+                "pack_id": sticker_pack_schema(),
+                "sticker_id": sticker_id_schema(),
+            },
+            "required": ["recipient", "pack_id", "sticker_id"],
+            "additionalProperties": false,
+        })
+    }
+    fn writes(&self) -> bool {
+        true
+    }
+    async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
+        let input: SendStickerInput = parse(input)?;
+        let to = Recipient::Contact(contact(ctx, &input.recipient).await?);
+        let pack = sticker_pack(&input.pack_id)?;
+        send_sticker(ctx, to, pack, input.sticker_id).await
+    }
+}
+
+fn sticker_id_schema() -> Value {
+    json!({
+        "type": "integer",
+        "minimum": 0,
+        "maximum": u32::MAX,
+        "description": "The sticker's number within its pack",
+    })
+}
+
+/// Sends one sticker and records it in the local history, as send_text does
+/// for text.
+async fn send_sticker(
+    ctx: &ToolContext,
+    to: Recipient,
+    pack: StickerPackId,
+    sticker_id: u32,
+) -> Result<Value, ToolError> {
+    let id = ctx
+        .signal
+        .send(to, Outgoing::Sticker { pack, sticker_id })
+        .await?;
+    ctx.store
+        .insert(&Message {
+            id,
+            conversation: to,
+            sender: id.author,
+            from_me: true,
+            received_at_ms: id.sent_at_ms,
+            body: Some(format!("[sticker {pack}:{sticker_id}]")),
+            attachments: vec![],
+            quote: None,
+            edited: false,
+            deleted: false,
+        })
+        .await?;
+    Ok(json!({ "id": id }))
 }
 
 fn caption_schema() -> Value {
@@ -453,5 +541,43 @@ mod tests {
         };
         assert_eq!(*to, Recipient::Contact(sid(ME)));
         assert_eq!(attachments.len(), 1, "{attachments:?}");
+    }
+
+    /// A sticker from an installed pack goes out as a sticker, not a file.
+    #[tokio::test]
+    async fn send_sticker_sends_an_installed_sticker_to_one_contact() {
+        let pack = StickerPackId::new([0xab; 16]);
+        let signal = Arc::new(
+            FakeSignal::new(Account {
+                service_id: sid(ME),
+                phone_number: Some("+15550000001".into()),
+                kind: ProfileKind::Primary,
+                device_name: "test".into(),
+            })
+            .with_sticker_pack(pack, vec![0, 5]),
+        );
+        let (ctx, _) = ctx_with_roots(&[]);
+        let ctx = ToolContext {
+            signal: signal.clone(),
+            ..ctx
+        };
+        Registry::standard()
+            .call(
+                &ctx,
+                "send_sticker",
+                json!({"recipient": sid(2).to_string(), "pack_id": pack.to_string(), "sticker_id": 5}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            signal.sent(),
+            [(
+                Recipient::Contact(sid(2)),
+                Outgoing::Sticker {
+                    pack,
+                    sticker_id: 5
+                }
+            )]
+        );
     }
 }

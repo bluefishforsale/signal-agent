@@ -244,6 +244,19 @@ pub fn group(s: &str) -> Result<GroupId, ToolError> {
     GroupId::parse(s).map_err(|e| ToolError::InvalidInput(e.to_string()))
 }
 
+pub fn sticker_pack_schema() -> Value {
+    json!({
+        "type": "string",
+        "format": "signal-sticker-pack",
+        "description": "A sticker pack id (32 hex characters)",
+    })
+}
+
+/// A sticker pack, by id.
+pub fn sticker_pack(s: &str) -> Result<StickerPackId, ToolError> {
+    StickerPackId::parse(s).map_err(|e| ToolError::InvalidInput(e.to_string()))
+}
+
 /// Text that must say something: refused when empty or only whitespace.
 pub fn non_blank(field: &str, s: String) -> Result<String, ToolError> {
     if s.trim().is_empty() {
