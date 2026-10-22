@@ -1,6 +1,6 @@
 //! Checks and cleans what the page sends before setup sees it: people paste
-//! links with stray spaces and the browser's scheme attached, and the page
-//! must never be able to claim a result only the driver can report.
+//! captcha links and type phone numbers loosely, and the page must never be
+//! able to claim a result only the driver can report.
 
 use relay_setup::prelude::*;
 
@@ -10,7 +10,7 @@ pub fn from_page(event: SetupEvent) -> Option<SetupEvent> {
 
     match event {
         E::CaptchaSolved { token } => Some(E::CaptchaSolved {
-            token: captcha_token(&token)?,
+            token: pasted_captcha_token(&token)?,
         }),
         E::NumberEntered { number } => Some(E::NumberEntered {
             number: number
@@ -35,44 +35,46 @@ pub fn from_page(event: SetupEvent) -> Option<SetupEvent> {
     }
 }
 
-/// The captcha token inside a pasted `signalcaptcha://` link, or `None` when
-/// nothing usable was pasted.
-pub fn captcha_token(pasted: &str) -> Option<String> {
-    let pasted = pasted.trim();
-    let token = pasted
-        .strip_prefix("signalcaptcha://")
-        .unwrap_or(pasted)
-        .trim();
-    (!token.is_empty()).then(|| token.to_owned())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Signal wants the bare token, but the browser hands over the whole
-    /// `signalcaptcha://` link, often with whitespace from the copy.
-    #[test]
-    fn a_pasted_captcha_link_yields_the_bare_token() {
-        let token = "signal-hcaptcha.5fad97ac.registration.P1_eyJ0";
-        for pasted in [
-            format!("signalcaptcha://{token}"),
-            format!("  signalcaptcha://{token}\n"),
-            token.to_owned(),
-        ] {
-            assert_eq!(
-                captcha_token(&pasted).as_deref(),
-                Some(token),
-                "from {pasted:?}"
-            );
+    fn pasted(text: &str) -> Option<String> {
+        match from_page(SetupEvent::CaptchaSolved { token: text.into() })? {
+            SetupEvent::CaptchaSolved { token } => Some(token),
+            other => panic!("captcha paste became {other:?}"),
         }
     }
 
-    /// An empty paste must not be sent as a solved captcha.
+    /// Signal wants the bare token, but people paste either the whole
+    /// `signalcaptcha://` link or the token copied out of it, often with
+    /// whitespace from the copy.
     #[test]
-    fn an_empty_paste_is_no_captcha() {
-        for pasted in ["", "   ", "signalcaptcha://", " signalcaptcha:// "] {
-            assert_eq!(captcha_token(pasted), None, "from {pasted:?}");
+    fn a_pasted_captcha_link_or_bare_token_yields_the_bare_token() {
+        let token = "signal-hcaptcha.5fad97ac.registration.P1_eyJ0";
+        for text in [
+            format!("signalcaptcha://{token}"),
+            format!("  signalcaptcha://{token}\n"),
+            token.to_owned(),
+            format!(" {token} "),
+        ] {
+            assert_eq!(pasted(&text).as_deref(), Some(token), "from {text:?}");
+        }
+    }
+
+    /// Every malformed token sent to Signal spends a registration attempt, so
+    /// an empty, line-wrapped or quoted paste must stop at the window.
+    #[test]
+    fn a_malformed_captcha_paste_never_reaches_signal() {
+        for text in [
+            "",
+            "   ",
+            "signalcaptcha://",
+            "signal-hcaptcha.5fad97ac\n.registration",
+            "\"signal-hcaptcha.5fad97ac\"",
+            "hello",
+        ] {
+            assert_eq!(pasted(text), None, "accepted {text:?}");
         }
     }
 
@@ -154,7 +156,7 @@ mod tests {
             ),
             (
                 r#"event: "captcha_solved", token: "#,
-                r#"{"event":"captcha_solved","token":"t"}"#,
+                r#"{"event":"captcha_solved","token":"signal-hcaptcha.x"}"#,
             ),
             (
                 r#"event: "code_entered", code: "#,
