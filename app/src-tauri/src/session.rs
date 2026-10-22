@@ -1,147 +1,139 @@
-//! The window's one live setup state. Clicks from the page and results from the
-//! driver both land here, so they go through relay-setup in a single order.
+//! The window's one setup driver, run as a single task. Clicks queue on a
+//! channel and the driver works through them in order, so a long step such as
+//! waiting for the phone to scan never blocks the window.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    future::Future,
+    sync::{Arc, Mutex},
+};
 
+use async_trait::async_trait;
 use relay_setup::prelude::*;
+use tokio::sync::mpsc;
 
 use crate::view::{View, view};
 
-/// Feeds results back into setup.
-pub type Events = Arc<dyn Fn(SetupEvent) + Send + Sync>;
+/// Called with each state setup enters.
+pub type Show<'a> = &'a mut (dyn FnMut(&SetupState) + Send);
 
-/// Carries out setup's side effects.
-pub trait Driver: Send + Sync {
-    /// Runs `commands` in order without blocking the caller, reporting each
-    /// result through `events`.
-    fn run(&self, commands: Vec<Command>, events: Events);
+/// Carries setup forward: relay-setup's driver, or a stand-in.
+#[async_trait]
+pub trait Setup: Send {
+    /// Applies `event` and runs what follows, showing each state entered,
+    /// until setup waits on the user again.
+    async fn dispatch(&mut self, event: SetupEvent, show: Show<'_>);
+
+    fn state(&self) -> &SetupState;
 }
 
-/// Setup in progress, redrawn through `on_change` after every event.
+/// Setup in progress, as the window's commands see it.
 pub struct Session {
-    state: Mutex<SetupState>,
-    driver: Box<dyn Driver>,
-    on_change: Box<dyn Fn(&View) + Send + Sync>,
+    events: mpsc::UnboundedSender<SetupEvent>,
+    screen: Arc<Mutex<View>>,
 }
 
 impl Session {
+    /// The session, and the task that drives `setup`, which the caller spawns.
+    /// `on_change` redraws the window.
     pub fn new(
-        start: SetupState,
-        driver: Box<dyn Driver>,
-        on_change: Box<dyn Fn(&View) + Send + Sync>,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            state: Mutex::new(start),
-            driver,
-            on_change,
-        })
+        mut setup: Box<dyn Setup>,
+        on_change: impl Fn(&View) + Send + 'static,
+    ) -> (Self, impl Future<Output = ()> + Send + 'static) {
+        let (events, mut queued) = mpsc::unbounded_channel();
+        let screen = Arc::new(Mutex::new(view(setup.state())));
+        let shown = Arc::clone(&screen);
+        let run = async move {
+            let mut redraw = move |state: &SetupState| {
+                let view = view(state);
+                on_change(&view);
+                *shown.lock().expect("screen lock") = view;
+            };
+            while let Some(event) = queued.recv().await {
+                setup.dispatch(event, &mut redraw).await;
+                // NOTE: a driver shows only changed states, but the page keeps
+                // the clicked button disabled until it is redrawn.
+                redraw(setup.state());
+            }
+        };
+        (Self { events, screen }, run)
     }
 
     /// The screen for the current state.
     pub fn view(&self) -> View {
-        view(&self.state.lock().expect("setup state lock"))
+        self.screen.lock().expect("screen lock").clone()
     }
 
-    /// Redraws the current screen, as after input that changed nothing.
-    pub fn redraw(&self) {
-        (self.on_change)(&self.view());
-    }
-
-    /// Applies `event` and starts whatever commands it calls for.
-    pub fn handle(self: &Arc<Self>, event: SetupEvent) {
-        let commands = {
-            let mut state = self.state.lock().expect("setup state lock");
-            let (next, commands) = transition(&state, event);
-            *state = next;
-            // Redrawn under the lock so screens reach the page in state order.
-            (self.on_change)(&view(&state));
-            commands
-        };
-        if commands.is_empty() {
-            return;
+    /// Queues `event` for the driver.
+    pub fn send(&self, event: SetupEvent) {
+        if self.events.send(event).is_err() {
+            eprintln!("setup has stopped; ignoring a click");
         }
-        let session = Arc::clone(self);
-        self.driver
-            .run(commands, Arc::new(move |event| session.handle(event)));
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{sync::mpsc as std_mpsc, time::Duration};
+
     use super::*;
+    use crate::scripted::Scripted;
 
-    type Log = Arc<Mutex<Vec<Vec<Command>>>>;
-
-    struct Recording(Log);
-
-    impl Driver for Recording {
-        fn run(&self, commands: Vec<Command>, _events: Events) {
-            self.0.lock().unwrap().push(commands);
+    fn link_at_once(command: &Command) -> Vec<(Duration, SetupEvent)> {
+        match command {
+            Command::StartLink { .. } => vec![
+                (
+                    Duration::ZERO,
+                    SetupEvent::LinkUri {
+                        uri: "sgnl://x".into(),
+                    },
+                ),
+                (Duration::ZERO, SetupEvent::Linked),
+            ],
+            _ => Vec::new(),
         }
     }
 
-    fn recorded() -> (Arc<Session>, Log) {
-        let log = Log::default();
-        let session = Session::new(
-            SetupState::start("Mac"),
-            Box::new(Recording(log.clone())),
-            Box::new(|_| {}),
-        );
-        (session, log)
+    fn screen_name(view: &View) -> String {
+        serde_json::to_value(view).unwrap()["screen"]
+            .as_str()
+            .unwrap()
+            .to_owned()
     }
 
-    /// A click must move the window to the next screen and hand the driver
-    /// exactly the commands relay-setup asked for.
-    #[test]
-    fn an_event_moves_the_screen_and_hands_its_commands_to_the_driver() {
-        let (session, log) = recorded();
-        session.handle(SetupEvent::AccountChosen {
+    fn started() -> (Session, std_mpsc::Receiver<String>) {
+        let (tx, rx) = std_mpsc::channel();
+        let (session, run) = Session::new(
+            Box::new(Scripted::new(SetupState::start("Mac"), link_at_once)),
+            move |view| tx.send(screen_name(view)).unwrap(),
+        );
+        tokio::spawn(run);
+        (session, rx)
+    }
+
+    fn next(rx: &std_mpsc::Receiver<String>) -> String {
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("no redraw within 5s")
+    }
+
+    /// Every state the driver passes through must reach the window in order,
+    /// or a QR refresh or progress step is lost.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_state_the_driver_enters_is_redrawn_in_order() {
+        let (session, rx) = started();
+        session.send(SetupEvent::AccountChosen {
             choice: AccountChoice::LinkExisting,
         });
-        assert!(
-            matches!(session.view(), View::Linking { qr: None, .. }),
-            "{:?}",
-            session.view()
-        );
-        assert_eq!(
-            *log.lock().unwrap(),
-            vec![vec![Command::StartLink {
-                device_name: "Claude (Mac)".into()
-            }]]
-        );
+        let screens: Vec<_> = (0..3).map(|_| next(&rx)).collect();
+        assert_eq!(screens, ["linking", "linking", "choose_access"]);
+        assert_eq!(screen_name(&session.view()), "choose_access");
     }
 
-    struct Instant;
-
-    impl Driver for Instant {
-        fn run(&self, _commands: Vec<Command>, events: Events) {
-            events(SetupEvent::LinkUri {
-                uri: "sgnl://x".into(),
-            });
-            events(SetupEvent::Linked);
-        }
-    }
-
-    /// A driver may answer before `run` returns; that must neither deadlock
-    /// on the state lock nor redraw screens out of order.
-    #[test]
-    fn a_driver_answering_inside_run_neither_deadlocks_nor_reorders_screens() {
-        let screens = Arc::new(Mutex::new(Vec::new()));
-        let seen = screens.clone();
-        let session = Session::new(
-            SetupState::start("Mac"),
-            Box::new(Instant),
-            Box::new(move |view| {
-                let name = serde_json::to_value(view).unwrap()["screen"].clone();
-                seen.lock().unwrap().push(name.as_str().unwrap().to_owned());
-            }),
-        );
-        session.handle(SetupEvent::AccountChosen {
-            choice: AccountChoice::LinkExisting,
-        });
-        assert_eq!(
-            *screens.lock().unwrap(),
-            ["linking", "linking", "choose_access"]
-        );
+    /// A click setup ignores changes nothing, but the page still needs a
+    /// redraw to re-enable the button it disabled.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_ignored_click_still_redraws() {
+        let (session, rx) = started();
+        session.send(SetupEvent::Retry);
+        assert_eq!(next(&rx), "choose_account");
     }
 }

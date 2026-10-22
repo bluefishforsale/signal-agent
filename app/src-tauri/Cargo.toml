@@ -13,6 +13,7 @@ mock-driver = []
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 dirs.workspace = true
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
 relay-core.workspace = true
@@ -20,3 +21,4 @@ relay-setup.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tauri = { version = "2.12.5", features = [] }
+tokio.workspace = true

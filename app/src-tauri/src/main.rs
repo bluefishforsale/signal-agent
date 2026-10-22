@@ -8,13 +8,15 @@ mod input;
 mod mock;
 #[cfg(target_os = "macos")]
 mod placement;
+mod scripted;
 mod session;
 mod view;
 
-use std::sync::Arc;
+use std::time::Duration;
 
 use relay_setup::prelude::*;
-use session::{Driver, Events, Session};
+use scripted::Scripted;
+use session::{Session, Setup};
 use tauri::{AppHandle, Emitter, Manager, State};
 use view::View;
 
@@ -32,28 +34,25 @@ mod placement {
     }
 }
 
-/// Who carries out setup's commands. Swap this for relay-setup's driver.
-#[cfg(not(feature = "mock-driver"))]
-fn driver() -> Box<dyn Driver> {
-    Box::new(NotReady)
+/// Who carries setup forward. Swap this for relay-setup's driver.
+fn setup() -> Box<dyn Setup> {
+    #[cfg(feature = "mock-driver")]
+    let script = mock::script;
+    #[cfg(not(feature = "mock-driver"))]
+    let script = not_ready;
+    Box::new(Scripted::new(start_state(), script))
 }
 
-#[cfg(feature = "mock-driver")]
-fn driver() -> Box<dyn Driver> {
-    Box::new(mock::Mock)
-}
-
-/// Stands in until relay-setup's driver lands, failing each step plainly
-/// instead of pretending setup worked.
+/// Stands in until relay-setup's driver is wired in, failing each step
+/// plainly instead of pretending setup worked.
 #[cfg_attr(feature = "mock-driver", allow(dead_code))]
-struct NotReady;
-
-impl Driver for NotReady {
-    fn run(&self, _commands: Vec<Command>, events: Events) {
-        events(SetupEvent::CommandFailed {
+fn not_ready(_command: &Command) -> Vec<(Duration, SetupEvent)> {
+    vec![(
+        Duration::ZERO,
+        SetupEvent::CommandFailed {
             message: "This test build can't finish setup yet.".into(),
-        });
-    }
+        },
+    )]
 }
 
 fn start_state() -> SetupState {
@@ -86,17 +85,20 @@ fn computer_name() -> String {
 }
 
 #[tauri::command]
-fn current(session: State<'_, Arc<Session>>) -> View {
+fn current(session: State<'_, Session>) -> View {
     session.view()
 }
 
 #[tauri::command]
-fn send(event: SetupEvent, session: State<'_, Arc<Session>>) {
+fn send(event: SetupEvent, session: State<'_, Session>, app: AppHandle) {
     let Some(event) = input::from_page(event) else {
-        session.redraw();
+        // Unchanged, but the page waits on a redraw to re-enable its button.
+        if let Err(e) = app.emit("setup", session.view()) {
+            eprintln!("unable to redraw the setup window: {e}");
+        }
         return;
     };
-    session.handle(event);
+    session.send(event);
 }
 
 #[tauri::command]
@@ -123,7 +125,9 @@ fn main() {
                     eprintln!("unable to redraw the setup window: {e}");
                 }
             };
-            app.manage(Session::new(start_state(), driver(), Box::new(redraw)));
+            let (session, run) = Session::new(setup(), redraw);
+            app.manage(session);
+            tauri::async_runtime::spawn(run);
             // Screenshot mode for development builds: a fixed theme, kept on top.
             #[cfg(feature = "mock-driver")]
             if let (Ok(theme), Some(window)) = (
