@@ -1045,9 +1045,39 @@ mod tests {
     const KEY: [u8; 32] = [7; 32];
     const ME: &str = "00000000-0000-0000-0000-00000000003e";
 
+    /// Every test that builds the staging fixture must run behind a proxy that
+    /// goes nowhere, so a send that slips past a local guard fails instead of
+    /// dialing Signal. Running these tests without it is the bug.
+    #[test]
+    fn tests_run_behind_a_proxy_that_goes_nowhere() {
+        assert_network_is_dead();
+    }
+
+    fn assert_network_is_dead() {
+        for var in ["HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"] {
+            assert_eq!(
+                std::env::var(var).as_deref(),
+                Ok("http://127.0.0.1:9"),
+                "{var} must point at the dead proxy; run tests with \
+                 HTTPS_PROXY=HTTP_PROXY=ALL_PROXY=http://127.0.0.1:9"
+            );
+        }
+        let no_proxy = std::env::var("NO_PROXY").unwrap_or_default();
+        assert!(
+            !no_proxy.contains("signal") && !no_proxy.contains('*'),
+            "NO_PROXY exempts Signal from the dead proxy: {no_proxy}"
+        );
+    }
+
     /// Writes a linked account's registration into a fresh store at `path`, as
     /// linking would, without touching Signal's servers.
+    // NOTE: presage's SignalServers offers only Staging and Production, so this
+    // account points at Signal's staging servers and nothing here can make
+    // that address unroutable. The dead proxy is the barrier: anything that
+    // gets past a local guard dials staging unless it is set, which is why
+    // building the fixture checks for it.
     async fn register_linked(path: &Path) {
+        assert_network_is_dead();
         let phone_number: presage::libsignal_service::prelude::phonenumber::PhoneNumber =
             "+15550000001".parse().expect("valid number");
         // presage's profile key deserializer borrows, so this goes through text.
