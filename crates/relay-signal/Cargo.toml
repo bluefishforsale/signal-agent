@@ -16,6 +16,7 @@ relay-core.workspace = true
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 tokio.workspace = true
@@ -60,5 +61,4 @@ chrono = "0.4.45"
 getrandom.workspace = true
 http = "1.5.0"
 proptest.workspace = true
-serde_json.workspace = true
 tempfile = "3.27.0"

@@ -17,10 +17,56 @@ use serde::Deserialize;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use url::Url;
 
-use presage::libsignal_service::configuration::{Endpoint, ServiceConfiguration, SignalServers};
+use presage::{
+    libsignal_service::configuration::{Endpoint, ServiceConfiguration, SignalServers},
+    manager::RegistrationData,
+};
 use relay_core::LinkAndSyncKey;
 
 use crate::{HistoryTransfer, RateLimited};
+
+/// The history the phone offered while linking, waiting to be fetched.
+pub(crate) struct PendingTransfer {
+    key: LinkAndSyncKey,
+    source: ArchiveSource,
+}
+
+impl PendingTransfer {
+    /// The transfer a just-linked device's `registration` was offered, if any.
+    // NOTE: the key only exists in this process right after linking; presage
+    // never stores it, so this must run before the linking manager is dropped.
+    pub(crate) fn after_link(registration: &RegistrationData) -> Option<anyhow::Result<Self>> {
+        let key = LinkAndSyncKey::new(registration.ephemeral_backup_key()?);
+        let source = login(registration)
+            .and_then(|login| ArchiveSource::signal(registration.signal_servers, login));
+        Some(source.map(|source| Self { key, source }))
+    }
+
+    /// Waits for the phone's history and downloads it into `dir`.
+    pub(crate) async fn fetch(self, dir: &Path) -> anyhow::Result<HistoryTransfer> {
+        self.source.fetch(self.key, dir).await
+    }
+}
+
+/// The basic-auth login of the device `registration` describes.
+// NOTE: presage keeps the password crate-private, so it comes from the
+// serialized form presage's own store writes. If presage renames the field,
+// the_device_logs_in_as_its_aci_and_device_id_with_presages_password fails.
+fn login(registration: &RegistrationData) -> anyhow::Result<(String, String)> {
+    let device_id = registration
+        .device_id
+        .context("the linked device has no device id")?;
+    let serialized =
+        serde_json::to_value(registration).context("unable to read the device's login")?;
+    let password = serialized
+        .get("password")
+        .and_then(|password| password.as_str())
+        .context("the device's registration has no password")?;
+    Ok((
+        format!("{}.{device_id}", registration.service_ids.aci),
+        password.to_owned(),
+    ))
+}
 
 /// Where the phone said its archive went, or why it sent none.
 #[derive(Debug, PartialEq, Eq)]
@@ -616,6 +662,36 @@ mod tests {
         assert_eq!(
             source.cdn_url(3, "a/b").expect("cdn").as_str(),
             "https://cdn3.signal.org/attachments/a%2Fb"
+        );
+    }
+
+    /// presage keeps the device's password to itself, so it's read from the
+    /// registration's serialized form; if presage ever renames it, this must
+    /// fail here, not as a 401 on the user's first link.
+    #[test]
+    fn the_device_logs_in_as_its_aci_and_device_id_with_presages_password() {
+        let phone_number: presage::libsignal_service::prelude::phonenumber::PhoneNumber =
+            "+15550000001".parse().expect("valid number");
+        // presage's profile key deserializer borrows, so this goes through text.
+        let json = serde_json::json!({
+            "signal_servers": "Staging",
+            "device_name": "Claude (test)",
+            "phone_number": phone_number,
+            "uuid": "00000000-0000-0000-0000-000000000001",
+            "pni": "00000000-0000-0000-0000-0000000000ff",
+            "password": "hunter2",
+            "device_id": 2,
+            "registration_id": 1,
+            "pni_registration_id": 1,
+            "profile_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        });
+        let data: RegistrationData = serde_json::from_str(&json.to_string()).expect("registration");
+        assert_eq!(
+            login(&data).expect("login"),
+            (
+                "00000000-0000-0000-0000-000000000001.2".to_owned(),
+                "hunter2".to_owned()
+            )
         );
     }
 }
