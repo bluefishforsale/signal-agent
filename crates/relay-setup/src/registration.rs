@@ -1,7 +1,38 @@
 //! Registering the agent's own number: catching the captcha token Signal's
 //! page hands back, so nobody copies a link by hand.
 
+use relay_signal::{Provisioner, RegistrationStep};
 use url::Url;
+
+use crate::{Command, SetupEvent};
+
+/// Performs `command` if it is a registration step, asking `provisioner` once,
+/// and reports what happened as the event to feed back into setup.
+pub async fn run_registration(
+    command: &Command,
+    provisioner: &dyn Provisioner,
+) -> Option<SetupEvent> {
+    // NOTE: exactly one call per command, never a retry loop. Signal's
+    // registration rate limits are its strictest, and a client that retries on
+    // its own looks like abuse; the user retries, and only by acting.
+    let step = match command {
+        Command::RequestCode { number, captcha } => {
+            provisioner
+                .request_code(number, captcha.as_deref(), false)
+                .await
+        }
+        Command::VerifyCode { code } => provisioner.verify_code(code).await,
+        _ => return None,
+    };
+    Some(match step {
+        Ok(RegistrationStep::CaptchaRequired) => SetupEvent::CaptchaRequired,
+        Ok(RegistrationStep::CodeSent) => SetupEvent::CodeSent,
+        Ok(RegistrationStep::Registered { .. }) => SetupEvent::Registered,
+        Err(e) => SetupEvent::CommandFailed {
+            message: format!("{e:#}"),
+        },
+    })
+}
 
 /// Signal's captcha page for registering a number on the production servers.
 pub const CAPTCHA_PAGE: &str = "https://signalcaptchas.org/registration/generate.html";
@@ -48,7 +79,13 @@ pub fn captcha_token(url: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use futures::{StreamExt, stream::BoxStream};
+    use relay_signal::LinkEvent;
+
     use super::*;
+    use crate::{SetupState, transition};
 
     const HCAPTCHA: &str = "signal-hcaptcha.5fad97ac-7d06-4e44-b18a-b950b20148ff.registration.P1_eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJwZCI6MCwiZXhwIjoxNzYxMDAwMDAwfQ.k2Zq-Xw_3bXr9aQ";
     const RECAPTCHA: &str = "signal-recaptcha-v2.6LfBXs0bAAAAAAjkDyyI1Lk5gBAUWfhI_bIyox5W.registration.03AFcWeA5ZqgXb1vKx-Ym_8Lr2Qp0";
@@ -139,5 +176,70 @@ mod tests {
         for url in refused {
             assert!(!captcha_navigation_allowed(url), "allowed {url:?}");
         }
+    }
+
+    /// Stands in for Signal answering every code request with a rate limit.
+    #[derive(Default)]
+    struct RateLimited {
+        requests: AtomicUsize,
+    }
+
+    const RATE_LIMIT: &str = "Rate limit exceeded: 413, retry after 86400 seconds";
+
+    #[async_trait::async_trait]
+    impl Provisioner for RateLimited {
+        fn link(&self, _: String) -> BoxStream<'static, anyhow::Result<LinkEvent>> {
+            futures::stream::empty().boxed()
+        }
+
+        async fn request_code(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: bool,
+        ) -> anyhow::Result<RegistrationStep> {
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!(RATE_LIMIT)
+        }
+
+        async fn verify_code(&self, _: &str) -> anyhow::Result<RegistrationStep> {
+            anyhow::bail!(RATE_LIMIT)
+        }
+    }
+
+    /// Registration is where Signal's anti-abuse limits bite hardest: a
+    /// rate-limited request must reach Signal exactly once, show Signal's own
+    /// words, and wait for the user rather than trying again by itself.
+    #[tokio::test]
+    async fn a_rate_limited_code_request_is_sent_once_and_shown_verbatim() {
+        let signal = RateLimited::default();
+        let state = SetupState::RequestingCode {
+            number: "+15555550123".into(),
+        };
+        let command = Command::RequestCode {
+            number: "+15555550123".into(),
+            captcha: Some(HCAPTCHA.into()),
+        };
+
+        let event = run_registration(&command, &signal)
+            .await
+            .expect("a registration command reports an event");
+        let (failed, commands) = transition(&state, event);
+        let SetupState::Failed { message, .. } = &failed else {
+            panic!("rate limit did not fail setup: {failed:?}");
+        };
+        assert!(
+            message.contains(RATE_LIMIT),
+            "Signal's words lost: {message:?}"
+        );
+        assert!(
+            commands.is_empty(),
+            "failure re-sent something: {commands:?}"
+        );
+
+        let (resumed, commands) = transition(&failed, SetupEvent::Retry);
+        assert_eq!(resumed, SetupState::EnterNumber);
+        assert!(commands.is_empty(), "retry re-sent by itself: {commands:?}");
+        assert_eq!(signal.requests.load(Ordering::SeqCst), 1);
     }
 }

@@ -4692,13 +4692,17 @@ name = "relay-setup"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "dirs",
+ "futures",
  "proptest",
  "relay-core",
  "relay-secrets",
+ "relay-signal",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
  "url",
 ]
 
