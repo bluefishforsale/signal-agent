@@ -28,3 +28,19 @@ FunctionEnd
     Pop $R9
   ${EndIf}
 !macroend
+
+; A running agent locks signal-agent.exe, which an update must replace. End
+; the supervisor's task (its job takes the agents with it) and any agent a
+; Claude client started, then start the task again once the new files are in.
+; On a first install there is nothing to stop or start, and both fail harmlessly.
+!macro NSIS_HOOK_PREINSTALL
+  nsExec::ExecToLog 'schtasks /End /TN signal-agent'
+  Pop $R9
+  nsExec::ExecToLog 'taskkill /F /IM signal-agent.exe'
+  Pop $R9
+!macroend
+
+!macro NSIS_HOOK_POSTINSTALL
+  nsExec::ExecToLog 'schtasks /Run /TN signal-agent'
+  Pop $R9
+!macroend

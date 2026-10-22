@@ -719,7 +719,9 @@ mod tests {
 
     /// Removing the app from Settings > Apps must run this same cleanup,
     /// carry the delete-data choice through, and never run during an update
-    /// or upgrade, which would leave a working profile with no agent.
+    /// or upgrade, which would leave a working profile with no agent. An
+    /// update must stop the agents that lock signal-agent.exe and start them
+    /// again afterwards.
     #[test]
     fn the_windows_uninstaller_runs_this_cleanup_but_never_on_update() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../app/src-tauri");
@@ -739,6 +741,10 @@ mod tests {
             r#"'"$INSTDIR\signal-agent.exe" uninstall --delete-data'"#,
             r#"'"$INSTDIR\signal-agent.exe" uninstall'"#,
             "!define MUI_CUSTOMFUNCTION_GUIINIT SignalAgentMarkInstalling",
+            "!macro NSIS_HOOK_PREINSTALL",
+            "taskkill /F /IM signal-agent.exe",
+            "!macro NSIS_HOOK_POSTINSTALL",
+            "schtasks /Run /TN signal-agent",
         ] {
             assert!(hooks.contains(needle), "hooks lack {needle}");
         }
