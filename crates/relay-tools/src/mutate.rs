@@ -543,4 +543,34 @@ mod tests {
         let stored = ctx.store.history(conversation, None, 10).await.unwrap();
         assert!(stored[0].deleted, "delete not flagged: {stored:?}");
     }
+
+    /// remove=true must go out as a retraction; sent as a plain reaction it
+    /// would re-add the emoji it was meant to take back.
+    #[tokio::test]
+    async fn react_to_message_with_remove_sends_a_retraction() {
+        let (ctx, signal) = ctx(AccessMode::Full, ProfileKind::Linked);
+        let out = Registry::standard()
+            .call(
+                &ctx,
+                "react_to_message",
+                json!({
+                    "recipient": sid(2).to_string(),
+                    "target_author": sid(2).to_string(),
+                    "target_timestamp": 42,
+                    "emoji": "👍",
+                    "remove": true,
+                }),
+            )
+            .await
+            .unwrap();
+        let sent = signal.sent();
+        assert!(
+            matches!(
+                sent.as_slice(),
+                [(_, Outgoing::Reaction { remove: true, .. })]
+            ),
+            "{sent:?}"
+        );
+        assert_eq!(out["status"], json!("reaction removed"), "{out}");
+    }
 }
