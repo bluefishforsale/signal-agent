@@ -177,6 +177,114 @@
       "description": "Permission identifier",
       "oneOf": [
         {
+          "description": "Enables the current command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-current",
+          "markdownDescription": "Enables the current command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the install_update command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-install-update",
+          "markdownDescription": "Enables the install_update command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the move_to_applications command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-move-to-applications",
+          "markdownDescription": "Enables the move_to_applications command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the needs_move command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-needs-move",
+          "markdownDescription": "Enables the needs_move command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the open_captcha command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-open-captcha",
+          "markdownDescription": "Enables the open_captcha command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the quit command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-quit",
+          "markdownDescription": "Enables the quit command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the send command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-send",
+          "markdownDescription": "Enables the send command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the uninstall command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-uninstall",
+          "markdownDescription": "Enables the uninstall command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the update_offer command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-update-offer",
+          "markdownDescription": "Enables the update_offer command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the current command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-current",
+          "markdownDescription": "Denies the current command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the install_update command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-install-update",
+          "markdownDescription": "Denies the install_update command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the move_to_applications command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-move-to-applications",
+          "markdownDescription": "Denies the move_to_applications command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the needs_move command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-needs-move",
+          "markdownDescription": "Denies the needs_move command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the open_captcha command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-open-captcha",
+          "markdownDescription": "Denies the open_captcha command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the quit command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-quit",
+          "markdownDescription": "Denies the quit command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the send command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-send",
+          "markdownDescription": "Denies the send command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the uninstall command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-uninstall",
+          "markdownDescription": "Denies the uninstall command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the update_offer command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-update-offer",
+          "markdownDescription": "Denies the update_offer command without any pre-configured scope."
+        },
+        {
           "description": "Default core plugins set.\n#### This default permission set includes:\n\n- `core:path:default`\n- `core:event:default`\n- `core:window:default`\n- `core:webview:default`\n- `core:app:default`\n- `core:image:default`\n- `core:resources:default`\n- `core:menu:default`\n- `core:tray:default`",
           "type": "string",
           "const": "core:default",
@@ -2215,6 +2323,72 @@
           "type": "string",
           "const": "core:window:deny-unminimize",
           "markdownDescription": "Denies the unminimize command without any pre-configured scope."
+        },
+        {
+          "description": "This permission set configures the types of dialogs\navailable from the dialog plugin.\n\n#### Granted Permissions\n\nAll dialog types are enabled.\n\n\n\n#### This default permission set includes:\n\n- `allow-message`\n- `allow-save`\n- `allow-open`",
+          "type": "string",
+          "const": "dialog:default",
+          "markdownDescription": "This permission set configures the types of dialogs\navailable from the dialog plugin.\n\n#### Granted Permissions\n\nAll dialog types are enabled.\n\n\n\n#### This default permission set includes:\n\n- `allow-message`\n- `allow-save`\n- `allow-open`"
+        },
+        {
+          "description": "Enables the ask command without any pre-configured scope. (**DEPRECATED**: This is now an alias to `allow-message` and will be removed in v3)",
+          "type": "string",
+          "const": "dialog:allow-ask",
+          "markdownDescription": "Enables the ask command without any pre-configured scope. (**DEPRECATED**: This is now an alias to `allow-message` and will be removed in v3)"
+        },
+        {
+          "description": "Enables the confirm command without any pre-configured scope. (**DEPRECATED**: This is now an alias to `allow-message` and will be removed in v3)",
+          "type": "string",
+          "const": "dialog:allow-confirm",
+          "markdownDescription": "Enables the confirm command without any pre-configured scope. (**DEPRECATED**: This is now an alias to `allow-message` and will be removed in v3)"
+        },
+        {
+          "description": "Enables the message command without any pre-configured scope.",
+          "type": "string",
+          "const": "dialog:allow-message",
+          "markdownDescription": "Enables the message command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the open command without any pre-configured scope.",
+          "type": "string",
+          "const": "dialog:allow-open",
+          "markdownDescription": "Enables the open command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the save command without any pre-configured scope.",
+          "type": "string",
+          "const": "dialog:allow-save",
+          "markdownDescription": "Enables the save command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the ask command without any pre-configured scope. (**DEPRECATED**: This is now an alias to `deny-message` and will be removed in v3)",
+          "type": "string",
+          "const": "dialog:deny-ask",
+          "markdownDescription": "Denies the ask command without any pre-configured scope. (**DEPRECATED**: This is now an alias to `deny-message` and will be removed in v3)"
+        },
+        {
+          "description": "Denies the confirm command without any pre-configured scope. (**DEPRECATED**: This is now an alias to `deny-message` and will be removed in v3)",
+          "type": "string",
+          "const": "dialog:deny-confirm",
+          "markdownDescription": "Denies the confirm command without any pre-configured scope. (**DEPRECATED**: This is now an alias to `deny-message` and will be removed in v3)"
+        },
+        {
+          "description": "Denies the message command without any pre-configured scope.",
+          "type": "string",
+          "const": "dialog:deny-message",
+          "markdownDescription": "Denies the message command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the open command without any pre-configured scope.",
+          "type": "string",
+          "const": "dialog:deny-open",
+          "markdownDescription": "Denies the open command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the save command without any pre-configured scope.",
+          "type": "string",
+          "const": "dialog:deny-save",
+          "markdownDescription": "Denies the save command without any pre-configured scope."
         },
         {
           "description": "This permission set configures which kind of\nupdater functions are exposed to the frontend.\n\n#### Granted Permissions\n\nThe full workflow from checking for updates to installing them\nis enabled.\n\n\n#### This default permission set includes:\n\n- `allow-check`\n- `allow-download`\n- `allow-install`\n- `allow-download-and-install`",

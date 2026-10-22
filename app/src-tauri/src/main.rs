@@ -21,7 +21,7 @@ use std::time::Duration;
 use relay_setup::prelude::*;
 use scripted::Scripted;
 use session::{Session, Setup};
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State, Webview};
 use view::View;
 
 // Only macOS translocates apps; elsewhere the app is always where it belongs.
@@ -128,15 +128,55 @@ fn update_offer(offered: State<'_, updater::Offered>) -> Option<updater::Offer> 
 }
 
 #[tauri::command]
-async fn install_update(app: AppHandle) -> Result<(), String> {
+async fn install_update(webview: Webview, app: AppHandle) -> Result<(), String> {
+    from_main_window(webview.label())?;
     updater::install(&app).await.map_err(|e| format!("{e:#}"))
 }
 
 #[tauri::command]
-async fn uninstall(delete_data: bool) -> Result<Vec<StepOutcome>, String> {
+async fn uninstall(
+    webview: Webview,
+    app: AppHandle,
+    delete_data: bool,
+) -> Result<Vec<StepOutcome>, String> {
+    from_main_window(webview.label())?;
+    // NOTE: the page's checkbox alone must not be able to delete messages;
+    // a native dialog the page can't answer asks once more.
+    if delete_data && !confirmed_deleting_data(&app).await {
+        return Err("Nothing was removed: deleting your messages wasn't confirmed".into());
+    }
     run_uninstall(delete_data)
         .await
         .map_err(|e| format!("{e:#}"))
+}
+
+/// Refuses a command that can't be undone unless it came from the local
+/// setup window; capabilities already keep it from the captcha window, and
+/// this holds even if they are loosened by mistake.
+fn from_main_window(label: &str) -> Result<(), String> {
+    if label != "main" {
+        return Err(format!("the \"{label}\" window may not do this"));
+    }
+    Ok(())
+}
+
+async fn confirmed_deleting_data(app: &AppHandle) -> bool {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .message(
+            "Uninstall will delete your Signal messages, account data and the keys that unlock them from this computer. This can't be undone.",
+        )
+        .title("Delete your messages?")
+        .kind(MessageDialogKind::Warning)
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "Delete them".into(),
+            "Keep them".into(),
+        ))
+        .show(move |confirmed| {
+            let _ = tx.send(confirmed);
+        });
+    rx.await.unwrap_or(false)
 }
 
 #[cfg(not(feature = "mock-driver"))]
@@ -188,6 +228,7 @@ fn main() {
     }
     let result = tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_dialog::init())
         .manage(updater::Offered::default())
         .setup(|app| {
             let handle = app.handle().clone();
@@ -236,6 +277,54 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    include!("../app_commands.rs");
+
+    use super::from_main_window;
+
+    /// Uninstall and Install must refuse any window but the setup window,
+    /// above all the captcha window, which shows Signal's remote page.
+    #[test]
+    fn irreversible_commands_refuse_every_window_but_main() {
+        assert_eq!(from_main_window("main"), Ok(()));
+        for other in ["captcha", "", "Main"] {
+            assert!(from_main_window(other).is_err(), "{other:?} allowed");
+        }
+    }
+
+    /// Only the local main window may call app commands, and it may call
+    /// exactly the declared ones; no capability may reach a remote page or
+    /// the captcha window.
+    #[test]
+    fn capabilities_grant_app_commands_to_the_local_main_window_only() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("capabilities");
+        for entry in std::fs::read_dir(&dir).expect("capabilities dir") {
+            let path = entry.expect("entry").path();
+            let cap: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+            assert_eq!(
+                cap["windows"],
+                serde_json::json!(["main"]),
+                "{}",
+                path.display()
+            );
+            assert!(cap.get("webviews").is_none(), "{}", path.display());
+            assert!(
+                cap.get("remote").is_none(),
+                "{} reaches remote pages",
+                path.display()
+            );
+            assert_ne!(cap["local"], serde_json::json!(false), "{}", path.display());
+            let granted: Vec<&str> = cap["permissions"]
+                .as_array()
+                .expect("permissions")
+                .iter()
+                .filter_map(|p| p.as_str()?.strip_prefix("allow-"))
+                .collect();
+            let declared: Vec<String> = APP_COMMANDS.iter().map(|c| c.replace('_', "-")).collect();
+            assert_eq!(granted, declared, "{}", path.display());
+        }
+    }
+
     /// The box that deletes messages and keys must say exactly that, in the
     /// words the acceptance checklist tells the tester to look for.
     #[test]
