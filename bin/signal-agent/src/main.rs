@@ -4,7 +4,7 @@
 
 mod setup_tty;
 
-use anyhow::bail;
+use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use relay_core::prelude::*;
 use tracing_subscriber::EnvFilter;
@@ -34,8 +34,12 @@ enum Cmd {
     Setup,
     /// Check every piece and repair what's missing.
     Doctor,
-    /// Remove this install's agent, Claude entries and keys.
-    Uninstall,
+    /// Remove this install's agent, Claude entries and files from this computer.
+    Uninstall {
+        /// Also delete messages, account data and the keys that unlock them.
+        #[arg(long)]
+        delete_data: bool,
+    },
 }
 
 #[tokio::main]
@@ -67,8 +71,32 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Mcp => relay_mcp::run_stdio(&profile).await,
         Cmd::Setup => setup_tty::run(profile).await,
         Cmd::Doctor => bail!("doctor is not implemented yet (lane L5)"),
-        Cmd::Uninstall => bail!("uninstall is not implemented yet (lane L12)"),
+        Cmd::Uninstall { delete_data } => uninstall(delete_data),
     }
+}
+
+/// Removes every profile's agent, Claude entries and files, reporting each
+/// step; the Windows uninstaller runs this too.
+fn uninstall(delete_data: bool) -> anyhow::Result<()> {
+    let agent = std::env::current_exe().context("unable to locate this executable")?;
+    let outcomes = relay_setup::uninstall(&agent, relay_agent::login::unregister, delete_data)?;
+    let mut failed = 0;
+    for outcome in &outcomes {
+        match &outcome.result {
+            Ok(()) => println!("done    {}", outcome.name),
+            Err(e) => {
+                failed += 1;
+                eprintln!("FAILED  {}: {e}", outcome.name);
+            }
+        }
+    }
+    if failed > 0 {
+        bail!(
+            "{failed} of {} steps failed; fix what they name and run `signal-agent uninstall` again",
+            outcomes.len()
+        );
+    }
+    Ok(())
 }
 
 /// The access mode the user chose in setup.
@@ -126,5 +154,21 @@ mod tests {
             .expect("saved file");
         std::fs::write(file, "full").expect("damage");
         assert_eq!(startup_access(&paths), AccessMode::ReadOnly, "damaged");
+    }
+
+    /// The Windows uninstaller passes the "delete app data" checkbox through
+    /// as this flag; without it nothing of the user's messages may go.
+    #[test]
+    fn uninstall_deletes_data_only_when_asked() {
+        for (args, expected) in [
+            (&["signal-agent", "uninstall"][..], false),
+            (&["signal-agent", "uninstall", "--delete-data"][..], true),
+        ] {
+            let cli = Cli::try_parse_from(args).expect("parse");
+            assert!(
+                matches!(cli.command, Cmd::Uninstall { delete_data } if delete_data == expected),
+                "{args:?}"
+            );
+        }
     }
 }

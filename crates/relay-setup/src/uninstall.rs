@@ -10,7 +10,10 @@ use relay_core::ProfileName;
 use relay_secrets::SecretStore;
 use serde::{Deserialize, Serialize};
 
-use crate::claude::{ClaudeClient, Clients, Platform, Runner, ServerEntry};
+use crate::{
+    Profiles,
+    claude::{ClaudeClient, Clients, Platform, Runner, ServerEntry, SystemRunner},
+};
 
 pub use footprint::{DELETE_DATA_LABEL, Footprint, Leftover, Roots, checklist};
 
@@ -81,6 +84,68 @@ pub struct Machine<'a> {
     pub agent: &'a Path,
     pub remove_login_item: Box<dyn Fn() -> anyhow::Result<()> + 'a>,
     pub stop_agents: Box<dyn Fn() -> anyhow::Result<()> + 'a>,
+}
+
+/// Uninstalls everything this user installed, every profile at once, on this
+/// machine. `agent` is the binary the Claude entries launch and
+/// `remove_login_item` removes the login item that starts it.
+pub fn uninstall(
+    agent: &Path,
+    remove_login_item: impl Fn() -> anyhow::Result<()>,
+    delete_data: bool,
+) -> anyhow::Result<Vec<StepOutcome>> {
+    let platform = Platform::current();
+    let footprint = Footprint::new(platform, Roots::system()?);
+    let profiles = installed_profiles(&footprint)?;
+    let clients = Clients::system();
+    let secrets = relay_secrets::platform_store()?;
+    let me = std::process::id();
+    let machine = Machine {
+        clients: &clients,
+        secrets: secrets.as_ref(),
+        agent,
+        remove_login_item: Box::new(remove_login_item),
+        stop_agents: Box::new(move || stop_agents(&SystemRunner, platform, me)),
+    };
+    Ok(run_steps(removal_steps(
+        &footprint,
+        &profiles,
+        &machine,
+        delete_data,
+    )))
+}
+
+/// Every profile with anything on this machine: those in the registry, the
+/// default, and any folder under the data directory named like a profile,
+/// so a damaged or older registry can't hide one from uninstall.
+pub(crate) fn installed_profiles(footprint: &Footprint) -> anyhow::Result<Vec<ProfileName>> {
+    let data = footprint.data_dir();
+    let mut profiles = Profiles::under(data.clone()).list().unwrap_or_default();
+    let mut add = |profile: ProfileName| {
+        if !profiles.contains(&profile) {
+            profiles.push(profile);
+        }
+    };
+    add(ProfileName::default_profile());
+    let entries = match fs::read_dir(&data) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(profiles),
+        Err(e) => return Err(e).with_context(|| format!("unable to list \"{}\"", data.display())),
+    };
+    for entry in entries {
+        let entry = entry.with_context(|| format!("unable to list \"{}\"", data.display()))?;
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        if let Some(profile) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| ProfileName::new(n).ok())
+        {
+            add(profile);
+        }
+    }
+    Ok(profiles)
 }
 
 /// The steps that remove `footprint`'s leftovers for `profiles`. Messages,
@@ -629,5 +694,24 @@ mod tests {
         ] {
             assert!(call.contains(needle), "{needle} missing from {call}");
         }
+    }
+
+    /// A profile set up by an older version, or one whose registry entry was
+    /// lost, still has a key and Claude entry; uninstall must find it from
+    /// its folder rather than leave them behind.
+    #[test]
+    fn profiles_missing_from_the_registry_are_still_uninstalled() {
+        let mac = Installed::mac();
+        let data = mac.footprint.data_dir();
+        std::fs::remove_file(data.join("profiles.json")).expect("lose registry");
+        let profiles = Profiles::under(data.clone());
+        profiles.create("work").expect("registered profile");
+        std::fs::create_dir_all(data.join("bot")).expect("unregistered profile dir");
+        std::fs::create_dir_all(data.join("Not A Profile")).expect("stray dir");
+        let found = installed_profiles(&mac.footprint).expect("profiles");
+        let names: Vec<&str> = found.iter().map(|p| &**p).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(sorted, ["bot", "personal", "work"], "found {names:?}");
     }
 }

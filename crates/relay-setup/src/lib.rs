@@ -14,7 +14,7 @@ pub use machine::{AccountChoice, ClientOutcome, Command, SetupEvent, SetupState,
 pub use profiles::Profiles;
 pub use uninstall::{
     DELETE_DATA_LABEL, Footprint, Leftover, Machine, Roots, Step, StepOutcome, checklist,
-    removal_steps, run_steps, stop_agents, uninstall_steps,
+    removal_steps, run_steps, stop_agents, uninstall, uninstall_steps,
 };
 
 pub mod prelude {
