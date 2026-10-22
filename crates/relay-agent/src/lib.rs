@@ -24,6 +24,7 @@ use rmcp::ServiceExt;
 use tokio::task::JoinSet;
 
 pub use all_profiles::run_all_profiles;
+pub use mcp::READ_ONLY_CAPABILITY;
 pub use supervisor::{Supervisor, SupervisorAction};
 
 /// What the agent needs to start.
