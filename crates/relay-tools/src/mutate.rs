@@ -183,6 +183,58 @@ impl Tool for EditMessage {
     }
 }
 
+pub struct DeleteMessage;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeleteInput {
+    recipient: String,
+    target_timestamp: Timestamp,
+}
+
+#[async_trait]
+impl Tool for DeleteMessage {
+    fn name(&self) -> &'static str {
+        "delete_message"
+    }
+    fn description(&self) -> &'static str {
+        "Delete a message you sent to a contact for everyone in the chat (Signal 5.0+ \
+         clients). recipient is the contact; target_timestamp names your message, as \
+         get_conversation or a send result returns it. Only your own messages can be deleted. \
+         Irreversible. Sends to Signal, then flags the stored copy deleted."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "recipient": recipient_schema(),
+                "target_timestamp": Timestamp::schema("Your message to delete"),
+            },
+            "required": ["recipient", "target_timestamp"],
+            "additionalProperties": false,
+        })
+    }
+    fn writes(&self) -> bool {
+        true
+    }
+    async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
+        let input: DeleteInput = parse(input)?;
+        let to = recipient(ctx, &input.recipient).await?;
+        // NOTE: as in edit_message, the target is always this account's own message.
+        let me = ctx.signal.account().await?.service_id;
+        let target = MessageId {
+            author: me,
+            sent_at_ms: input.target_timestamp.0,
+        };
+        ctx.signal.send(to, Outgoing::Delete { target }).await?;
+        ctx.store
+            .mark_deleted(target, me)
+            .await
+            .context("Signal accepted the delete, but the stored copy wasn't flagged")?;
+        Ok(json!({ "status": "deleted" }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use relay_signal::Outgoing;
@@ -337,5 +389,29 @@ mod tests {
         let stored = ctx.store.history(left, None, 10).await.unwrap();
         assert_eq!(stored[0].body.as_deref(), Some("teh cat"), "{stored:?}");
         assert!(!stored[0].edited, "refused edit flagged: {stored:?}");
+    }
+
+    /// The delete goes to Signal as this account's own message, and only then
+    /// is the stored copy flagged deleted.
+    #[tokio::test]
+    async fn delete_message_sends_the_delete_then_flags_the_stored_copy() {
+        let (ctx, signal) = ctx(AccessMode::Full, ProfileKind::Linked);
+        let dm = Recipient::Contact(sid(2));
+        ctx.store.insert(&mine(dm, 42, "oops")).await.unwrap();
+        Registry::standard()
+            .call(
+                &ctx,
+                "delete_message",
+                json!({"recipient": sid(2).to_string(), "target_timestamp": 42}),
+            )
+            .await
+            .unwrap();
+        let target = MessageId {
+            author: sid(ME),
+            sent_at_ms: 42,
+        };
+        assert_eq!(signal.sent(), [(dm, Outgoing::Delete { target })]);
+        let stored = ctx.store.history(dm, None, 10).await.unwrap();
+        assert!(stored[0].deleted, "delete not flagged: {stored:?}");
     }
 }
