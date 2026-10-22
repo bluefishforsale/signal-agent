@@ -248,6 +248,17 @@ impl MessageStore for SqlCipherStore {
         Ok(())
     }
 
+    async fn get(&self, id: MessageId) -> anyhow::Result<Option<Message>> {
+        let row: Option<MessageRow> = sqlx::query_as(select_messages!(
+            "FROM messages m WHERE m.author = ? AND m.sent_at_ms = ?"
+        ))
+        .bind(id.author.to_string())
+        .bind(to_i64(id.sent_at_ms)?)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(Message::try_from).transpose()
+    }
+
     async fn conversations(&self) -> anyhow::Result<Vec<Conversation>> {
         let rows: Vec<(String, Option<String>, i64, i64)> = sqlx::query_as(
             "SELECT m.conversation, t.title, max(m.sent_at_ms), \
@@ -516,8 +527,9 @@ mod tests {
         store.close().await.expect("close");
     }
 
-    /// History and unread run on every read tool call, so they must use an
-    /// index rather than scan every message the profile ever received.
+    /// History, unread and get-by-id run on every tool call that touches
+    /// messages, so they must use an index rather than scan every message the
+    /// profile ever received.
     #[tokio::test]
     async fn history_and_unread_use_indices() {
         let (store, _dir) = open_temp().await;
@@ -526,6 +538,7 @@ mod tests {
              WHERE conversation = 'x' AND sent_at_ms < 5 ORDER BY sent_at_ms DESC",
             "EXPLAIN QUERY PLAN SELECT * FROM messages \
              WHERE from_me = 0 AND read = 0 ORDER BY sent_at_ms",
+            "EXPLAIN QUERY PLAN SELECT * FROM messages WHERE author = 'a' AND sent_at_ms = 1",
         ] {
             let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(sql)
                 .fetch_all(&store.pool)

@@ -469,3 +469,21 @@ async fn export_filters_by_conversation_and_start_oldest_first() {
     }
     stores.close().await;
 }
+
+/// get must find exactly the stored message by id and nothing for an
+/// unknown id, since tools rely on it to check a target's conversation.
+#[tokio::test]
+async fn get_returns_the_stored_message_or_none() {
+    let group = Recipient::Group(GroupId::new([3; 32]));
+    let m = msg(7, 70, group, "hi");
+    let missing = msg(8, 70, group, "").id;
+    let stores = Stores::open().await;
+    for (name, store) in stores.each() {
+        store.insert(&m).await.expect("insert");
+        let got = store.get(m.id).await.expect("get");
+        assert_eq!(got, Some(m.clone()), "{name}");
+        let none = store.get(missing).await.expect("get");
+        assert_eq!(none, None, "{name}: found a message never stored");
+    }
+    stores.close().await;
+}

@@ -82,6 +82,10 @@ impl MessageStore for MemoryStore {
         Ok(())
     }
 
+    async fn get(&self, id: MessageId) -> anyhow::Result<Option<Message>> {
+        Ok(self.inner().messages.iter().find(|m| m.id == id).cloned())
+    }
+
     async fn conversations(&self) -> anyhow::Result<Vec<Conversation>> {
         let inner = self.inner();
         let mut by_recipient: HashMap<Recipient, Conversation> = HashMap::new();
