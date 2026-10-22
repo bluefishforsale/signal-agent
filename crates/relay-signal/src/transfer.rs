@@ -3,14 +3,18 @@
 //! (docs/link-and-sync.md), so this does, over its own HTTP client.
 
 use std::{
+    io::SeekFrom,
     path::Path,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, anyhow, bail};
-use reqwest::{StatusCode, header::RETRY_AFTER};
+use reqwest::{
+    StatusCode,
+    header::{RANGE, RETRY_AFTER},
+};
 use serde::Deserialize;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use url::Url;
 
 use crate::RateLimited;
@@ -46,6 +50,10 @@ struct Patience {
     /// The least time between the starts of two polls, whatever the server
     /// does with `per_poll`.
     min_gap: Duration,
+    /// How many times to try the download when the connection breaks.
+    download_attempts: u32,
+    /// How long to wait before resuming a broken download.
+    retry_delay: Duration,
 }
 
 #[derive(Deserialize)]
@@ -108,33 +116,69 @@ impl ArchiveSource {
         Ok(url)
     }
 
-    /// Downloads the archive the phone put on `cdn` under `key` to `to`.
+    /// Downloads the archive the phone put on `cdn` under `key` to `to`,
+    /// resuming where it stopped when the connection breaks.
     async fn download(&self, cdn: u32, key: &str, to: &Path) -> anyhow::Result<()> {
         let url = self.cdn_url(cdn, key)?;
         let mut file = tokio::fs::File::create(to)
             .await
             .with_context(|| format!("unable to create \"{}\"", to.display()))?;
-        let mut response = self
-            .http
-            .get(url)
-            .send()
-            .await
-            .context("unable to download the history archive")?;
-        if !response.status().is_success() {
-            return Err(refused(&response, "the history archive download"));
+        let mut written = 0u64;
+        let mut attempt = 1;
+        loop {
+            let broke = match self.fetch_from(&url, &mut file, &mut written).await? {
+                None => return Ok(()),
+                Some(broke) => broke,
+            };
+            if attempt >= self.patience.download_attempts {
+                return Err(broke.context("the history archive download kept breaking off"));
+            }
+            attempt += 1;
+            tokio::time::sleep(self.patience.retry_delay).await;
         }
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .context("the history archive download broke off")?
-        {
+    }
+
+    /// Fetches `url` from byte `written` on into `file`. The outer error is
+    /// Signal's refusal; the inner one a connection that broke, worth resuming.
+    async fn fetch_from(
+        &self,
+        url: &Url,
+        file: &mut tokio::fs::File,
+        written: &mut u64,
+    ) -> anyhow::Result<Option<anyhow::Error>> {
+        let mut request = self.http.get(url.clone());
+        if *written > 0 {
+            request = request.header(RANGE, format!("bytes={written}-"));
+        }
+        let mut response = match request.send().await {
+            Ok(response) => response,
+            Err(e) => return Ok(Some(anyhow!(e))),
+        };
+        match response.status() {
+            StatusCode::PARTIAL_CONTENT => {}
+            StatusCode::OK => {
+                // The CDN ignored the range and sent everything again.
+                file.set_len(0).await?;
+                file.seek(SeekFrom::Start(0)).await?;
+                *written = 0;
+            }
+            _ => return Err(refused(&response, "the history archive download")),
+        }
+        loop {
+            let chunk = match response.chunk().await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                Err(e) => return Ok(Some(anyhow!(e))),
+            };
             file.write_all(&chunk)
                 .await
-                .with_context(|| format!("unable to write \"{}\"", to.display()))?;
+                .context("unable to write the history archive")?;
+            *written += chunk.len() as u64;
         }
         file.flush()
             .await
-            .with_context(|| format!("unable to write \"{}\"", to.display()))
+            .context("unable to write the history archive")?;
+        Ok(None)
     }
 
     /// Long-polls until the phone says where the archive is.
@@ -254,6 +298,8 @@ mod tests {
                 per_poll: Duration::from_secs(1),
                 total: Duration::from_secs(10),
                 min_gap: Duration::ZERO,
+                download_attempts: 3,
+                retry_delay: Duration::ZERO,
             },
         }
     }
@@ -399,6 +445,40 @@ mod tests {
         assert!(
             !request.to_lowercase().contains("authorization"),
             "{request}"
+        );
+    }
+
+    /// A download cut off partway must pick up where it stopped with a Range
+    /// request, as Signal Desktop does, rather than refetch or keep a
+    /// truncated file.
+    #[tokio::test]
+    async fn a_broken_download_resumes_from_where_it_stopped() {
+        let archive: Vec<u8> = (0..=255).collect();
+        let (head, tail) = archive.split_at(100);
+        let server = FakeServer::start(vec![
+            bytes("200 OK", "", head, archive.len()),
+            bytes(
+                "206 Partial Content",
+                "content-range: bytes 100-255/256\r\n",
+                tail,
+                tail.len(),
+            ),
+        ])
+        .await;
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("archive");
+        source(&server)
+            .download(0, "k", &path)
+            .await
+            .expect("downloaded");
+        assert_eq!(std::fs::read(&path).expect("file"), archive);
+        let requests = server.requests();
+        let [_, resumed] = requests.as_slice() else {
+            panic!("expected two requests: {requests:?}");
+        };
+        assert!(
+            resumed.to_lowercase().contains("range: bytes=100-\r\n"),
+            "{resumed}"
         );
     }
 }
