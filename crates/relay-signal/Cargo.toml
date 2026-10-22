@@ -20,8 +20,11 @@ url = "2.5.8"
 # NOTE: pinned to an exact rev (PRD anti-goal 7: no fork, pin a revision). presage's
 # sqlite store brings the bundled SQLCipher the whole binary shares; see the root
 # [patch.crates-io], which must move with this rev.
-presage = { git = "https://github.com/whisperfish/presage", rev = "6f630791b2c7bf3d5b00c75f5a6c94131bf79c8c" }
+presage = { git = "https://github.com/whisperfish/presage", rev = "6f630791b2c7bf3d5b00c75f5a6c94131bf79c8c", features = ["cdsi"] }
 presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "6f630791b2c7bf3d5b00c75f5a6c94131bf79c8c" }
+# Only to recognize contact discovery's "retry later" inside libsignal-service's
+# ServiceError::CdsiLookupError; keep it at the tag libsignal-service uses.
+libsignal-net = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0" }
 # Only to recognize a 429 on a websocket upgrade inside libsignal-service's
 # ServiceError::WsError; keep it at the version libsignal-service uses.
 reqwest-websocket = "0.6.0"

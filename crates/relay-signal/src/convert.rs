@@ -1,7 +1,7 @@
 //! The only place presage and libsignal types meet relay-core types, so the
 //! protocol's shape changes in one file when presage moves.
 
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
 use anyhow::{Context, bail};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -392,6 +392,27 @@ pub(crate) fn safety_number(
     )
     .and_then(|fingerprint| fingerprint.display_string())
     .map_err(|e| anyhow::anyhow!("unable to compute the safety number with {them}: {e}"))
+}
+
+/// `numbers` answered from what discovery `found`, in the order asked.
+// NOTE: only an ACI comes back. relay-core's ServiceId means an ACI everywhere
+// (sending, contacts, the store), so a PNI passed off as one would address
+// nobody, or the wrong account.
+pub(crate) fn discovered(
+    numbers: &[String],
+    found: Vec<(PhoneNumber, Option<protocol::ServiceId>)>,
+) -> Vec<(String, Option<ServiceId>)> {
+    let found: HashMap<String, ServiceId> = found
+        .into_iter()
+        .filter_map(|(number, id)| match id? {
+            protocol::ServiceId::Aci(aci) => Some((e164(&number), ServiceId::new(aci.into()))),
+            protocol::ServiceId::Pni(_) => None,
+        })
+        .collect();
+    numbers
+        .iter()
+        .map(|number| (number.clone(), found.get(number).copied()))
+        .collect()
 }
 
 pub(crate) fn contact_from(contact: &presage::model::contacts::Contact) -> crate::Contact {
@@ -1225,6 +1246,45 @@ mod tests {
             let after = safety_number(me, &identity_key(mine), alice, &identity_key(replaced))
                 .expect("computes");
             prop_assert_ne!(ours, after);
+        }
+    }
+
+    proptest! {
+        /// Discovery answers every number asked, in the order asked, whatever
+        /// order Signal answered in. Only an ACI is an account the agent can
+        /// address; a number Signal knows only by its PNI, or didn't answer
+        /// for, reads as undiscoverable rather than as a mislabeled ACI.
+        #[test]
+        fn discovery_answers_every_number_in_order_with_acis_only(
+            answers in proptest::collection::vec((0u8..3, any::<u128>()), 1..6),
+            shuffle_seed in any::<u64>(),
+        ) {
+            let numbers: Vec<String> = (0..answers.len())
+                .map(|i| format!("+1555000{i:04}"))
+                .collect();
+            let mut found: Vec<_> = numbers
+                .iter()
+                .zip(&answers)
+                .filter_map(|(number, &(kind, uuid))| {
+                    let phone: PhoneNumber = number.parse().expect("valid number");
+                    let uuid = Uuid::from_u128(uuid);
+                    match kind {
+                        0 => None,
+                        1 => Some((phone, Some(protocol::ServiceId::from(Aci::from(uuid))))),
+                        _ => Some((phone, Some(protocol::ServiceId::from(protocol::Pni::from(uuid))))),
+                    }
+                })
+                .collect();
+            let len = found.len().max(1);
+            found.rotate_left((shuffle_seed as usize) % len);
+            let expected: Vec<_> = numbers
+                .iter()
+                .zip(&answers)
+                .map(|(number, &(kind, uuid))| {
+                    (number.clone(), (kind == 1).then(|| ServiceId::new(Uuid::from_u128(uuid))))
+                })
+                .collect();
+            prop_assert_eq!(discovered(&numbers, found), expected);
         }
     }
 
