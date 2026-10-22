@@ -18,7 +18,12 @@ sqlx = { version = "0.9.0", default-features = false, features = ["sqlite", "run
 libsqlite3-sys = { version = "0.36.0", features = ["bundled-sqlcipher-custom-crypto"] }
 log = "0.4.34"
 
-# The fork's build.rs still demands OpenSSL on Windows even with custom crypto.
+# NOTE: the fork's build.rs demands OpenSSL on Windows even with custom crypto,
+# and when both features are on it picks OpenSSL, so Windows runs SQLCipher on
+# OpenSSL and every other OS on RustCrypto. That is accepted (docs/slices.md):
+# the file format is standard SQLCipher either way, and the build is the same
+# whatever else is in the graph. Don't swap this for an OPENSSL_DIR trick;
+# sqlcipher_uses_the_declared_crypto_backend pins the result.
 [target.'cfg(windows)'.dependencies]
 libsqlite3-sys = { version = "0.36.0", features = ["bundled-sqlcipher-vendored-openssl"] }
 
