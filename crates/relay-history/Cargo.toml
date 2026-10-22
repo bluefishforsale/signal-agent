@@ -5,5 +5,41 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+aes = "0.9.1"
+aes-gcm = "0.11.1"
 anyhow.workspace = true
+base64 = "0.22.1"
+cbc = "0.2.1"
+futures.workspace = true
+hex = "0.4.3"
+# NOTE: same git source and tag as libsignal-service-rs (and so presage) uses.
+# Cargo treats a different tag or rev as a different source, which would link
+# two copies of libsignal-core and friends into one binary. Cargo.lock pins the
+# commit (439f035d9c for v0.99.0); bump these together with presage.
+# `test-util` is what makes the generated backup protos public; it adds no code
+# to the import path.
+libsignal-account-keys = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0" }
+libsignal-core = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0" }
+libsignal-message-backup = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0", features = ["test-util"] }
+zkgroup = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0" }
+# NOTE: the one-SQLite rule (docs/slices.md): the same sqlx and libsqlite3-sys
+# as presage-store-sqlite, with the one crypto backend every crate declares.
+libsqlite3-sys = { version = "0.36.0", features = ["bundled-sqlcipher-custom-crypto"] }
+pbkdf2 = "0.13.0"
+protobuf = "3.7.2"
+relay-core.workspace = true
 relay-store.workspace = true
+serde_json.workspace = true
+sha1 = "0.11.0"
+sqlx = { version = "0.9.0", default-features = false, features = ["sqlite", "runtime-tokio"] }
+uuid.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# NOTE: at the pinned whisperfish rev, SQLCipher's Windows build still needs
+# OpenSSL even with custom crypto (docs/slices.md).
+libsqlite3-sys = { version = "0.36.0", features = ["bundled-sqlcipher-vendored-openssl"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+
+[dev-dependencies]
+tempfile = "3.23.0"
+tokio.workspace = true
