@@ -14,7 +14,8 @@ use relay_secrets::StoreKey;
 use relay_setup::{
     AgentKeys,
     claude::{Clients, ServerEntry},
-    driver::{Driver, HistoryImport, LoginItem, OpenProvisioner, Services},
+    driver::{Driver, HistorySkip, LoginItem, OpenProvisioner, Services},
+    history::{LinkAndSync, ProfileStore, SignalDesktop},
     prelude::*,
 };
 use relay_signal::{PresageProvisioner, Provisioner, Servers};
@@ -30,6 +31,10 @@ impl Setup for Driver {
     fn state(&self) -> &SetupState {
         Driver::state(self)
     }
+
+    fn history_skip(&self) -> Option<HistorySkip> {
+        Some(Driver::history_skip(self))
+    }
 }
 
 /// Setup of the default profile, starting at `start`.
@@ -37,14 +42,19 @@ pub fn setup(start: SetupState) -> anyhow::Result<Box<dyn Setup>> {
     let profile = ProfileName::default_profile();
     let agent = agent()?;
     let server = ServerEntry::for_profile(&profile, &agent, ["mcp", "--profile", &profile])?;
+    let paths = ProfilePaths::for_profile(&profile)?;
+    // NOTE: every key read goes through the bundled signal-agent, never the
+    // app itself, so the Keychain item keeps trusting the program the login
+    // item runs (#112).
+    let store = || ProfileStore::new(&profile, &paths, Box::new(AgentKeys::new(agent.clone())));
     let services = Services {
         signal: Box::new(Presage),
-        secrets: Box::new(AgentKeys::new(agent)),
-        history: Box::new(NoHistoryYet),
+        secrets: Box::new(AgentKeys::new(agent.clone())),
+        history: Box::new(LinkAndSync::new(store())),
+        desktop: Box::new(SignalDesktop::usual_place(store())),
         login: Box::new(AgentAtLogin),
         clients: Clients::system(),
     };
-    let paths = ProfilePaths::for_profile(&profile)?;
     Ok(Box::new(Driver::new(
         start, profile, paths, server, services,
     )))
@@ -72,17 +82,6 @@ impl OpenProvisioner for Presage {
     }
 }
 
-// Integration seam: link-and-sync import (lane L7) needs the archive and key
-// from linking, which the Provisioner contract doesn't carry yet (issue #34).
-struct NoHistoryYet;
-
-#[async_trait]
-impl HistoryImport for NoHistoryYet {
-    async fn import(&self, _: &mut (dyn FnMut(u64, Option<u64>) + Send)) -> anyhow::Result<()> {
-        Ok(())
-    }
-}
-
 struct AgentAtLogin;
 
 impl LoginItem for AgentAtLogin {
@@ -96,12 +95,17 @@ mod tests {
     use std::{sync::mpsc, time::Duration};
 
     use futures::stream::BoxStream;
-    use relay_signal::{Account, LinkEvent, RegistrationStep};
+    use relay_signal::{Account, HistoryTransfer, LinkEvent, RegistrationStep};
 
     use super::*;
     use crate::{session::Session, view::View};
 
-    struct Phone;
+    /// A phone that links at once, and then either offers no history or
+    /// never answers the history long-poll.
+    #[derive(Clone, Copy)]
+    struct Phone {
+        stalls_history: bool,
+    }
 
     #[async_trait]
     impl Provisioner for Phone {
@@ -132,12 +136,19 @@ mod tests {
         async fn verify_code(&self, _: &str) -> anyhow::Result<RegistrationStep> {
             bail!("not scripted")
         }
+
+        async fn transfer_history(&self, _: &Path) -> anyhow::Result<HistoryTransfer> {
+            if self.stalls_history {
+                futures::future::pending::<()>().await;
+            }
+            Ok(HistoryTransfer::NotOffered)
+        }
     }
 
     #[async_trait]
     impl OpenProvisioner for Phone {
         async fn open(&self, _: &Path, _: &StoreKey) -> anyhow::Result<Box<dyn Provisioner>> {
-            Ok(Box::new(Phone))
+            Ok(Box::new(*self))
         }
     }
 
@@ -158,13 +169,30 @@ mod tests {
     }
 
     fn faked(dir: &Path) -> Box<dyn Setup> {
+        faked_with(
+            dir,
+            Phone {
+                stalls_history: false,
+            },
+        )
+    }
+
+    fn faked_with(dir: &Path, phone: Phone) -> Box<dyn Setup> {
         let profile = ProfileName::default_profile();
         let server = ServerEntry::for_profile(&profile, &dir.join("signal-agent"), ["mcp"])
             .expect("server entry");
+        let store = || {
+            ProfileStore::new(
+                &profile,
+                &ProfilePaths::under(dir.to_path_buf(), &profile),
+                Box::new(relay_secrets::MemorySecretStore::default()),
+            )
+        };
         let services = Services {
-            signal: Box::new(Phone),
+            signal: Box::new(phone),
             secrets: Box::new(relay_secrets::MemorySecretStore::default()),
-            history: Box::new(NoHistoryYet),
+            history: Box::new(LinkAndSync::new(store())),
+            desktop: Box::new(SignalDesktop::new(None, store())),
             login: Box::new(NoLogin),
             clients: Clients::new(
                 relay_setup::claude::Platform::current(),
@@ -219,6 +247,51 @@ mod tests {
                 })
             ),
             "{screens:?}"
+        );
+    }
+
+    /// Skip in the window must reach an import that is waiting on the phone,
+    /// which holds the driver, rather than queue behind it for up to an hour.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn skip_in_the_window_stops_a_history_import_waiting_on_the_phone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (tx, rx) = mpsc::channel();
+        let (session, run) = Session::new(
+            faked_with(
+                dir.path(),
+                Phone {
+                    stalls_history: true,
+                },
+            ),
+            move |view: &View| {
+                tx.send(view.clone()).unwrap();
+            },
+        );
+        tokio::spawn(run);
+        session.send(SetupEvent::AccountChosen {
+            choice: AccountChoice::LinkExisting,
+        });
+        session.send(SetupEvent::AccessChosen {
+            access: AccessMode::Full,
+        });
+        let next = || rx.recv_timeout(Duration::from_secs(10));
+        while let Ok(view) = next() {
+            if matches!(view, View::ImportingHistory { .. }) {
+                break;
+            }
+        }
+        session.send(SetupEvent::SkipHistory);
+        let mut screens = Vec::new();
+        while let Ok(view) = next() {
+            let done = matches!(view, View::Done { .. });
+            screens.push(view);
+            if done {
+                break;
+            }
+        }
+        assert!(
+            matches!(screens.last(), Some(View::Done { .. })),
+            "skip never reached the import: {screens:?}"
         );
     }
 }
