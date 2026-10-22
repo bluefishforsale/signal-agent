@@ -172,6 +172,19 @@ pub async fn contact(ctx: &ToolContext, s: &str) -> Result<ServiceId, ToolError>
     }
 }
 
+pub fn group_schema() -> Value {
+    json!({
+        "type": "string",
+        "format": "signal-group-id",
+        "description": "A group id (64 hex characters), as list_conversations returns it",
+    })
+}
+
+/// A group, by id; a person is refused.
+pub fn group(s: &str) -> Result<GroupId, ToolError> {
+    GroupId::parse(s).map_err(|e| ToolError::InvalidInput(e.to_string()))
+}
+
 /// Text that must say something: refused when empty or only whitespace.
 pub fn non_blank(field: &str, s: String) -> Result<String, ToolError> {
     if s.trim().is_empty() {

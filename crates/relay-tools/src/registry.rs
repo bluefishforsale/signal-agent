@@ -25,6 +25,7 @@ impl Registry {
             .with(read::GetConversation)
             .with(read::SearchMessages)
             .with(send::SendMessage)
+            .with(send::SendGroupMessage)
     }
 
     pub fn with(mut self, tool: impl Tool + 'static) -> Self {
@@ -187,6 +188,7 @@ mod tests {
     fn sample(name: &str, prop: &Value) -> Value {
         match prop["format"].as_str() {
             Some("signal-recipient" | "signal-service-id") => json!(sid(2).to_string()),
+            Some("signal-group-id") => json!("ab".repeat(32)),
             Some("iso-datetime") => json!("2024-01-01T00:00:00Z"),
             Some(other) => panic!("{name}: no sample for format \"{other}\"; add one here"),
             None => match prop["type"].as_str() {
@@ -220,6 +222,11 @@ mod tests {
                     Some("signal-service-id") => {
                         bad.extend(malformed_ids);
                         bad.push(json!("ab".repeat(32)));
+                    }
+                    // A group-only field must also refuse a well-formed person.
+                    Some("signal-group-id") => {
+                        bad.extend(malformed_ids);
+                        bad.push(json!(sid(2).to_string()));
                     }
                     Some("iso-datetime") => bad.extend([
                         json!("yesterday"),

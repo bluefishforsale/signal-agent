@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 use crate::{
     Tool, ToolContext, ToolError,
-    input::{Timestamp, contact, contact_schema, non_blank, parse},
+    input::{Timestamp, contact, contact_schema, group, group_schema, non_blank, parse},
 };
 
 pub struct SendMessage;
@@ -31,9 +31,9 @@ impl Tool for SendMessage {
         "Send a text message to one Signal contact. Use send_group_message for groups and \
          send_note_to_self for your own Note to Self. recipient is the contact's phone number \
          or service id; message is the text. To reply, quote_author and quote_timestamp \
-         name the quoted message (its id's author and sent_at_ms). Not idempotent: repeating sends a duplicate. The \
-         sent message is saved to the local store. Returns the new message's id, which \
-         replies, reactions, edits and deletes reference."
+         name the quoted message (its id's author and sent_at_ms). Not idempotent: \
+         repeating sends a duplicate. The sent message is saved to the local store. Returns \
+         the new message's id, which replies, reactions, edits and deletes reference."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -54,6 +54,55 @@ impl Tool for SendMessage {
     async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
         let input: SendMessageInput = parse(input)?;
         let to = Recipient::Contact(contact(ctx, &input.recipient).await?);
+        let body = non_blank("message", input.message)?;
+        let quote = quote(ctx, input.quote_author, input.quote_timestamp).await?;
+        send_text(ctx, to, body, quote).await
+    }
+}
+
+pub struct SendGroupMessage;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SendGroupMessageInput {
+    group_id: String,
+    message: String,
+    quote_author: Option<String>,
+    quote_timestamp: Option<Timestamp>,
+}
+
+#[async_trait]
+impl Tool for SendGroupMessage {
+    fn name(&self) -> &'static str {
+        "send_group_message"
+    }
+    fn description(&self) -> &'static str {
+        "Send a text message to a Signal group you belong to. Use send_message for one \
+         contact. group_id comes from list_conversations; message is the text. To reply, \
+         quote_author and quote_timestamp name the quoted message (its id's author and \
+         sent_at_ms). Not idempotent: repeating sends a duplicate. The sent message is saved \
+         to the local store. Returns the new message's id, which replies, reactions, edits \
+         and deletes reference."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "group_id": group_schema(),
+                "message": {"type": "string", "minLength": 1, "description": "Message text to send"},
+                "quote_author": contact_schema("Author of the message being replied to"),
+                "quote_timestamp": Timestamp::schema("Send time of the message being replied to"),
+            },
+            "required": ["group_id", "message"],
+            "additionalProperties": false,
+        })
+    }
+    fn writes(&self) -> bool {
+        true
+    }
+    async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
+        let input: SendGroupMessageInput = parse(input)?;
+        let to = Recipient::Group(group(&input.group_id)?);
         let body = non_blank("message", input.message)?;
         let quote = quote(ctx, input.quote_author, input.quote_timestamp).await?;
         send_text(ctx, to, body, quote).await
@@ -122,7 +171,73 @@ mod tests {
     use relay_signal::Outgoing;
     use serde_json::json;
 
-    use crate::{Registry, ToolError, testing::*};
+    use std::sync::Arc;
+
+    use relay_signal::{Account, FakeSignal, Group};
+    use relay_store::MemoryStore;
+
+    use crate::{Registry, ToolContext, ToolError, testing::*};
+
+    const GROUP: [u8; 32] = [7; 32];
+
+    /// A full-access linked profile that belongs to one group, GROUP.
+    fn group_ctx() -> (ToolContext, Arc<FakeSignal>) {
+        let signal = Arc::new(
+            FakeSignal::new(Account {
+                service_id: sid(ME),
+                phone_number: Some("+15550000001".into()),
+                kind: ProfileKind::Linked,
+                device_name: "test".into(),
+            })
+            .with_groups(vec![Group {
+                id: GroupId::new(GROUP),
+                title: "band".into(),
+                members: vec![sid(ME), sid(2)],
+            }]),
+        );
+        let ctx = ToolContext {
+            store: Arc::new(MemoryStore::default()),
+            signal: signal.clone(),
+            access: AccessMode::Full,
+            kind: ProfileKind::Linked,
+        };
+        (ctx, signal)
+    }
+
+    /// A group send goes to the group, not to any one member, and is stored
+    /// in the group's conversation with a reply quote intact.
+    #[tokio::test]
+    async fn send_group_message_sends_to_the_group_and_stores_it_there() {
+        let (ctx, signal) = group_ctx();
+        let group = GroupId::new(GROUP);
+        let out = Registry::standard()
+            .call(
+                &ctx,
+                "send_group_message",
+                json!({
+                    "group_id": group.to_string(),
+                    "message": "soundcheck at 6",
+                    "quote_author": sid(2).to_string(),
+                    "quote_timestamp": 99,
+                }),
+            )
+            .await
+            .unwrap();
+        let quoted = MessageId {
+            author: sid(2),
+            sent_at_ms: 99,
+        };
+        let to = Recipient::Group(group);
+        let text = Outgoing::Text {
+            body: "soundcheck at 6".into(),
+            quote: Some(quoted),
+        };
+        assert_eq!(signal.sent(), [(to, text)]);
+        let id: MessageId = serde_json::from_value(out["id"].clone()).unwrap();
+        let stored = ctx.store.history(to, None, 10).await.unwrap();
+        assert_eq!(stored.len(), 1, "{stored:?}");
+        assert_eq!((stored[0].id, stored[0].quote), (id, Some(quoted)));
+    }
 
     /// A send must reach Signal as plain text to that one contact, return the
     /// id clients quote, edit or delete it by, and land in the local history,
