@@ -6001,6 +6001,7 @@ dependencies = [
  "relay-secrets",
  "relay-setup",
  "relay-signal",
+ "relay-store",
  "tempfile",
  "tokio",
  "tracing",

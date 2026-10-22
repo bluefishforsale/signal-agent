@@ -57,6 +57,12 @@ pub(super) fn register(data_dir: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
+pub(super) fn is_registered() -> anyhow::Result<bool> {
+    // SAFETY: as in `register`.
+    Ok(unsafe { service()?.status() } == SMAppServiceStatus::Enabled)
+}
+
+#[cfg(target_os = "macos")]
 pub(super) fn unregister(data_dir: &Path) -> anyhow::Result<()> {
     let service = service()?;
     unregister_service(&service)?;

@@ -2,6 +2,7 @@
 //! Claude clients launch, and the terminal setup flow, in one binary so every
 //! platform ships a single signed executable.
 
+mod doctor;
 mod http_cli;
 mod setup_tty;
 
@@ -16,9 +17,10 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(name = "signal-agent", version, about = "MCP Relay for Signal")]
 struct Cli {
-    /// Which account to act on.
-    #[arg(long, global = true, default_value = "personal")]
-    profile: String,
+    /// Which account to act on: `personal` unless named, except that doctor
+    /// checks every account unless one is named.
+    #[arg(long, global = true)]
+    profile: Option<String>,
     #[command(subcommand)]
     command: Cmd,
 }
@@ -36,8 +38,13 @@ enum Cmd {
     Mcp,
     /// Set up a profile in the terminal.
     Setup,
-    /// Check every piece and repair what's missing.
-    Doctor,
+    /// Check every piece and say what's wrong; never contacts Signal.
+    Doctor {
+        /// Put back missing Claude entries and the login item. Never touches
+        /// messages, keys or the Signal link.
+        #[arg(long)]
+        fix: bool,
+    },
     /// Remove this install's agent, Claude entries and files from this computer.
     Uninstall {
         /// Also delete messages, account data and the keys that unlock them.
@@ -84,7 +91,8 @@ async fn main() -> anyhow::Result<()> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
-    let profile = ProfileName::new(cli.profile)?;
+    let named = cli.profile.map(ProfileName::new).transpose()?;
+    let profile = named.clone().unwrap_or_else(ProfileName::default_profile);
     match cli.command {
         Cmd::Agent { all_profiles: true } => relay_agent::run_all_profiles().await,
         Cmd::Agent {
@@ -109,7 +117,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Mcp => relay_mcp::run_stdio(&profile).await,
         Cmd::Setup => setup_tty::run(profile).await,
-        Cmd::Doctor => bail!("doctor is not implemented yet (lane L5)"),
+        Cmd::Doctor { fix } => doctor::run(named.as_ref(), fix).await,
         Cmd::Uninstall { delete_data } => uninstall(delete_data),
         Cmd::Http(cmd) => {
             let paths = ProfilePaths::for_profile(&profile)?;
@@ -220,12 +228,25 @@ mod tests {
         for action in [KeyAction::Get, KeyAction::Ensure, KeyAction::Delete] {
             let args = std::iter::once("signal-agent".to_owned()).chain(action.args(&work));
             let cli = Cli::try_parse_from(args).expect("parse");
-            assert_eq!(cli.profile, "work");
+            assert_eq!(cli.profile.as_deref(), Some("work"));
             assert!(
                 matches!(cli.command, Cmd::Key { action: a } if KeyAction::from(a) == action),
                 "{action:?}"
             );
         }
+    }
+
+    /// Doctor checks every profile unless one is named, and repairs only
+    /// when asked to.
+    #[test]
+    fn doctor_checks_every_profile_unless_named_and_fixes_only_when_asked() {
+        let cli = Cli::try_parse_from(["signal-agent", "doctor"]).expect("parse");
+        assert!(cli.profile.is_none(), "doctor defaulted to one profile");
+        assert!(matches!(cli.command, Cmd::Doctor { fix: false }));
+        let cli = Cli::try_parse_from(["signal-agent", "doctor", "--profile", "work", "--fix"])
+            .expect("parse");
+        assert_eq!(cli.profile.as_deref(), Some("work"));
+        assert!(matches!(cli.command, Cmd::Doctor { fix: true }));
     }
 
     /// The Windows uninstaller passes the "delete app data" checkbox through
