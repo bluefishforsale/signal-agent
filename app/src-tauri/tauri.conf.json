@@ -33,9 +33,13 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "externalBin": ["binaries/signal-agent"],
     "macOS": {
       "minimumSystemVersion": "13.0",
-      "hardenedRuntime": true
+      "hardenedRuntime": true,
+      "files": {
+        "Library/LaunchAgents/com.bluefishforsale.signalagent.agent.plist": "../../crates/relay-agent/launchd/com.bluefishforsale.signalagent.agent.plist"
+      }
     },
     "windows": {
       "nsis": {

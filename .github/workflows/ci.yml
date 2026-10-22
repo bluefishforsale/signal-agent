@@ -48,14 +48,17 @@ jobs:
           - os: macos-latest
             target: universal-apple-darwin
             rust-targets: aarch64-apple-darwin x86_64-apple-darwin
+            cli-targets: --target aarch64-apple-darwin --target x86_64-apple-darwin
             bundles: dmg
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             rust-targets: x86_64-pc-windows-msvc
+            cli-targets: --target x86_64-pc-windows-msvc
             bundles: nsis
           - os: windows-11-arm
             target: aarch64-pc-windows-msvc
             rust-targets: aarch64-pc-windows-msvc
+            cli-targets: --target aarch64-pc-windows-msvc
             bundles: nsis
     runs-on: ${{ matrix.os }}
     steps:
@@ -71,8 +74,17 @@ jobs:
       - run: rustup target add ${{ matrix.rust-targets }}
         shell: bash
       - run: cargo install tauri-cli --version "^2" --locked
+      # The app bundles the CLI as a sidecar (see release.yml), so build it first.
+      - run: cargo build --release --locked -p signal-agent ${{ matrix.cli-targets }}
+      - run: scripts/stage-agent-sidecar.sh ${{ matrix.target }}
+        shell: bash
       - run: cargo tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
         working-directory: app/src-tauri
+      - if: runner.os == 'macOS'
+        run: scripts/check-macos-bundle.sh "target/${{ matrix.target }}/release/bundle/macos/MCP Relay for Signal.app"
+      - if: runner.os == 'Windows'
+        run: ./scripts/check-nsis-payload.ps1 -Installer (Get-Item target/${{ matrix.target }}/release/bundle/nsis/*-setup.exe).FullName
+        shell: pwsh
       - uses: actions/upload-artifact@v4
         with:
           name: unsigned-${{ matrix.target }}

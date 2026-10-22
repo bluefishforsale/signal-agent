@@ -100,6 +100,10 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - name: Build the signal-agent CLI the app ships
+        run: |
+          cargo build --release --locked -p signal-agent --target aarch64-apple-darwin --target x86_64-apple-darwin
+          scripts/stage-agent-sidecar.sh universal-apple-darwin
       - name: Signing keychain and notarization key
         if: github.event_name == 'push'
         env:
@@ -122,6 +126,8 @@ jobs:
         if: github.event_name != 'push'
         working-directory: app/src-tauri
         run: $TAURI_CLI build --ci --target universal-apple-darwin --bundles app,dmg
+      - name: The app carries signal-agent and the login agent plist
+        run: scripts/check-macos-bundle.sh "$BUNDLE/macos/MCP Relay for Signal.app"
       - name: Sign, notarize and staple the dmg
         if: github.event_name == 'push'
         env:
@@ -139,6 +145,7 @@ jobs:
           app=$(echo "$BUNDLE"/macos/*.app)
           dmg=$(echo "$BUNDLE"/dmg/*.dmg)
           codesign --verify --deep --strict --verbose=2 "$app"
+          codesign --verify --strict --verbose=2 "$app/Contents/MacOS/signal-agent"
           spctl --assess --type execute --verbose=2 "$app"
           xcrun stapler validate "$app"
           xcrun stapler validate "$dmg"
@@ -148,7 +155,6 @@ jobs:
           mkdir dist
           cp "$BUNDLE"/dmg/*.dmg "dist/signal-agent-$VERSION-macos-universal.dmg"
           COPYFILE_DISABLE=1 tar -czf "dist/signal-agent-$VERSION-macos-universal.app.tar.gz" -C "$BUNDLE/macos" "MCP Relay for Signal.app"
-          lipo -archs "$BUNDLE/macos/MCP Relay for Signal.app/Contents/MacOS/relay-app"
       - uses: actions/upload-artifact@v4
         with:
           name: dist-macos-universal
@@ -238,13 +244,18 @@ jobs:
       - run: rustup target add ${{ matrix.target }}
       # NOTE: pwsh, like ci.yml, because vendored OpenSSL needs Strawberry Perl;
       # under Git Bash the msys perl comes first on PATH and its build fails.
+      - run: cargo build --release --locked -p signal-agent --target ${{ matrix.target }}
+        shell: pwsh
+      - run: scripts/stage-agent-sidecar.sh ${{ matrix.target }}
       - run: Invoke-Expression "$env:TAURI_CLI build --ci --target ${{ matrix.target }} --no-bundle"
         shell: pwsh
         working-directory: app/src-tauri
       - uses: actions/upload-artifact@v4
         with:
           name: windows-app-${{ matrix.arch }}
-          path: target/${{ matrix.target }}/release/relay-app.exe
+          path: |
+            target/${{ matrix.target }}/release/relay-app.exe
+            target/${{ matrix.target }}/release/signal-agent.exe
           if-no-files-found: error
 
   windows-sign-app:
@@ -282,7 +293,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: windows-app-${{ matrix.arch }}
-          path: app-exe/relay-app.exe
+          path: app-exe/*.exe
           if-no-files-found: error
           overwrite: true
 
@@ -313,8 +324,12 @@ jobs:
         with:
           name: windows-app-${{ matrix.arch }}
           path: target/${{ matrix.target }}/release
+      - run: scripts/stage-agent-sidecar.sh ${{ matrix.target }}
       - run: $TAURI_CLI bundle --ci --target ${{ matrix.target }} --bundles nsis
         working-directory: app/src-tauri
+      - name: The installer puts signal-agent.exe next to the app
+        run: ./scripts/check-nsis-payload.ps1 -Installer (Get-Item target/${{ matrix.target }}/release/bundle/nsis/*-setup.exe).FullName -RequireSigned:$${{ github.event_name == 'push' }}
+        shell: pwsh
       - name: Name the installer
         run: |
           mkdir dist
@@ -356,6 +371,8 @@ jobs:
           files-folder-filter: exe
           exclude-environment-credential: true
       - run: ./scripts/verify-authenticode.ps1 -Folder dist
+        shell: pwsh
+      - run: ./scripts/check-nsis-payload.ps1 -Installer (Get-Item dist/*-setup.exe).FullName -RequireSigned
         shell: pwsh
       - uses: actions/upload-artifact@v4
         with:
