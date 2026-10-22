@@ -666,7 +666,7 @@ async fn a_due_job_is_claimed_exactly_once() {
 #[tokio::test]
 async fn failed_and_interrupted_jobs_are_never_sent_again() {
     let stores = Stores::open().await;
-    for (name, store) in stores.round_two() {
+    for (name, store) in stores.each() {
         let ok = store.schedule(&later(1, 1)).await.expect("schedule");
         let failed = store.schedule(&later(2, 1)).await.expect("schedule");
         let crashed = store.schedule(&later(3, 1)).await.expect("schedule");

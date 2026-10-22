@@ -170,6 +170,10 @@ fn to_i64(n: u64) -> anyhow::Result<i64> {
     i64::try_from(n).with_context(|| format!("timestamp {n} too large for the message store"))
 }
 
+fn job_key(id: JobId) -> anyhow::Result<i64> {
+    i64::try_from(id.0).with_context(|| format!("no scheduled job {id:?}"))
+}
+
 fn recipient_key(recipient: Recipient) -> String {
     match recipient {
         Recipient::Contact(id) => format!("contact:{id}"),
@@ -526,7 +530,8 @@ impl MessageStore for SqlCipherStore {
              WHERE state = 'pending' AND send_at_ms <= ? \
              RETURNING id, recipient, body, send_at_ms, state, error",
         )
-        .bind(to_i64(now_ms)?)
+        // Every stored send_at_ms fits in an i64, so a later now is "all due".
+        .bind(i64::try_from(now_ms).unwrap_or(i64::MAX))
         .fetch_all(&self.pool)
         .await?;
         let mut due = rows
@@ -537,12 +542,16 @@ impl MessageStore for SqlCipherStore {
         Ok(due)
     }
 
-    async fn finish_scheduled(
-        &self,
-        _id: JobId,
-        _result: Result<(), String>,
-    ) -> anyhow::Result<()> {
-        bail!("scheduled sends are not implemented yet (lane L2b)")
+    async fn finish_scheduled(&self, id: JobId, result: Result<(), String>) -> anyhow::Result<()> {
+        let query = match result {
+            Ok(()) => sqlx::query("DELETE FROM scheduled_jobs WHERE id = ?"),
+            Err(error) => {
+                sqlx::query("UPDATE scheduled_jobs SET state = 'failed', error = ? WHERE id = ?")
+                    .bind(error)
+            }
+        };
+        query.bind(job_key(id)?).execute(&self.pool).await?;
+        Ok(())
     }
 }
 
