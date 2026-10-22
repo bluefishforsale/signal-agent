@@ -5,19 +5,21 @@ use std::sync::Arc;
 use relay_core::prelude::*;
 use serde_json::Value;
 
-use crate::{Tool, ToolContext, ToolError, directory, local, mutate, read, send};
+use crate::{Limiter, Tool, ToolContext, ToolError, directory, limits, local, mutate, read, send};
 
 /// The set of tools a profile serves.
 #[derive(Clone, Default)]
 pub struct Registry {
     tools: Vec<Arc<dyn Tool>>,
+    limiter: Option<Arc<Limiter>>,
 }
 
 impl Registry {
-    /// Every tool this build ships.
+    /// Every tool this build ships, under the default account-safety limits.
     pub fn standard() -> Self {
         // Lanes L3b to L3e add their tools here.
         Self::default()
+            .with_limiter(Limiter::default())
             .with(read::ListConversations)
             .with(read::GetOwnNumber)
             .with(read::StoreStats)
@@ -41,6 +43,12 @@ impl Registry {
             .with(local::MarkAsUnread)
             .with(local::ClearLocalStore)
             .with(local::PruneStore)
+    }
+
+    /// Applies account-safety limits to every send a tool makes.
+    pub fn with_limiter(mut self, limiter: Limiter) -> Self {
+        self.limiter = Some(Arc::new(limiter));
+        self
     }
 
     pub fn with(mut self, tool: impl Tool + 'static) -> Self {
@@ -86,6 +94,7 @@ impl Registry {
                 "\"{name}\" has no parameter \"{unknown}\""
             )));
         }
+        let ctx = &limits::guard(self.limiter.as_ref(), ctx);
         tool.call(ctx, input).await
     }
 }
