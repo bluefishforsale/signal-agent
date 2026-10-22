@@ -107,11 +107,14 @@ pub async fn run_due(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use relay_signal::Outgoing;
+    use relay_store::{JobState, ScheduledJob};
     use serde_json::json;
 
     use super::*;
-    use crate::{Registry, testing::*};
+    use crate::{Limiter, Limits, Registry, SystemClock, testing::*};
 
     /// A due job must reach Signal once and then be gone, however many ticks
     /// or run_scheduled_messages calls follow, or the recipient gets repeats.
@@ -148,5 +151,76 @@ mod tests {
             )]
         );
         assert!(ctx.store.scheduled().await.unwrap().is_empty());
+    }
+
+    /// Schedules "hi" to contact 2, due at 1 ms, and returns the job's id.
+    async fn schedule_hi(ctx: &ToolContext) -> u64 {
+        let out = Registry::standard()
+            .call(
+                ctx,
+                "schedule_message",
+                json!({
+                    "recipient": sid(2).to_string(),
+                    "message": "hi",
+                    "send_at": "1970-01-01T00:00:00Z",
+                }),
+            )
+            .await
+            .unwrap();
+        out["job_id"].as_u64().unwrap()
+    }
+
+    /// A send the limiter refuses must end Failed and stay that way: queueing
+    /// it for a later tick would let a pile of refused jobs burst out together
+    /// once the limit lifts (PRD goal 13).
+    #[tokio::test]
+    async fn a_job_the_limiter_refuses_ends_failed_and_is_never_sent_again() {
+        let (ctx, signal) = ctx(AccessMode::Full, ProfileKind::Primary);
+        let no_new_recipients = Limits {
+            new_recipients_per_day: 0,
+            ..Limits::default()
+        };
+        let registry = Registry::standard()
+            .with_limiter(Limiter::new(no_new_recipients, Arc::new(SystemClock)));
+        let id = schedule_hi(&ctx).await;
+        let fired = run_due(&registry, &ctx, 1).await.unwrap();
+        assert!(
+            matches!(fired.as_slice(), [(JobId(j), Err(_))] if *j == id),
+            "{fired:?}"
+        );
+        for later in [2, 86_400_000 * 2] {
+            let fired = run_due(&registry, &ctx, later).await.unwrap();
+            assert!(fired.is_empty(), "refused job fired again: {fired:?}");
+        }
+        assert!(signal.sent().is_empty(), "sent {:?}", signal.sent());
+        let jobs = ctx.store.scheduled().await.unwrap();
+        assert!(
+            matches!(
+                jobs.as_slice(),
+                [ScheduledJob {
+                    state: JobState::Failed { .. },
+                    ..
+                }]
+            ),
+            "{jobs:?}"
+        );
+    }
+
+    /// Read-only mode must hold at fire time too: a job saved while the
+    /// profile had full access must not send after it was switched to read-only.
+    #[tokio::test]
+    async fn read_only_mode_refuses_a_scheduled_job_at_fire_time() {
+        let (full, signal) = ctx(AccessMode::Full, ProfileKind::Primary);
+        schedule_hi(&full).await;
+        let read_only = ToolContext {
+            access: AccessMode::ReadOnly,
+            ..full.clone()
+        };
+        let fired = run_due(&Registry::standard(), &read_only, 1).await.unwrap();
+        assert!(
+            matches!(fired.as_slice(), [(_, Err(e))] if e.contains("read-only")),
+            "{fired:?}"
+        );
+        assert!(signal.sent().is_empty(), "sent {:?}", signal.sent());
     }
 }
