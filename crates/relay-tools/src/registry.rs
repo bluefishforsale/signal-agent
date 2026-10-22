@@ -46,6 +46,7 @@ impl Registry {
             .with(local::ClearLocalStore)
             .with(local::PruneStore)
             .with(lookup::ListDevices)
+            .with(lookup::ListIdentities)
     }
 
     /// Applies account-safety limits to every send a tool makes.
