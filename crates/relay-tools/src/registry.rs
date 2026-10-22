@@ -11,14 +11,15 @@ use crate::{Limiter, Tool, ToolContext, ToolError, limits, mutate, read, send};
 #[derive(Clone, Default)]
 pub struct Registry {
     tools: Vec<Arc<dyn Tool>>,
-    limiter: Arc<Limiter>,
+    limiter: Option<Arc<Limiter>>,
 }
 
 impl Registry {
-    /// Every tool this build ships.
+    /// Every tool this build ships, under the default account-safety limits.
     pub fn standard() -> Self {
         // Lanes L3b to L3e add their tools here.
         Self::default()
+            .with_limiter(Limiter::default())
             .with(read::ListConversations)
             .with(read::GetOwnNumber)
             .with(read::StoreStats)
@@ -36,10 +37,9 @@ impl Registry {
             .with(mutate::DeleteGroupMessage)
     }
 
-    /// Replaces the default account-safety limits, which use the wall clock and
-    /// forget their state when the process exits.
+    /// Applies account-safety limits to every send a tool makes.
     pub fn with_limiter(mut self, limiter: Limiter) -> Self {
-        self.limiter = Arc::new(limiter);
+        self.limiter = Some(Arc::new(limiter));
         self
     }
 
@@ -86,7 +86,7 @@ impl Registry {
                 "\"{name}\" has no parameter \"{unknown}\""
             )));
         }
-        let ctx = &limits::guard(&self.limiter, ctx);
+        let ctx = &limits::guard(self.limiter.as_ref(), ctx);
         tool.call(ctx, input).await
     }
 }

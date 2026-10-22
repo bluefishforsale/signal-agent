@@ -4,7 +4,7 @@
 
 use std::{
     num::NonZeroU32,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -147,9 +147,7 @@ impl Limiter {
         self.path = Some(path);
         Ok(self)
     }
-}
 
-impl Limiter {
     /// Counts one message to `to`, or refuses it.
     async fn admit(&self, store: &dyn MessageStore, to: Recipient) -> anyhow::Result<()> {
         let known = !store.history(to, None, 1).await?.is_empty();
@@ -205,11 +203,7 @@ impl Limiter {
 /// Records an attempt to link or register at `now_ms` in `path`, or refuses
 /// it when the previous attempt was within the backoff. Call it before every
 /// `Provisioner::link` and `Provisioner::request_code`.
-pub fn begin_provisioning(
-    path: &std::path::Path,
-    limits: &Limits,
-    now_ms: u64,
-) -> anyhow::Result<()> {
+pub fn begin_provisioning(path: &Path, limits: &Limits, now_ms: u64) -> anyhow::Result<()> {
     let last = match std::fs::read(path) {
         Ok(bytes) => Some(
             serde_json::from_slice::<u64>(&bytes)
@@ -238,7 +232,7 @@ fn provisioning_wait(last_ms: Option<u64>, now_ms: u64, minutes: NonZeroU32) -> 
 
 // NOTE: a torn write would fail to load and keep the agent from starting, so
 // write beside the file and rename over it.
-fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
+fn write_atomically(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, bytes).with_context(|| format!("can't write {}", tmp.display()))?;
     std::fs::rename(&tmp, path).with_context(|| format!("can't replace {}", path.display()))
@@ -251,7 +245,10 @@ impl Default for Limiter {
 }
 
 /// `ctx` with its Signal connection routed through `limiter`.
-pub(crate) fn guard(limiter: &Arc<Limiter>, ctx: &ToolContext) -> ToolContext {
+pub(crate) fn guard(limiter: Option<&Arc<Limiter>>, ctx: &ToolContext) -> ToolContext {
+    let Some(limiter) = limiter else {
+        return ctx.clone();
+    };
     ToolContext {
         signal: Arc::new(Guarded {
             inner: ctx.signal.clone(),
@@ -396,6 +393,63 @@ mod tests {
             result.is_ok(),
             "send after the retry time refused: {result:?}"
         );
+    }
+
+    /// The registry the agent ships must be limited without anyone wiring it,
+    /// so a forgotten setting can't leave an account unprotected.
+    #[tokio::test]
+    async fn the_shipped_registry_limits_sends_by_default() {
+        let registry = Registry::standard();
+        let (ctx, signal) = ctx();
+        let input = json!({"recipient": sid(2).to_string(), "message": "hi"});
+        let mut results = vec![];
+        for _ in 0..21 {
+            results.push(registry.call(&ctx, "send_message", input.clone()).await);
+        }
+        assert!(
+            results.iter().any(|r| refused(r).is_some()),
+            "21 sends in a row all went through: {results:?}"
+        );
+        assert_eq!(signal.sent().len(), 20);
+    }
+
+    /// Typing indicators and read receipts aren't messages anyone reads, so an
+    /// exhausted message budget must not block them.
+    #[tokio::test]
+    async fn typing_and_read_receipts_go_through_once_the_message_budget_is_spent() {
+        let one = NonZeroU32::new(1).expect("nonzero literal");
+        let (registry, _clock) = limited(Limits {
+            burst_per_minute: one,
+            ..Limits::default()
+        });
+        let (ctx, signal) = ctx();
+        let to = sid(2).to_string();
+        let message = json!({"recipient": to, "message": "hi"});
+        assert!(
+            registry
+                .call(&ctx, "send_message", message.clone())
+                .await
+                .is_ok()
+        );
+        let result = registry.call(&ctx, "send_message", message).await;
+        assert!(
+            refused(&result).is_some(),
+            "budget of one allowed two: {result:?}"
+        );
+        for (name, input) in [
+            ("set_typing", json!({"recipient": to})),
+            (
+                "send_read_receipt",
+                json!({"sender": to, "timestamps": [1]}),
+            ),
+        ] {
+            let result = registry.call(&ctx, name, input).await;
+            assert!(
+                result.is_ok(),
+                "{name} blocked by the message budget: {result:?}"
+            );
+        }
+        assert_eq!(signal.sent().len(), 3, "{:?}", signal.sent());
     }
 
     /// Only first contact with a stranger counts against the daily cap: a
