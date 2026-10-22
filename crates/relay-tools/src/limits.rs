@@ -15,6 +15,7 @@ use futures::stream::BoxStream;
 use relay_core::prelude::*;
 use relay_signal::{Account, Contact, Group, Incoming, Outgoing, SignalBackend};
 use relay_store::MessageStore;
+use serde::{Deserialize, Serialize};
 
 use crate::ToolContext;
 
@@ -23,7 +24,8 @@ const HOUR_MS: u64 = 60 * MINUTE_MS;
 const DAY_MS: u64 = 24 * HOUR_MS;
 
 /// How much a profile may send before tools refuse.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Limits {
     /// Messages allowed back to back, refilling over a minute.
     pub burst_per_minute: NonZeroU32,
@@ -444,6 +446,28 @@ mod tests {
             "a refused first contact reached Signal"
         );
         std::fs::remove_dir_all(&dir).expect("clean temp dir");
+    }
+
+    /// A settings file that names only some limits must keep the conservative
+    /// defaults for the rest, and must not be able to switch a rate off.
+    #[test]
+    fn partial_limits_keep_defaults_and_a_zero_rate_is_refused() {
+        let limits: Limits = serde_json::from_value(json!({"per_hour": 100})).expect("valid");
+        assert_eq!(
+            limits,
+            Limits {
+                per_hour: NonZeroU32::new(100).expect("nonzero literal"),
+                ..Limits::default()
+            }
+        );
+        for bad in [
+            json!({"burst_per_minute": 0}),
+            json!({"per_hour": 0}),
+            json!({"per_houre": 5}),
+        ] {
+            let parsed = serde_json::from_value::<Limits>(bad.clone());
+            assert!(parsed.is_err(), "accepted {bad}: {parsed:?}");
+        }
     }
 
     /// Sends counted by Signal-visible message, per window of `window_ms`,
