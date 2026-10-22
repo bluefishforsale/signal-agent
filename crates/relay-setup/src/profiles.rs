@@ -21,6 +21,15 @@ pub struct Profiles {
 }
 
 impl Profiles {
+    /// The registry in the platform data directory, beside the profiles it lists.
+    pub fn system() -> anyhow::Result<Self> {
+        let root = ProfilePaths::for_profile(&ProfileName::default_profile())?.root;
+        let base = root
+            .parent()
+            .with_context(|| format!("profile directory \"{}\" has no parent", root.display()))?;
+        Ok(Self::under(base.to_path_buf()))
+    }
+
     /// The same registry rooted at `base`, for tests and for relocating data.
     pub fn under(base: PathBuf) -> Self {
         Self { base }
@@ -196,5 +205,16 @@ mod tests {
         assert_ne!(a.1, b.1, "both profiles got the same store key");
         assert_ne!(a.2, b.2, "shared agent endpoint");
         assert_ne!(a.3, b.3, "shared MCP server name");
+    }
+
+    /// The agent finds its files through `ProfilePaths::for_profile`, so the
+    /// registry must resolve a profile to the same place or setup would
+    /// prepare one directory and the agent open another.
+    #[test]
+    fn the_system_registry_agrees_with_the_agent_on_where_a_profile_lives() {
+        let profile = name("bot");
+        let registry = Profiles::system().expect("system registry");
+        let agent = ProfilePaths::for_profile(&profile).expect("agent paths");
+        assert_eq!(registry.paths(&profile), agent);
     }
 }
