@@ -5044,6 +5044,8 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
+ "futures",
+ "proptest",
  "relay-core",
  "relay-signal",
  "relay-store",
