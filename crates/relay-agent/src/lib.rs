@@ -6,6 +6,7 @@ mod capture;
 pub mod endpoint;
 pub mod login;
 mod mcp;
+mod scheduler;
 mod startup;
 mod supervisor;
 
@@ -113,6 +114,11 @@ impl Agent {
             },
             registry: self.registry,
         };
+        let scheduler = tokio::spawn(scheduler::run(
+            handler.registry.clone(),
+            handler.ctx.clone(),
+            Arc::new(SystemClock),
+        ));
         let capture = tokio::spawn(capture::run(self.signal, self.store, self.webhook));
         let mut sessions = JoinSet::new();
         tokio::pin!(shutdown);
@@ -139,8 +145,10 @@ impl Agent {
         };
         sessions.shutdown().await;
         capture.abort();
+        scheduler.abort();
         // An aborted task reports cancellation; all that matters is that it ended.
         let _ = capture.await;
+        let _ = scheduler.await;
         result
     }
 }
