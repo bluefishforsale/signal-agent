@@ -33,6 +33,7 @@ impl Registry {
             .with(send::SendGroupMessage)
             .with(send::SendNoteToSelf)
             .with(send::SetTyping)
+            .with(send::SetExpirationTimer)
             .with(send::SendReadReceipt)
             .with(mutate::ReactToMessage)
             .with(mutate::EditMessage)

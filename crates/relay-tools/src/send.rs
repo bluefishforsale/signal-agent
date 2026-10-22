@@ -213,6 +213,57 @@ impl Tool for SetTyping {
     }
 }
 
+pub struct SetExpirationTimer;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetExpirationTimerInput {
+    recipient: String,
+    seconds: u32,
+}
+
+#[async_trait]
+impl Tool for SetExpirationTimer {
+    fn name(&self) -> &'static str {
+        "set_expiration_timer"
+    }
+    fn description(&self) -> &'static str {
+        "Set the disappearing-messages timer of a direct conversation, for both sides: \
+         messages sent after it vanish that many seconds after they are seen. seconds=0 turns \
+         it off. recipient is the contact's phone number or service id. Groups aren't \
+         supported: a group's timer is a group setting. Shows in the chat as a timer change \
+         and counts against the send limits."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "recipient": contact_schema("The contact whose conversation this sets"),
+                "seconds": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": u32::MAX,
+                    "description": "Seconds until a read message disappears; 0 turns the timer off",
+                },
+            },
+            "required": ["recipient", "seconds"],
+            "additionalProperties": false,
+        })
+    }
+    fn writes(&self) -> bool {
+        true
+    }
+    async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
+        let input: SetExpirationTimerInput = parse(input)?;
+        let to = Recipient::Contact(contact(ctx, &input.recipient).await?);
+        let seconds = input.seconds;
+        ctx.signal
+            .send(to, Outgoing::ExpirationTimer { seconds })
+            .await?;
+        Ok(json!({ "seconds": seconds }))
+    }
+}
+
 pub struct SendReadReceipt;
 
 #[derive(Deserialize)]
@@ -569,6 +620,28 @@ mod tests {
         );
         let stats = ctx.store.stats().await.unwrap();
         assert_eq!(stats.messages, 0, "{stats:?}");
+    }
+
+    /// The timer change must reach the named contact with the seconds asked,
+    /// 0 included, since 0 is how disappearing messages are turned off.
+    #[tokio::test]
+    async fn set_expiration_timer_sends_the_seconds_to_the_contact_and_zero_turns_it_off() {
+        let (ctx, signal) = ctx(AccessMode::Full, ProfileKind::Linked);
+        let registry = Registry::standard();
+        for seconds in [3600, 0] {
+            let input = json!({"recipient": sid(2).to_string(), "seconds": seconds});
+            registry
+                .call(&ctx, "set_expiration_timer", input)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            signal.sent(),
+            [3600, 0].map(|seconds| (
+                Recipient::Contact(sid(2)),
+                Outgoing::ExpirationTimer { seconds }
+            ))
+        );
     }
 
     /// One receipt covers every timestamp, each naming the sender's message,
