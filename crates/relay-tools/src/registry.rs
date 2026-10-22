@@ -5,7 +5,9 @@ use std::sync::Arc;
 use relay_core::prelude::*;
 use serde_json::Value;
 
-use crate::{Limiter, Tool, ToolContext, ToolError, directory, limits, local, mutate, read, send};
+use crate::{
+    Limiter, Tool, ToolContext, ToolError, directory, limits, local, mutate, pins, read, send,
+};
 
 /// The set of tools a profile serves.
 #[derive(Clone, Default)]
@@ -43,6 +45,8 @@ impl Registry {
             .with(local::MarkAsUnread)
             .with(local::ClearLocalStore)
             .with(local::PruneStore)
+            .with(pins::PinMessage)
+            .with(pins::UnpinMessage)
     }
 
     /// Applies account-safety limits to every send a tool makes.

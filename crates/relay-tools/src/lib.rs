@@ -7,6 +7,7 @@ mod input;
 mod limits;
 mod local;
 mod mutate;
+mod pins;
 mod read;
 mod registry;
 mod send;
