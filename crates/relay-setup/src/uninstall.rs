@@ -106,22 +106,23 @@ pub struct Machine<'a> {
 }
 
 /// Uninstalls everything this user installed, every profile at once, on this
-/// machine. `agent` is the binary the Claude entries launch and
-/// `remove_login_item` removes the login item that starts it.
+/// machine. `agent` is the binary the Claude entries launch,
+/// `remove_login_item` removes the login item that starts it, and `secrets`
+/// holds the keys.
 pub fn uninstall(
     agent: &Path,
     remove_login_item: impl Fn() -> anyhow::Result<()>,
+    secrets: &dyn SecretStore,
     delete_data: bool,
 ) -> anyhow::Result<Vec<StepOutcome>> {
     let platform = Platform::current();
     let footprint = Footprint::new(platform, Roots::system()?);
     let profiles = installed_profiles(&footprint)?;
     let clients = Clients::system();
-    let secrets = relay_secrets::platform_store()?;
     let me = std::process::id();
     let machine = Machine {
         clients: &clients,
-        secrets: secrets.as_ref(),
+        secrets,
         agent,
         remove_login_item: Box::new(remove_login_item),
         stop_agents: Box::new(move || stop_agents(&SystemRunner, platform, me)),

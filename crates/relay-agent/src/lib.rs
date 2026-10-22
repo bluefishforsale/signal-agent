@@ -11,10 +11,11 @@ mod scheduler;
 mod startup;
 mod supervisor;
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, bail};
 use relay_core::prelude::*;
+use relay_secrets::{SecretStore, StoreKey};
 use relay_signal::{PresageSignal, SendRoots, SignalBackend};
 use relay_store::{MessageStore, SqlCipherStore};
 use relay_tools::{
@@ -164,20 +165,61 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
     // device state before discovering it should exit.
     let name = endpoint::name(&config.profile, &config.paths)?;
     let listener = endpoint::Listener::bind(&name).await?;
+    let _stores = claim_stores(&config)?;
+    let mut stop = std::pin::pin!(stop_or_setup(&config));
     let profile = config.profile.clone();
     // Off the critical path: it shells out to Claude's CLIs, and the agent must
     // start capturing whether or not that works.
     tokio::task::spawn_blocking(move || startup::reregister_claude_entries(&profile));
-    let secrets = relay_secrets::platform_store()?;
-    let (signal, store) = open_backend_and_store(&config, &*secrets).await?;
+    let secrets = Arc::from(relay_secrets::platform_store()?);
+    let (signal, store) = tokio::select! {
+        opened = open_backend_and_store(&config, secrets) => opened?,
+        () = &mut stop => return Ok(()),
+    };
     let settings = configured(&config.paths);
     let registry = registry(&config.paths, settings.limits, Arc::new(SystemClock));
     let mut agent =
         Agent::new(signal, store, registry, config.access).with_send_roots(settings.send_roots);
     if let Some(url) = settings.webhook {
-        agent = agent.with_webhook(config.profile, url);
+        agent = agent.with_webhook(config.profile.clone(), url);
     }
-    agent.serve(listener, stop_requested()).await
+    agent.serve(listener, stop).await
+}
+
+/// Takes the profile's stores for this agent, unless setup is running on the
+/// profile or another process already has them.
+fn claim_stores(config: &AgentConfig) -> anyhow::Result<relay_setup::StoreLock> {
+    let profile = &config.profile;
+    if relay_setup::setup_running(&config.paths) {
+        bail!("setup is running for profile \"{profile}\"; its agent starts once setup finishes");
+    }
+    relay_setup::StoreLock::try_acquire(&config.paths)?
+        .with_context(|| format!("another process has profile \"{profile}\"'s stores open"))
+}
+
+/// How often a running agent checks whether setup wants its profile.
+const SETUP_CHECK: Duration = Duration::from_secs(2);
+
+/// Resolves when the OS asks the agent to stop, or setup starts on its
+/// profile and needs the stores to itself.
+async fn stop_or_setup(config: &AgentConfig) {
+    tokio::select! {
+        () = stop_requested() => {}
+        () = setup_started(config.paths.clone()) => tracing::info!(
+            "setup started for profile \"{}\"; stopping so it has the stores to itself",
+            config.profile
+        ),
+    }
+}
+
+/// Resolves once setup is running on the profile at `paths`.
+async fn setup_started(paths: ProfilePaths) {
+    loop {
+        tokio::time::sleep(SETUP_CHECK).await;
+        if relay_setup::setup_running(&paths) {
+            return;
+        }
+    }
 }
 
 /// The shipped tools under `limits`, with what they've spent kept in the
@@ -235,19 +277,57 @@ async fn stop_requested() {
     }
 }
 
+const FIRST_KEY_RETRY: Duration = Duration::from_secs(5);
+const LONGEST_KEY_RETRY: Duration = Duration::from_secs(5 * 60);
+
+/// The profile's key, waiting out a secret store that can't be read yet: a
+/// keyring still locked after login, or a prompt nobody has answered.
+// NOTE: exiting instead would crash-loop under the supervisor and log the
+// same failure every few seconds. A key that is plainly missing still fails
+// at once, since waiting can't bring it back.
+async fn wait_for_key(
+    profile: &ProfileName,
+    secrets: Arc<dyn SecretStore>,
+) -> anyhow::Result<StoreKey> {
+    let mut wait = FIRST_KEY_RETRY;
+    let mut waited = false;
+    loop {
+        let (store, name) = (secrets.clone(), profile.clone());
+        // A Keychain or Secret Service prompt blocks its thread until answered.
+        let read = tokio::task::spawn_blocking(move || store.get(&name))
+            .await
+            .context("the key read stopped")?;
+        match read {
+            Ok(Some(key)) => {
+                if waited {
+                    tracing::info!("profile \"{profile}\"'s database key is readable now");
+                }
+                return Ok(key);
+            }
+            Ok(None) => bail!("profile \"{profile}\" has no database key; run setup for it again"),
+            Err(e) if !waited => {
+                tracing::warn!(
+                    "unable to read profile \"{profile}\"'s database key yet ({e:#}); \
+                     waiting for the login keyring to unlock, retrying up to every {} minutes",
+                    LONGEST_KEY_RETRY.as_secs() / 60
+                );
+                waited = true;
+            }
+            Err(_) => {}
+        }
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(LONGEST_KEY_RETRY);
+    }
+}
+
 /// The profile's Signal account and message history, both opened with the key
 /// setup saved for it.
 async fn open_backend_and_store(
     config: &AgentConfig,
-    secrets: &dyn relay_secrets::SecretStore,
+    secrets: Arc<dyn SecretStore>,
 ) -> anyhow::Result<(Arc<dyn SignalBackend>, Arc<dyn MessageStore>)> {
     let profile = &config.profile;
-    let Some(key) = secrets
-        .get(profile)
-        .with_context(|| format!("unable to read profile \"{profile}\"'s database key"))?
-    else {
-        bail!("profile \"{profile}\" has no database key; run setup for it again");
-    };
+    let key = wait_for_key(profile, secrets).await?;
     let paths = &config.paths;
     // NOTE: presage creates a missing store on open. One made here would hold
     // no account, yet look to the next start like a profile that has one.
@@ -284,6 +364,18 @@ pub(crate) mod tests {
         } else {
             dir.join("p").join("agent.sock").display().to_string()
         }
+    }
+
+    /// Whether `check` holds within a second. A lock let go of can stay held
+    /// for an instant longer: a process a parallel test is spawning shares
+    /// its descriptor until it execs.
+    fn soon(check: impl Fn() -> bool) -> bool {
+        (0..100).any(|_| {
+            check() || {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                false
+            }
+        })
     }
 
     pub(crate) fn fake_signal() -> Arc<FakeSignal> {
@@ -326,7 +418,7 @@ pub(crate) mod tests {
         let config = profile_paths(tmp.path());
         std::fs::create_dir_all(&config.paths.root).expect("profile dir");
         let secrets = relay_secrets::MemorySecretStore::default();
-        let Err(e) = open_backend_and_store(&config, &secrets).await else {
+        let Err(e) = open_backend_and_store(&config, Arc::new(secrets)).await else {
             panic!("opened a profile that has no key");
         };
         let message = format!("{e:#}");
@@ -337,6 +429,113 @@ pub(crate) mod tests {
         assert!(
             !config.paths.signal_store.exists() && !config.paths.message_store.exists(),
             "a store was created without a key"
+        );
+    }
+
+    /// A keyring that refuses reads a few times (locked at login, a prompt
+    /// nobody has answered yet), then hands the key over.
+    struct LockedAtFirst {
+        refusals: std::sync::atomic::AtomicU32,
+        reads: std::sync::Mutex<Vec<tokio::time::Instant>>,
+        key: relay_secrets::StoreKey,
+    }
+
+    impl relay_secrets::SecretStore for LockedAtFirst {
+        fn get(&self, _: &ProfileName) -> anyhow::Result<Option<relay_secrets::StoreKey>> {
+            self.reads
+                .lock()
+                .expect("reads")
+                .push(tokio::time::Instant::now());
+            let left = self.refusals.load(std::sync::atomic::Ordering::SeqCst);
+            if left == 0 {
+                return Ok(Some(self.key.clone()));
+            }
+            self.refusals
+                .store(left - 1, std::sync::atomic::Ordering::SeqCst);
+            bail!("the Secret Service collection is locked")
+        }
+        fn set(&self, _: &ProfileName, _: &relay_secrets::StoreKey) -> anyhow::Result<()> {
+            bail!("read only")
+        }
+        fn delete(&self, _: &ProfileName) -> anyhow::Result<()> {
+            bail!("read only")
+        }
+    }
+
+    /// A keyring locked at login must not crash-loop the agent: it waits,
+    /// longer each time up to a cap, and starts once the key reads.
+    #[tokio::test(start_paused = true)]
+    async fn a_locked_keyring_is_waited_out_with_growing_bounded_retries() {
+        let key = relay_secrets::StoreKey::generate().expect("key");
+        let locked = Arc::new(LockedAtFirst {
+            refusals: 8.into(),
+            reads: Default::default(),
+            key: key.clone(),
+        });
+        let profile = ProfileName::new("personal").expect("valid profile");
+        let got = wait_for_key(&profile, locked.clone()).await.expect("key");
+        assert_eq!(got, key);
+        let reads = locked.reads.lock().expect("reads").clone();
+        let waits: Vec<_> = reads.windows(2).map(|w| w[1] - w[0]).collect();
+        assert_eq!(waits.len(), 8, "{waits:?}");
+        assert!(
+            waits.windows(2).all(|w| w[1] >= w[0]),
+            "a wait shrank: {waits:?}"
+        );
+        assert!(
+            waits
+                .first()
+                .is_some_and(|w| *w >= std::time::Duration::from_secs(5)),
+            "retried without waiting: {waits:?}"
+        );
+        assert!(
+            waits
+                .iter()
+                .all(|w| *w <= std::time::Duration::from_secs(5 * 60)),
+            "waited past the cap: {waits:?}"
+        );
+    }
+
+    /// An agent must let go of its profile once setup starts there, and not
+    /// before, so a re-link never shares the Signal store with it.
+    #[tokio::test(start_paused = true)]
+    async fn the_agent_stops_once_setup_starts_on_its_profile_and_not_before() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = profile_paths(tmp.path());
+        let mut started = Box::pin(setup_started(config.paths.clone()));
+        let early = tokio::time::timeout(std::time::Duration::from_secs(60), &mut started).await;
+        assert!(early.is_err(), "stopped with no setup running");
+        let _setup = relay_setup::SetupLock::try_acquire(&config.paths)
+            .expect("lock")
+            .expect("free");
+        tokio::time::timeout(std::time::Duration::from_secs(10), started)
+            .await
+            .expect("still running after setup started");
+    }
+
+    /// An agent started while setup or another agent has the profile's
+    /// stores must stop before opening them, saying why.
+    #[test]
+    fn an_agent_never_opens_stores_another_process_holds() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = profile_paths(tmp.path());
+        let other = claim_stores(&config).expect("first claim");
+        let Err(e) = claim_stores(&config) else {
+            panic!("two agents hold one profile's stores");
+        };
+        assert!(format!("{e:#}").contains("\"personal\""), "{e:#}");
+        drop(other);
+        let setup = relay_setup::SetupLock::try_acquire(&config.paths)
+            .expect("lock")
+            .expect("free");
+        let Err(e) = claim_stores(&config) else {
+            panic!("claimed the stores while setup runs");
+        };
+        assert!(format!("{e:#}").contains("setup"), "{e:#}");
+        drop(setup);
+        assert!(
+            soon(|| claim_stores(&config).is_ok()),
+            "not free once setup is done"
         );
     }
 
@@ -351,7 +550,7 @@ pub(crate) mod tests {
         let secrets = relay_secrets::MemorySecretStore::default();
         let key = relay_secrets::StoreKey::generate().expect("key");
         secrets.set(&config.profile, &key).expect("save key");
-        let Err(e) = open_backend_and_store(&config, &secrets).await else {
+        let Err(e) = open_backend_and_store(&config, Arc::new(secrets)).await else {
             panic!("opened a profile with no Signal account");
         };
         let message = format!("{e:#}");
@@ -429,7 +628,7 @@ pub(crate) mod tests {
         secrets.set(&config.profile, &key).expect("save key");
         linked_signal_store(&config.paths.signal_store, &key).await;
 
-        let (signal, store) = open_backend_and_store(&config, &secrets)
+        let (signal, store) = open_backend_and_store(&config, Arc::new(secrets))
             .await
             .expect("opens");
         let account = signal.account().await.expect("account");
@@ -472,7 +671,7 @@ pub(crate) mod tests {
             let secrets = relay_secrets::MemorySecretStore::default();
             secrets.set(&config.profile, &saved).expect("save key");
 
-            let opened = open_backend_and_store(&config, &secrets).await;
+            let opened = open_backend_and_store(&config, Arc::new(secrets)).await;
             let case = if messages_key.is_none() {
                 "signal"
             } else {

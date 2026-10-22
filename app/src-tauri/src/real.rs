@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use relay_core::prelude::*;
 use relay_secrets::StoreKey;
 use relay_setup::{
+    AgentKeys,
     claude::{Clients, ServerEntry},
     driver::{Driver, HistorySkip, LoginItem, OpenProvisioner, Services},
     history::{LinkAndSync, ProfileStore, SignalDesktop},
@@ -41,20 +42,18 @@ impl Setup for Driver {
 
 /// Setup of `profile`, starting at `start`.
 pub fn setup(start: SetupState, profile: ProfileName) -> anyhow::Result<Box<dyn Setup>> {
-    let server = ServerEntry::for_profile(&profile, &agent()?, ["mcp", "--profile", &profile])?;
+    let agent = agent()?;
+    let server = ServerEntry::for_profile(&profile, &agent, ["mcp", "--profile", &profile])?;
     let paths = ProfilePaths::for_profile(&profile)?;
-    let store = || -> anyhow::Result<ProfileStore> {
-        Ok(ProfileStore::new(
-            &profile,
-            &paths,
-            relay_secrets::platform_store()?,
-        ))
-    };
+    // NOTE: every key read goes through the bundled signal-agent, never the
+    // app itself, so the Keychain item keeps trusting the program the login
+    // item runs (#112).
+    let store = || ProfileStore::new(&profile, &paths, Box::new(AgentKeys::new(agent.clone())));
     let services = Services {
         signal: Box::new(Presage),
-        secrets: relay_secrets::platform_store()?,
-        history: Box::new(LinkAndSync::new(store()?)),
-        desktop: Box::new(SignalDesktop::usual_place(store()?)),
+        secrets: Box::new(AgentKeys::new(agent.clone())),
+        history: Box::new(LinkAndSync::new(store())),
+        desktop: Box::new(SignalDesktop::usual_place(store())),
         login: Box::new(AgentAtLogin),
         clients: Clients::system(),
     };
@@ -69,20 +68,13 @@ pub fn remove(profile: &ProfileName, delete_data: bool) -> anyhow::Result<Vec<St
     let agent = agent()?;
     let profiles = Profiles::system()?;
     let clients = Clients::system();
-    let secrets = relay_secrets::platform_store()?;
+    let secrets = AgentKeys::new(agent.clone());
     let entry = ServerEntry::for_profile(profile, &agent, ["mcp", "--profile", profile])?;
     let paths = profiles.paths(profile);
     let stop = Step::new(format!("Stop the agent for \"{profile}\""), || {
         agent_stopped(profile, &paths, AGENT_STOP_WAIT)
     });
-    let steps = profiles.removal_steps(
-        profile,
-        &clients,
-        &entry,
-        stop,
-        secrets.as_ref(),
-        delete_data,
-    )?;
+    let steps = profiles.removal_steps(profile, &clients, &entry, stop, &secrets, delete_data)?;
     Ok(run_steps(steps))
 }
 
@@ -113,6 +105,12 @@ fn agent_stopped(
         std::thread::sleep(Duration::from_millis(200));
     }
     Ok(())
+}
+
+/// The access choice `profile`'s last setup saved, if it finished.
+pub fn saved_access(profile: &ProfileName) -> Option<AccessMode> {
+    let paths = ProfilePaths::for_profile(profile).ok()?;
+    paths.load_access().ok()
 }
 
 /// The `signal-agent` binary shipped beside the app, which Claude launches.

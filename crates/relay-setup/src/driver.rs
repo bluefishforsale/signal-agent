@@ -7,6 +7,7 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{Context, bail};
@@ -21,7 +22,7 @@ use relay_tools::{Clock, Limits, Settings, SystemClock};
 use tokio::sync::watch;
 
 use crate::{
-    Command, HistoryGap, Profiles, SetupEvent, SetupState,
+    Command, HistoryGap, Profiles, SetupEvent, SetupLock, SetupState, StoreLock,
     claude::{Clients, ServerEntry},
     transition,
 };
@@ -121,7 +122,15 @@ pub struct Driver {
     skip: HistorySkip,
     /// Whether this registration attempt already asked for a call.
     called: bool,
+    /// Keeps every agent off the profile from the store's first open until
+    /// clients connect, and lets go if setup is abandoned.
+    setup_lock: Option<SetupLock>,
+    /// The profile's stores, once its agent has let go of them.
+    store_lock: Option<StoreLock>,
 }
+
+/// How long a running agent gets to close its stores once setup asks.
+const AGENT_LET_GO: Duration = Duration::from_secs(30);
 
 impl Driver {
     /// Setup for `profile`, stored under `paths`, registering `server` with
@@ -144,6 +153,8 @@ impl Driver {
             called: false,
             clock: Arc::new(SystemClock),
             skip: HistorySkip(Arc::new(watch::Sender::new(Import::Idle))),
+            setup_lock: None,
+            store_lock: None,
         }
     }
 
@@ -335,6 +346,8 @@ impl Driver {
             }
             Command::ConnectClients => {
                 self.close_signal_store();
+                self.store_lock = None;
+                self.setup_lock = None;
                 self.services.login.register(&self.profile)?;
                 SetupEvent::ClientsConnected {
                     clients: self.services.clients.reregister_missing(&self.server),
@@ -356,7 +369,8 @@ impl Driver {
             Some(provisioner) => provisioner,
             None => {
                 self.list_profile()?;
-                let key = self.store_key()?;
+                self.hold_profile().await?;
+                let key = self.services.secrets.ensure(&self.profile)?;
                 fs::create_dir_all(&self.paths.root).with_context(|| {
                     format!("unable to create \"{}\"", self.paths.root.display())
                 })?;
@@ -367,6 +381,34 @@ impl Driver {
             }
         };
         Ok(&**self.provisioner.insert(provisioner))
+    }
+
+    /// Takes the profile from its agent, if one runs, and keeps every agent
+    /// off it until clients connect.
+    async fn hold_profile(&mut self) -> anyhow::Result<()> {
+        let profile = &self.profile;
+        if self.setup_lock.is_none() {
+            let lock = SetupLock::try_acquire(&self.paths)?.with_context(|| {
+                format!("setup is already running for \"{profile}\" in another window")
+            })?;
+            self.setup_lock = Some(lock);
+        }
+        let deadline = tokio::time::Instant::now() + AGENT_LET_GO;
+        while self.store_lock.is_none() {
+            self.store_lock = StoreLock::try_acquire(&self.paths)?;
+            if self.store_lock.is_some() {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!(
+                    "the background agent for \"{profile}\" didn't let go of its data within \
+                     {} seconds; try again, or restart this computer if it keeps happening",
+                    AGENT_LET_GO.as_secs()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        Ok(())
     }
 
     /// Refuses a link or registration too soon after the last one, before
@@ -410,18 +452,6 @@ impl Driver {
             .parent()
             .with_context(|| format!("profile directory \"{}\" has no parent", root.display()))?;
         Profiles::under(base.to_path_buf()).ensure(&self.profile)
-    }
-
-    /// The profile's saved key, or a new one saved before anything uses it:
-    /// a store encrypted with a key that was never saved is lost.
-    fn store_key(&self) -> anyhow::Result<StoreKey> {
-        let secrets = &self.services.secrets;
-        if let Some(key) = secrets.get(&self.profile)? {
-            return Ok(key);
-        }
-        let key = StoreKey::generate()?;
-        secrets.set(&self.profile, &key)?;
-        Ok(key)
     }
 }
 
@@ -504,6 +534,9 @@ mod tests {
 
     const ARCHIVE: &str = HISTORY_ARCHIVE_FILE;
 
+    /// At each store open and agent start: (setup running, stores free).
+    type HeldLog = Vec<(&'static str, bool, bool)>;
+
     /// The fakes' shared state: what Signal and the OS will do, and everything
     /// every fake did, in order. Clones share it, so two setup runs can see one
     /// machine.
@@ -517,6 +550,7 @@ mod tests {
         desktop: Arc<Mutex<Option<Vec<u64>>>>,
         failures: Arc<Mutex<Vec<&'static str>>>,
         opened_with: Arc<Mutex<Vec<StoreKey>>>,
+        profile_held: Arc<Mutex<HeldLog>>,
         secrets: Arc<MemorySecretStore>,
         clock: Arc<FakeClock>,
     }
@@ -551,6 +585,7 @@ mod tests {
                 desktop: Arc::default(),
                 failures: Arc::default(),
                 opened_with: Arc::default(),
+                profile_held: Arc::default(),
                 secrets: Arc::default(),
                 clock: Arc::new(FakeClock {
                     now: AtomicU64::new(1_700_000_000_000),
@@ -644,6 +679,18 @@ mod tests {
             self.log.lock().expect("log").clone()
         }
 
+        fn note_profile_held(&self, at: &'static str) {
+            let paths = self.paths();
+            let free = crate::StoreLock::try_acquire(&paths)
+                .expect("store lock")
+                .is_some();
+            let running = crate::setup_running(&paths);
+            self.profile_held
+                .lock()
+                .expect("held")
+                .push((at, running, free));
+        }
+
         fn opened_with(&self) -> Vec<StoreKey> {
             self.opened_with.lock().expect("keys").clone()
         }
@@ -725,6 +772,7 @@ mod tests {
         async fn open(&self, path: &Path, key: &StoreKey) -> anyhow::Result<Box<dyn Provisioner>> {
             self.push(format!("open {}", path.display()));
             self.opened_with.lock().expect("keys").push(key.clone());
+            self.note_profile_held("open");
             Ok(Box::new(FakeProvisioner(self.clone())))
         }
     }
@@ -791,6 +839,7 @@ mod tests {
 
     impl LoginItem for World {
         fn register(&self, profile: &ProfileName) -> anyhow::Result<()> {
+            self.note_profile_held("start agent");
             self.push(format!(
                 "start agent {profile}, access {}",
                 self.saved_access()
@@ -1261,6 +1310,72 @@ mod tests {
             !world.paths().root.join(ARCHIVE).exists(),
             "a failed archive was left behind"
         );
+    }
+
+    /// Setup run again on a set-up profile must wait for its agent to let go
+    /// before opening the Signal store, keep every agent off while it works,
+    /// and hand the profile back before the agent is started again.
+    #[tokio::test]
+    async fn setup_has_the_profile_to_itself_from_store_open_until_the_agent_starts() {
+        let world = World::new().link(vec![linked()]);
+        let paths = world.paths();
+        paths
+            .save_access(AccessMode::Full)
+            .expect("an earlier setup");
+        let agent = crate::StoreLock::try_acquire(&paths)
+            .expect("lock")
+            .expect("free");
+        // The agent lets go once it sees setup running, or gives up waiting.
+        let yielding = std::thread::spawn(move || {
+            for _ in 0..500 {
+                if crate::setup_running(&paths) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            drop(agent);
+        });
+        let mut h = Harness::new(&world);
+        h.send(LINK).await;
+        h.send(SetupEvent::AccessChosen {
+            access: AccessMode::Full,
+        })
+        .await;
+        yielding.join().expect("agent");
+        assert_eq!(
+            *world.profile_held.lock().expect("held"),
+            [("open", true, false), ("start agent", false, true)]
+        );
+    }
+
+    /// An agent that won't let go must fail setup with a retry, never open
+    /// the store under it, and closing setup must give the profile back.
+    #[tokio::test(start_paused = true)]
+    async fn an_agent_that_never_lets_go_fails_setup_without_opening_the_store() {
+        let world = World::new().link(vec![linked()]);
+        let paths = world.paths();
+        let _agent = crate::StoreLock::try_acquire(&paths)
+            .expect("lock")
+            .expect("free");
+        let mut h = Harness::new(&world);
+        let state = h.send(LINK).await;
+        assert_failed(&state, "Linking");
+        assert!(
+            world.log().iter().all(|e| !e.starts_with("open ")),
+            "opened the store under a running agent: {:?}",
+            world.log()
+        );
+        assert!(crate::setup_running(&paths), "setup let go before quitting");
+        drop(h);
+        // A parallel test's spawn can share the lock's descriptor for an
+        // instant after it is let go.
+        let released = (0..100).any(|_| {
+            !crate::setup_running(&paths) || {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                false
+            }
+        });
+        assert!(released, "a closed setup kept the profile");
     }
 
     /// The login item runs only the profiles in the registry, so a profile

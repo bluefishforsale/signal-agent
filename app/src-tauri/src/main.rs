@@ -44,14 +44,14 @@ mod placement {
 /// scripted walk-through in development builds.
 #[cfg(not(feature = "mock-driver"))]
 fn setup(profile: ProfileName) -> Box<dyn Setup> {
-    let start = start_state();
+    let start = start_state(&profile);
     real::setup(start.clone(), profile)
         .unwrap_or_else(|e| Box::new(Scripted::new(start, unavailable(e))))
 }
 
 #[cfg(feature = "mock-driver")]
-fn setup(_profile: ProfileName) -> Box<dyn Setup> {
-    Box::new(Scripted::new(start_state(), mock::script))
+fn setup(profile: ProfileName) -> Box<dyn Setup> {
+    Box::new(Scripted::new(start_state(&profile), mock::script))
 }
 
 /// The accounts on this computer, or in development builds a scratch list
@@ -82,7 +82,9 @@ fn unavailable(why: anyhow::Error) -> impl Fn(&Command) -> Vec<(Duration, SetupE
     }
 }
 
-fn start_state() -> SetupState {
+/// Where `profile`'s setup opens: "already set up" once it has finished.
+#[cfg_attr(feature = "mock-driver", allow(unused_variables))]
+fn start_state(profile: &ProfileName) -> SetupState {
     // Lets a development build open on any screen, for screenshots.
     #[cfg(feature = "mock-driver")]
     if let Some(state) = std::env::var("RELAY_SETUP_STATE")
@@ -91,7 +93,10 @@ fn start_state() -> SetupState {
     {
         return state;
     }
-    SetupState::start(&computer_name())
+    #[cfg(feature = "mock-driver")]
+    return SetupState::start(&computer_name());
+    #[cfg(not(feature = "mock-driver"))]
+    SetupState::for_profile(&computer_name(), real::saved_access(profile))
 }
 
 /// The name the user gave this computer, which the phone shows for the link.
@@ -245,7 +250,13 @@ async fn confirmed_deleting_data(app: &AppHandle, warning: &str) -> bool {
 async fn run_uninstall(delete_data: bool) -> anyhow::Result<Vec<StepOutcome>> {
     let agent = real::agent()?;
     tauri::async_runtime::spawn_blocking(move || {
-        relay_setup::uninstall(&agent, relay_agent::login::unregister, delete_data)
+        let secrets = relay_setup::AgentKeys::new(agent.clone());
+        relay_setup::uninstall(
+            &agent,
+            relay_agent::login::unregister,
+            &secrets,
+            delete_data,
+        )
     })
     .await?
 }

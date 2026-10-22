@@ -12,7 +12,7 @@ use relay_core::ProfileName;
 /// The supervisor's task. Per-profile tasks from before it were
 /// `signal-agent-<profile>`.
 #[cfg(windows)]
-const TASK_NAME: &str = "signal-agent";
+pub(super) const TASK_NAME: &str = "signal-agent";
 
 #[cfg(windows)]
 pub(super) fn register(exe: &Path, profiles: &[ProfileName]) -> anyhow::Result<()> {
