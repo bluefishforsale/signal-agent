@@ -279,34 +279,43 @@ fn signal_wait_ms(limited: &RateLimited) -> u64 {
         .map_or(5 * MINUTE_MS, |wait| wait.as_millis() as u64)
 }
 
+// The provisioning file holds the earliest time of the next attempt, in ms.
+
 /// Records an attempt to link or register at `now_ms` in `path`, or refuses
 /// it when the previous attempt was within the backoff. Call it before every
 /// `Provisioner::link` and `Provisioner::request_code`.
 pub fn begin_provisioning(path: &Path, limits: &Limits, now_ms: u64) -> anyhow::Result<()> {
-    let last = match std::fs::read(path) {
-        Ok(bytes) => Some(
-            serde_json::from_slice::<u64>(&bytes)
-                .with_context(|| format!("unreadable provisioning file {}", path.display()))?,
-        ),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(e).with_context(|| format!("can't read {}", path.display())),
-    };
     let minutes = limits.provisioning_backoff_minutes;
-    if let Some(retry_after) = provisioning_wait(last, now_ms, minutes) {
+    let next = next_provisioning(path)?;
+    if let Some(wait) = next.checked_sub(now_ms).filter(|w| *w > 0) {
         return Err(LimitExceeded {
-            limit: format!("one link or registration attempt every {minutes} minutes"),
-            retry_after,
+            limit: format!(
+                "one link or registration attempt every {minutes} minutes, or longer when \
+                 Signal asks"
+            ),
+            retry_after: Duration::from_millis(wait),
         }
         .into());
     }
-    write_atomically(path, &serde_json::to_vec(&now_ms)?)
+    let next = now_ms + u64::from(minutes.get()) * MINUTE_MS;
+    write_atomically(path, &serde_json::to_vec(&next)?)
 }
 
-/// How long until another attempt is allowed after one at `last_ms`.
-fn provisioning_wait(last_ms: Option<u64>, now_ms: u64, minutes: NonZeroU32) -> Option<Duration> {
-    let until = last_ms? + u64::from(minutes.get()) * MINUTE_MS;
-    let wait = until.checked_sub(now_ms).filter(|w| *w > 0)?;
-    Some(Duration::from_millis(wait))
+/// Holds off the next link or registration attempt in `path` until Signal's
+/// `limited` wait from `now_ms` has passed. Call it when `Provisioner::link`,
+/// `request_code` or `verify_code` fails as rate-limited.
+pub fn defer_provisioning(path: &Path, limited: &RateLimited, now_ms: u64) -> anyhow::Result<()> {
+    let next = next_provisioning(path)?.max(now_ms + signal_wait_ms(limited));
+    write_atomically(path, &serde_json::to_vec(&next)?)
+}
+
+fn next_provisioning(path: &Path) -> anyhow::Result<u64> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .with_context(|| format!("unreadable provisioning file {}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(e).with_context(|| format!("can't read {}", path.display())),
+    }
 }
 
 /// The saved state at `path`, or a fresh one if there's none yet.
