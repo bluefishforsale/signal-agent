@@ -11,41 +11,11 @@ use serde_json::{Value, json};
 
 use crate::{
     Tool, ToolContext, ToolError,
-    input::{contact, contact_schema, non_blank, parse, recipient, recipient_schema},
+    input::{
+        Timestamp, contact, contact_schema, group, group_schema, non_blank, parse, recipient,
+        recipient_schema,
+    },
 };
-
-/// A message's send timestamp in epoch ms, as Signal uses it to name the message.
-#[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(try_from = "u64")]
-struct Timestamp(u64);
-
-impl Timestamp {
-    // JavaScript's largest safe integer, so every MCP client can send it exactly.
-    const MAX: u64 = (1 << 53) - 1;
-
-    fn schema(description: &str) -> Value {
-        json!({
-            "type": "integer",
-            "minimum": 1,
-            "maximum": Self::MAX,
-            "description": format!("{description}: its send timestamp in epoch milliseconds, \
-                                    as get_conversation returns it"),
-        })
-    }
-}
-
-impl TryFrom<u64> for Timestamp {
-    type Error = String;
-    fn try_from(n: u64) -> Result<Self, String> {
-        match n {
-            1..=Self::MAX => Ok(Self(n)),
-            _ => Err(format!(
-                "target_timestamp must be 1 to {}, got {n}",
-                Self::MAX
-            )),
-        }
-    }
-}
 
 pub struct ReactToMessage;
 
@@ -101,7 +71,7 @@ impl Tool for ReactToMessage {
         let to = recipient(ctx, &input.recipient).await?;
         let target = MessageId {
             author: contact(ctx, &input.target_author).await?,
-            sent_at_ms: input.target_timestamp.0,
+            sent_at_ms: input.target_timestamp.ms(),
         };
         check_target(ctx, to, target).await?;
         let remove = input.remove;
@@ -170,7 +140,7 @@ impl Tool for EditMessage {
         let me = ctx.signal.account().await?.service_id;
         let target = MessageId {
             author: me,
-            sent_at_ms: input.target_timestamp.0,
+            sent_at_ms: input.target_timestamp.ms(),
         };
         check_target(ctx, to, target).await?;
         let edit = Outgoing::Edit {
@@ -223,7 +193,8 @@ impl Tool for DeleteMessage {
     }
     async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
         let input: DeleteInput = parse(input)?;
-        delete_own(ctx, &input.recipient, input.target_timestamp).await
+        let to = recipient(ctx, &input.recipient).await?;
+        delete_own(ctx, to, input.target_timestamp).await
     }
 }
 
@@ -243,8 +214,7 @@ impl Tool for DeleteGroupMessage {
     }
     fn description(&self) -> &'static str {
         "Delete a message you sent to a group for all members (Signal 5.0+ clients). \
-         group_id is the group, as list_conversations returns it (a contact's id works too, \
-         and acts like delete_message); target_timestamp names your message, which must be stored \
+         group_id is the group, as list_conversations returns it; target_timestamp names your message, which must be stored \
          locally in that group. Only your own messages can be deleted. Irreversible. Sends to Signal, then flags the stored copy \
          deleted."
     }
@@ -252,7 +222,7 @@ impl Tool for DeleteGroupMessage {
         json!({
             "type": "object",
             "properties": {
-                "group_id": recipient_schema(),
+                "group_id": group_schema(),
                 "target_timestamp": Timestamp::schema("Your message to delete"),
             },
             "required": ["group_id", "target_timestamp"],
@@ -264,22 +234,22 @@ impl Tool for DeleteGroupMessage {
     }
     async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
         let input: DeleteGroupInput = parse(input)?;
-        delete_own(ctx, &input.group_id, input.target_timestamp).await
+        let to = Recipient::Group(group(&input.group_id)?);
+        delete_own(ctx, to, input.target_timestamp).await
     }
 }
 
-/// Deletes this account's own message in `conversation` for everyone.
+/// Deletes this account's own message in `to` for everyone.
 async fn delete_own(
     ctx: &ToolContext,
-    conversation: &str,
+    to: Recipient,
     sent_at: Timestamp,
 ) -> Result<Value, ToolError> {
-    let to = recipient(ctx, conversation).await?;
     // NOTE: as in edit_message, the target is always this account's own message.
     let me = ctx.signal.account().await?.service_id;
     let target = MessageId {
         author: me,
-        sent_at_ms: sent_at.0,
+        sent_at_ms: sent_at.ms(),
     };
     check_target(ctx, to, target).await?;
     ctx.signal.send(to, Outgoing::Delete { target }).await?;
