@@ -179,7 +179,8 @@ struct Stored {
     conversation: Recipient,
 }
 
-/// Every attachment in stored history, newest message first.
+/// Every attachment in stored history, newest message first, leaving out
+/// messages deleted for everyone.
 // NOTE: scans the whole store, since MessageStore has no attachment index.
 // Fine at personal-history sizes; an index belongs in the store if it isn't.
 async fn stored_attachments(ctx: &ToolContext) -> anyhow::Result<Vec<Stored>> {
@@ -187,6 +188,7 @@ async fn stored_attachments(ctx: &ToolContext) -> anyhow::Result<Vec<Stored>> {
     messages.reverse();
     Ok(messages
         .into_iter()
+        .filter(|m| !m.deleted)
         .flat_map(|m| {
             m.attachments.into_iter().map(move |attachment| Stored {
                 attachment,
@@ -364,5 +366,30 @@ mod tests {
                 "conversation": {"kind": "contact", "id": sid(2).to_string()},
             }),
         );
+    }
+
+    /// A message deleted for everyone takes its files with it: listing them
+    /// would resurface what the sender retracted.
+    #[tokio::test]
+    async fn list_attachments_leaves_out_files_from_deleted_messages() {
+        let ctx = ctx_of(|s| s);
+        let gone = with_attachments(2, 100, &["retracted"]);
+        ctx.store.insert(&gone).await.unwrap();
+        ctx.store
+            .insert(&with_attachments(2, 200, &["kept"]))
+            .await
+            .unwrap();
+        ctx.store.mark_deleted(gone.id, sid(2)).await.unwrap();
+        let out = Registry::standard()
+            .call(&ctx, "list_attachments", json!({}))
+            .await
+            .unwrap();
+        let ids: Vec<_> = out["attachments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["kept"], "{out}");
     }
 }
