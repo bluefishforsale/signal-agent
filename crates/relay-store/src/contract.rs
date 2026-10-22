@@ -743,3 +743,30 @@ async fn parallel_claimers_never_share_a_job() {
     }
     stores.close().await;
 }
+
+/// A pruned message's attachments must leave the attachment listing with it,
+/// or get_attachment would point at a message that no longer exists.
+#[tokio::test]
+async fn pruned_messages_take_their_attachments_with_them() {
+    let alice = Recipient::Contact(sid(1));
+    let mut old = msg(1, 1, alice, "");
+    old.attachments = vec![AttachmentRef {
+        id: "old".into(),
+        content_type: "image/png".into(),
+        file_name: None,
+        size: 1,
+    }];
+    let stores = Stores::open().await;
+    for (name, store) in stores.each() {
+        store.insert(&old).await.expect("insert");
+        store.prune(2).await.expect("prune");
+        let page = store.attachments(10, 0).await.expect("page");
+        assert!(
+            page.is_empty(),
+            "{name}: pruned attachment listed: {page:?}"
+        );
+        let found = store.attachment("old").await.expect("lookup");
+        assert_eq!(found, None, "{name}: pruned attachment found");
+    }
+    stores.close().await;
+}

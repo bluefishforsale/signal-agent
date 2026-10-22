@@ -26,26 +26,7 @@ pub struct SqlCipherStore {
 impl SqlCipherStore {
     /// Opens or creates the store at `path`, failing if `key` doesn't decrypt it.
     pub async fn open(path: &Path, key: &StoreKey) -> anyhow::Result<Self> {
-        let hex: String = key.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
-        // NOTE: sqlx logs every statement it runs, including the PRAGMA key it
-        // sends on connect, and logs slow ones at WARN. Leaving either on writes
-        // the database key into the agent log.
-        let options = SqliteConnectOptions::from_str("sqlite:")?
-            .filename(path)
-            .pragma("key", format!("\"x'{hex}'\""))
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .log_statements(LevelFilter::Off)
-            .log_slow_statements(LevelFilter::Off, std::time::Duration::ZERO);
-        let pool = SqlitePoolOptions::new()
-            .connect_with(options)
-            .await
-            .with_context(|| {
-                format!(
-                    "unable to open message store \"{}\": wrong key or not a message store",
-                    path.display()
-                )
-            })?;
+        let pool = connect(path, key).await?;
         sqlx::migrate!()
             .run(&pool)
             .await
@@ -66,6 +47,30 @@ impl SqlCipherStore {
         tx.commit().await?;
         Ok(())
     }
+}
+
+/// A pool on the store at `path`, keyed but not yet migrated.
+async fn connect(path: &Path, key: &StoreKey) -> anyhow::Result<SqlitePool> {
+    let hex: String = key.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    // NOTE: sqlx logs every statement it runs, including the PRAGMA key it
+    // sends on connect, and logs slow ones at WARN. Leaving either on writes
+    // the database key into the agent log.
+    let options = SqliteConnectOptions::from_str("sqlite:")?
+        .filename(path)
+        .pragma("key", format!("\"x'{hex}'\""))
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .log_statements(LevelFilter::Off)
+        .log_slow_statements(LevelFilter::Off, std::time::Duration::ZERO);
+    SqlitePoolOptions::new()
+        .connect_with(options)
+        .await
+        .with_context(|| {
+            format!(
+                "unable to open message store \"{}\": wrong key or not a message store",
+                path.display()
+            )
+        })
 }
 
 /// A `SELECT` of every `MessageRow` column from `messages m`, followed by
@@ -760,6 +765,56 @@ mod tests {
                 "full scan for {sql}: {details:?}"
             );
         }
+        store.close().await.expect("close");
+    }
+
+    /// Receivers keep only a poll's highest vote count, so a count that
+    /// restarted at 1 after the agent restarts would make every later vote
+    /// invisible.
+    #[tokio::test]
+    async fn poll_vote_counts_survive_a_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("messages.db");
+        let key = StoreKey::from_bytes([4; 32]);
+        let poll = msg(1, "poll").id;
+        let store = SqlCipherStore::open(&path, &key).await.expect("open");
+        store.next_poll_vote(poll).await.expect("vote");
+        store.close().await.expect("close");
+        let store = SqlCipherStore::open(&path, &key).await.expect("reopen");
+        let count = store.next_poll_vote(poll).await.expect("vote");
+        assert_eq!(count, 2, "vote count restarted after reopen");
+        store.close().await.expect("close");
+    }
+
+    /// Stores from before the attachment index already hold attachments; the
+    /// migration must index them, or they vanish from the listing on upgrade.
+    #[tokio::test]
+    async fn upgrading_indexes_attachments_already_stored() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("messages.db");
+        let key = StoreKey::from_bytes([5; 32]);
+        let mut old = msg(1, "");
+        old.attachments = vec![AttachmentRef {
+            id: "before-upgrade".into(),
+            content_type: "image/png".into(),
+            file_name: None,
+            size: 1,
+        }];
+        let pool = connect(&path, &key).await.expect("connect");
+        sqlx::migrate!()
+            .run_to(1, &pool)
+            .await
+            .expect("migrate to 0001");
+        let round_one = SqlCipherStore { pool };
+        round_one.insert(&old).await.expect("insert");
+        round_one.close().await.expect("close");
+        let store = SqlCipherStore::open(&path, &key).await.expect("upgrade");
+        let found = store.attachment("before-upgrade").await.expect("lookup");
+        assert_eq!(
+            found.map(|a| a.message),
+            Some(old.id),
+            "attachment stored before the upgrade not indexed"
+        );
         store.close().await.expect("close");
     }
 
