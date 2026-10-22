@@ -5,7 +5,7 @@ use std::sync::Arc;
 use relay_core::prelude::*;
 use serde_json::Value;
 
-use crate::{Tool, ToolContext, ToolError, directory, read};
+use crate::{Tool, ToolContext, ToolError, directory, read, send};
 
 /// The set of tools a profile serves.
 #[derive(Clone, Default)]
@@ -24,6 +24,11 @@ impl Registry {
             .with(read::GetUnread)
             .with(read::GetConversation)
             .with(read::SearchMessages)
+            .with(send::SendMessage)
+            .with(send::SendGroupMessage)
+            .with(send::SendNoteToSelf)
+            .with(send::SetTyping)
+            .with(send::SendReadReceipt)
             .with(directory::ListContacts)
             .with(directory::ListGroups)
             .with(directory::ListAttachments)
@@ -190,12 +195,14 @@ mod tests {
     fn sample(name: &str, prop: &Value) -> Value {
         match prop["format"].as_str() {
             Some("signal-recipient" | "signal-service-id") => json!(sid(2).to_string()),
+            Some("signal-group-id") => json!("ab".repeat(32)),
             Some("iso-datetime") => json!("2024-01-01T00:00:00Z"),
             Some(other) => panic!("{name}: no sample for format \"{other}\"; add one here"),
             None => match prop["type"].as_str() {
                 Some("string") => json!("x"),
                 Some("integer") => prop["minimum"].clone(),
                 Some("boolean") => json!(true),
+                Some("array") => json!([sample(name, &prop["items"])]),
                 other => panic!("{name}: no sample for type {other:?}; add one here"),
             },
         }
@@ -224,6 +231,11 @@ mod tests {
                         bad.extend(malformed_ids);
                         bad.push(json!("ab".repeat(32)));
                     }
+                    // A group-only field must also refuse a well-formed person.
+                    Some("signal-group-id") => {
+                        bad.extend(malformed_ids);
+                        bad.push(json!(sid(2).to_string()));
+                    }
                     Some("iso-datetime") => bad.extend([
                         json!("yesterday"),
                         json!("2024-13-01"),
@@ -251,6 +263,23 @@ mod tests {
                 ]);
             }
             Some("boolean") => bad.extend([json!("true"), json!(1)]),
+            // An empty array is already refused above, so arrays must not be empty.
+            Some("array") => {
+                let (Some(1..), Some(max)) = (prop["minItems"].as_u64(), prop["maxItems"].as_u64())
+                else {
+                    panic!(
+                        "{name}: array properties must declare minItems >= 1 and maxItems: {prop}"
+                    );
+                };
+                let item = sample(name, &prop["items"]);
+                let too_many = vec![item; max as usize + 1];
+                bad.extend([json!("x"), json!(1), json!(true), json!(too_many)]);
+                bad.extend(
+                    bad_values(name, &prop["items"])
+                        .into_iter()
+                        .map(|v| json!([v])),
+                );
+            }
             other => panic!("{name}: no bad values for type {other:?}; add some here"),
         }
         bad

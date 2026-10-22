@@ -64,6 +64,10 @@ jobs:
         with:
           key: bundle-${{ matrix.target }}
           cache-all-crates: true
+      # presage's libsignal-service generates its protobufs with prost-build.
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - run: rustup target add ${{ matrix.rust-targets }}
         shell: bash
       - run: cargo install tauri-cli --version "^2" --locked
