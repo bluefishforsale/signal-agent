@@ -301,7 +301,9 @@ pub trait Provisioner: Send + Sync {
     fn link(&self, device_name: String) -> BoxStream<'static, anyhow::Result<LinkEvent>>;
     /// After `link` reports `Linked`, waits for the history the phone offered
     /// to send and downloads it into `dir`. Fails with `RateLimited` when
-    /// Signal refuses as rate-limited, and never retries that.
+    /// Signal refuses as rate-limited, and never retries that itself. After a
+    /// failure the caller may call again; inside Signal's wait that fails
+    /// with `RateLimited` without asking Signal.
     async fn transfer_history(&self, _dir: &Path) -> anyhow::Result<HistoryTransfer> {
         Ok(HistoryTransfer::NotOffered)
     }

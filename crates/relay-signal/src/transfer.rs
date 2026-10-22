@@ -819,4 +819,36 @@ mod tests {
         assert_eq!(std::fs::read(&path).expect("file"), archive);
         assert_eq!(key.as_bytes(), &[5; 32]);
     }
+
+    /// A retry after Signal rate-limited the fetch must not reach Signal
+    /// until Signal's wait is over; it fails locally with the time left.
+    #[tokio::test]
+    async fn a_retry_after_a_rate_limit_waits_without_asking_signal() {
+        let server = FakeServer::start(vec![bytes(
+            "429 Too Many Requests",
+            "retry-after: 60\r\n",
+            b"",
+            0,
+        )])
+        .await;
+        let dir = tempfile::tempdir().expect("dir");
+        let mut pending = pending(&server);
+        pending
+            .fetch(dir.path())
+            .await
+            .expect_err("a 429 succeeded");
+        let error = pending
+            .fetch(dir.path())
+            .await
+            .expect_err("retried inside Signal's wait");
+        let limited = error
+            .downcast_ref::<RateLimited>()
+            .unwrap_or_else(|| panic!("not RateLimited: {error:#}"));
+        let left = limited.retry_after.expect("time left");
+        assert!(
+            left > Duration::from_secs(50) && left <= Duration::from_secs(60),
+            "{left:?}"
+        );
+        assert_eq!(server.requests().len(), 1, "{:?}", server.requests());
+    }
 }
