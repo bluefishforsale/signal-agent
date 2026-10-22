@@ -62,6 +62,8 @@ pub struct Driver {
     services: Services,
     provisioner: Option<Box<dyn Provisioner>>,
     clock: Arc<dyn Clock>,
+    /// Whether this registration attempt already asked for a call.
+    called: bool,
 }
 
 impl Driver {
@@ -81,6 +83,7 @@ impl Driver {
             server,
             services,
             provisioner: None,
+            called: false,
             clock: Arc::new(SystemClock),
         }
     }
@@ -154,9 +157,20 @@ impl Driver {
                 // NOTE: a captcha only comes after Signal asked for one, and a
                 // call only after an SMS, so both finish the attempt in
                 // progress; gating them would leave the user stuck behind the
-                // backoff. Signal paces calls itself and says when to retry.
-                if captcha.is_none() && !voice {
+                // backoff. One call per attempt is our own limit, so a stuck
+                // button can't make Signal ring a phone over and over (PRD
+                // goal 13); past that, a fresh attempt meets the backoff.
+                if voice {
+                    if self.called {
+                        bail!(
+                            "A call for this code was already requested. Wait for it, \
+                             or go back and enter your number again to start over."
+                        );
+                    }
+                    self.called = true;
+                } else if captcha.is_none() {
                     self.begin_provisioning()?;
+                    self.called = false;
                 }
                 let step = self
                     .provisioner()
@@ -807,6 +821,7 @@ mod tests {
     #[tokio::test]
     async fn a_voice_call_after_the_sms_is_not_held_back_by_the_backoff() {
         let world = World::new()
+            .stopped_clock()
             .code(Ok(RegistrationStep::CodeSent))
             .code(Ok(RegistrationStep::CodeSent));
         let mut h = Harness::new(&world);
@@ -835,6 +850,53 @@ mod tests {
             "{log:?}"
         );
         assert_eq!(world.opened_with().len(), 1, "session reopened: {log:?}");
+    }
+
+    /// A second call request in one attempt is refused before Signal hears of
+    /// it, and starting over from the number meets the provisioning backoff.
+    #[tokio::test]
+    async fn a_second_voice_call_request_in_one_attempt_is_refused_without_contacting_signal() {
+        let world = World::new()
+            .stopped_clock()
+            .code(Ok(RegistrationStep::CodeSent))
+            .code(Ok(RegistrationStep::CodeSent))
+            .code(Ok(RegistrationStep::CodeSent));
+        let mut h = Harness::new(&world);
+        h.send(SetupEvent::AccountChosen {
+            choice: AccountChoice::OwnNumber,
+        })
+        .await;
+        h.send(SetupEvent::NumberEntered {
+            number: NUMBER.into(),
+        })
+        .await;
+        h.send(SetupEvent::CodeByVoice).await;
+        let refused = h.send(SetupEvent::CodeByVoice).await;
+        let SetupState::Failed { message, .. } = &refused else {
+            panic!("second call request not refused: {refused:?}");
+        };
+        assert!(message.contains("already requested"), "{message}");
+        h.send(SetupEvent::Retry).await;
+        let again = h
+            .send(SetupEvent::NumberEntered {
+                number: NUMBER.into(),
+            })
+            .await;
+        assert!(matches!(again, SetupState::Failed { .. }), "{again:?}");
+        let log = world.log();
+        let requests: Vec<_> = log
+            .iter()
+            .filter(|e| e.starts_with("request code"))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            requests,
+            [
+                "request code +15555550100 None voice=false",
+                "request code +15555550100 None voice=true",
+            ],
+            "{log:?}"
+        );
     }
 
     /// A failed access save must stop clients connecting in the same batch,
