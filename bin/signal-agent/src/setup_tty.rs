@@ -36,6 +36,16 @@ pub async fn run(profile: ProfileName) -> anyhow::Result<()> {
     };
     let start = SetupState::start(&computer_name());
     let mut driver = Driver::new(start, profile, paths, server, services);
+    let skip = driver.history_skip();
+    // NOTE: listening for Ctrl-C replaces its default exit, so it must still
+    // exit whenever there is no history import to skip.
+    tokio::spawn(async move {
+        while tokio::signal::ctrl_c().await.is_ok() {
+            if !skip.skip() {
+                std::process::exit(130);
+            }
+        }
+    });
     drive(&mut driver, &mut terminal_input()?, &mut io::stdout()).await
 }
 
@@ -153,7 +163,7 @@ fn render(state: &SetupState, out: &mut impl Write) -> io::Result<()> {
             ..
         } => writeln!(
             out,
-            "\nImporting your earlier messages. {}",
+            "\nImporting your earlier messages. {} Press Ctrl-C to skip them.",
             relay_setup::HISTORY_NOTE
         ),
         SetupState::ImportingHistory {
