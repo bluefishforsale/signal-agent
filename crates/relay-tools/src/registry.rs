@@ -99,6 +99,15 @@ mod tests {
     /// Tools the boundary sweep can't call meaningfully with probe inputs, and why.
     const EXCLUDED: &[&str] = &[];
 
+    /// Tools that act on a stored message and must refuse one the store doesn't
+    /// hold. The sweep's store is empty, so their sample input is refused too.
+    const NEEDS_STORED_TARGET: &[&str] = &[
+        "react_to_message",
+        "edit_message",
+        "delete_message",
+        "delete_group_message",
+    ];
+
     struct Sender;
 
     #[async_trait]
@@ -301,11 +310,18 @@ mod tests {
                 .map(|(k, p)| (k.clone(), sample(&format!("{name}.{k}"), p)))
                 .collect();
 
-            let (result, _) = probe(&registry, name, Value::Object(valid.clone())).await;
-            assert!(
-                !matches!(result, Err(ToolError::InvalidInput(_))),
-                "{name} refused its own schema's sample input {valid:?}: {result:?}"
-            );
+            let (result, sent) = probe(&registry, name, Value::Object(valid.clone())).await;
+            if NEEDS_STORED_TARGET.contains(&name) {
+                assert!(
+                    matches!(result, Err(ToolError::InvalidInput(_))) && sent == 0,
+                    "{name} acted on a target the empty store doesn't hold: {result:?}, {sent} sent"
+                );
+            } else {
+                assert!(
+                    !matches!(result, Err(ToolError::InvalidInput(_))),
+                    "{name} refused its own schema's sample input {valid:?}: {result:?}"
+                );
+            }
 
             let mut probes = vec![];
             let mut unknown = valid.clone();
