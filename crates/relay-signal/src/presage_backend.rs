@@ -27,14 +27,15 @@ use presage::{
         provisioning::ProvisioningError,
     },
     libsignal_service::{
-        content::Content,
+        content::{Content, ContentBody},
         protocol::{
             DeviceId, IdentityKey, IdentityKeyStore, ProtocolAddress, ServiceId as SignalServiceId,
         },
+        sender::{AttachmentSpec, AttachmentUploadError},
     },
     manager::{Confirmation, Registered, RegistrationOptions},
     model::messages::Received,
-    proto::GroupContextV2,
+    proto::{AttachmentPointer, GroupContextV2},
     store::{ContentsStore, StateStore, Store, Thread},
 };
 use presage_store_sqlite::{OnNewIdentity, SqliteConnectOptions, SqliteStore};
@@ -498,7 +499,7 @@ async fn send(
     }
     match to {
         Recipient::Contact(contact) => {
-            let body = convert::content_body(&message, sent_at_ms, None)?;
+            let body = content_body(&manager, &message, sent_at_ms, None).await?;
             manager
                 .send_message(convert::aci(contact), body, sent_at_ms)
                 .await
@@ -511,13 +512,77 @@ async fn send(
                 revision: Some(group.revision),
                 group_change: None,
             };
-            let body = convert::content_body(&message, sent_at_ms, Some(&context))?;
+            let body = content_body(&manager, &message, sent_at_ms, Some(&context)).await?;
             manager
                 .send_message_to_group(&master_key, body, sent_at_ms)
                 .await
                 .map_err(|e| signal_error(e, format!("unable to send to group {id}")))
         }
     }
+}
+
+/// What to put on the wire for `message`, uploading a sticker's image first.
+// NOTE: the sticker is looked up before anything is uploaded, so a pack that
+// isn't installed fails without reaching Signal.
+async fn content_body(
+    manager: &Manager<SqliteStore, Registered>,
+    message: &Outgoing,
+    sent_at_ms: u64,
+    group: Option<&GroupContextV2>,
+) -> anyhow::Result<ContentBody> {
+    let Outgoing::Sticker { pack, sticker_id } = message else {
+        return convert::content_body(message, sent_at_ms, group);
+    };
+    let Some(installed) = manager
+        .store()
+        .sticker_pack(pack.as_bytes())
+        .await
+        .context("unable to read sticker packs")?
+    else {
+        bail!("sticker pack {pack} is not installed");
+    };
+    let Some(sticker) = installed
+        .manifest
+        .stickers
+        .iter()
+        .find(|s| s.id == *sticker_id)
+    else {
+        bail!("sticker pack {pack} has no sticker {sticker_id}");
+    };
+    let Some(bytes) = sticker.bytes.clone() else {
+        bail!("sticker {sticker_id} of pack {pack} was never downloaded");
+    };
+    let spec = AttachmentSpec {
+        content_type: sticker
+            .content_type
+            .clone()
+            .unwrap_or_else(|| "image/webp".into()),
+        length: bytes.len(),
+        ..Default::default()
+    };
+    let image = upload(manager, spec, bytes).await?;
+    Ok(convert::sticker_body(
+        *pack,
+        &installed.key,
+        *sticker_id,
+        sticker.emoji.as_deref(),
+        image,
+        sent_at_ms,
+        group,
+    ))
+}
+
+/// Encrypts and uploads `bytes`, returning the pointer a message carries.
+async fn upload(
+    manager: &Manager<SqliteStore, Registered>,
+    spec: AttachmentSpec,
+    bytes: Vec<u8>,
+) -> anyhow::Result<AttachmentPointer> {
+    manager
+        .upload_attachment(spec, bytes)
+        .await
+        .map_err(|e| signal_error(e, "unable to upload attachment"))?
+        .map_err(upload_error)
 }
 
 /// The cached group with public id `id`, with the master key sending needs.
@@ -785,6 +850,16 @@ fn service_rate_limited(error: &ServiceError) -> Option<RateLimited> {
         }
         _ => None,
     }
+}
+
+/// A failed upload, as the typed `RateLimited` when Signal rate-limited it.
+fn upload_error(error: AttachmentUploadError) -> anyhow::Error {
+    if let AttachmentUploadError::ServiceError(service) = &error
+        && let Some(limited) = service_rate_limited(service)
+    {
+        return limited.into();
+    }
+    anyhow!(error).context("unable to upload attachment")
 }
 
 // NOTE: the challenge token stays out of the message; it would otherwise reach
@@ -1068,6 +1143,73 @@ mod tests {
             err.to_string().contains("your own"),
             "failed for the wrong reason: {err:#}"
         );
+    }
+
+    /// A sticker's pack key comes from presage's store; a pack the account
+    /// never installed has none, so the send must fail before reaching Signal.
+    #[tokio::test]
+    async fn a_sticker_from_a_pack_not_installed_fails_without_the_network() {
+        let (_dir, path) = temp_store();
+        register_linked(&path).await;
+        let signal = PresageSignal::open(&path, &KEY).await.expect("opens");
+        let alice = ServiceId::new(uuid::Uuid::from_u128(0xa11ce));
+        let err = signal
+            .send(
+                Recipient::Contact(alice),
+                Outgoing::Sticker {
+                    pack: StickerPackId::new([1; 16]),
+                    sticker_id: 0,
+                },
+            )
+            .await
+            .expect_err("sent a sticker from a pack never installed");
+        assert!(
+            err.to_string().contains("not installed"),
+            "unclear error: {err:#}"
+        );
+    }
+
+    /// An installed pack without the asked-for sticker, or whose image never
+    /// downloaded, has nothing to send; both must fail before any upload.
+    #[tokio::test]
+    async fn a_sticker_missing_from_its_installed_pack_fails_without_the_network() {
+        let (_dir, path) = temp_store();
+        register_linked(&path).await;
+        let pack = StickerPackId::new([1; 16]);
+        seed(&path, move |mut store| async move {
+            let sticker = |id, bytes| presage::store::Sticker {
+                id,
+                emoji: None,
+                content_type: Some("image/webp".into()),
+                bytes,
+            };
+            store
+                .add_sticker_pack(&presage::store::StickerPack {
+                    id: pack.as_bytes().to_vec(),
+                    key: vec![2; 32],
+                    manifest: presage::store::StickerPackManifest {
+                        title: "cats".into(),
+                        author: "me".into(),
+                        cover: None,
+                        stickers: vec![sticker(0, None), sticker(1, Some(vec![1, 2, 3]))],
+                    },
+                })
+                .await
+                .expect("saved");
+        })
+        .await;
+        let signal = PresageSignal::open(&path, &KEY).await.expect("opens");
+        let alice = Recipient::Contact(ServiceId::new(uuid::Uuid::from_u128(0xa11ce)));
+        for (sticker_id, reason) in [(9, "has no sticker"), (0, "never downloaded")] {
+            let err = signal
+                .send(alice, Outgoing::Sticker { pack, sticker_id })
+                .await
+                .expect_err("sent a sticker with no image");
+            assert!(
+                err.to_string().contains(reason),
+                "sticker {sticker_id}: unclear error: {err:#}"
+            );
+        }
     }
 
     /// Sending to a group the account isn't in must fail with a reason, before
@@ -1389,6 +1531,22 @@ mod tests {
             "not typed: {error:#}"
         );
         assert!(error.to_string().contains("30s"), "wait hidden: {error}");
+    }
+
+    /// An upload reports its failure in its own error type, beside presage's.
+    /// A 429 there is still Signal rate-limiting the account and must come
+    /// back typed, with its wait, and outermost.
+    #[test]
+    fn a_rate_limited_upload_is_recognized() {
+        let error = upload_error(AttachmentUploadError::ServiceError(
+            ServiceError::RateLimitExceeded {
+                retry_after: Some(chrono::Duration::seconds(30)),
+            },
+        ));
+        let limited = error
+            .downcast_ref::<RateLimited>()
+            .unwrap_or_else(|| panic!("an upload 429 went unrecognized: {error:#}"));
+        assert_eq!(limited.retry_after, Some(Duration::from_secs(30)));
     }
 
     /// Reconnecting to receive after a drop is fine, but reconnecting a second

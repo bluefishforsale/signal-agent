@@ -316,8 +316,33 @@ pub(crate) fn content_body(
             ..Default::default()
         })),
         Outgoing::Sticker { .. } => {
-            bail!("sending {message:?} is not implemented yet (lane L1b)")
+            bail!("a sticker goes out through sticker_body, once its pack is looked up")
         }
+    })
+}
+
+/// What to put on the wire for sticker `sticker_id` of `pack`, whose image
+/// was uploaded as `image`.
+pub(crate) fn sticker_body(
+    pack: StickerPackId,
+    pack_key: &[u8],
+    sticker_id: u32,
+    emoji: Option<&str>,
+    image: AttachmentPointer,
+    sent_at_ms: u64,
+    group: Option<&GroupContextV2>,
+) -> ContentBody {
+    ContentBody::DataMessage(DataMessage {
+        timestamp: Some(sent_at_ms),
+        group_v2: group.cloned(),
+        sticker: Some(data_message::Sticker {
+            pack_id: Some(pack.as_bytes().to_vec()),
+            pack_key: Some(pack_key.to_vec()),
+            sticker_id: Some(sticker_id),
+            data: Some(image),
+            emoji: emoji.map(str::to_owned),
+        }),
+        ..Default::default()
     })
 }
 
@@ -1048,6 +1073,30 @@ mod tests {
                 .expect("a poll end");
             prop_assert_eq!(end.target_sent_timestamp, Some(poll.sent_at_ms));
         }
+    }
+
+    /// A sticker goes out naming its pack and key, so receivers with the pack
+    /// show it from there, and with the uploaded image for those without.
+    #[test]
+    fn a_sticker_names_its_pack_and_carries_its_image() {
+        let pack = StickerPackId::new([1; 16]);
+        let image = AttachmentPointer {
+            content_type: Some("image/webp".into()),
+            size: Some(10),
+            ..Default::default()
+        };
+        let ContentBody::DataMessage(data) =
+            sticker_body(pack, &[2; 32], 7, Some("🐈"), image.clone(), 9, None)
+        else {
+            panic!("a sticker is not a data message");
+        };
+        let sticker = data.sticker.expect("a sticker");
+        assert_eq!(sticker.pack_id, Some(vec![1; 16]));
+        assert_eq!(sticker.pack_key, Some(vec![2; 32]));
+        assert_eq!(sticker.sticker_id, Some(7));
+        assert_eq!(sticker.emoji.as_deref(), Some("🐈"));
+        assert_eq!(sticker.data, Some(image));
+        assert_eq!(data.timestamp, Some(9));
     }
 
     /// Typing in a group names the group by its public id; group members' apps
