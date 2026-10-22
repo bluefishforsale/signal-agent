@@ -144,7 +144,7 @@ mod tests {
     /// that screen must already be stored when the redraw goes out. It once
     /// lagged by one state and flaked on Windows CI.
     #[tokio::test(start_paused = true)]
-    async fn the_current_screen_is_stored_before_the_window_is_told_to_redraw() {
+    async fn a_redraw_stores_the_new_screen_before_anyone_is_told_it_changed() {
         let screen: Arc<OnceLock<Arc<Mutex<View>>>> = Arc::default();
         let stored = Arc::clone(&screen);
         let (tx, mut rx) = mpsc::unbounded_channel();
