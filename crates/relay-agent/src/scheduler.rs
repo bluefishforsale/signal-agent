@@ -59,6 +59,7 @@ mod tests {
     use relay_core::prelude::*;
     use relay_signal::RateLimited;
     use relay_store::{JobState, MemoryStore, MessageStore, ScheduledSend};
+    use relay_tools::{Limiter, Limits};
     use uuid::Uuid;
 
     use super::*;
@@ -106,9 +107,13 @@ mod tests {
         store.schedule(&later).await.expect("schedule");
         signal.rate_limit_next_send(RateLimited {
             message: "slow down".into(),
-            retry_after: None,
+            retry_after: Some(Duration::from_secs(10)),
         });
-        let ticking = tokio::spawn(run(Arc::new(Registry::standard()), ctx, clock.clone()));
+        // The limiter pauses sends for Signal's Retry-After, judged on the
+        // same clock the jobs fall due by.
+        let registry =
+            Registry::standard().with_limiter(Limiter::new(Limits::default(), clock.clone()));
+        let ticking = tokio::spawn(run(Arc::new(registry), ctx, clock.clone()));
         for _ in 0..20 {
             tokio::time::sleep(TICK).await;
             clock.0.fetch_add(TICK.as_millis() as u64, Ordering::SeqCst);

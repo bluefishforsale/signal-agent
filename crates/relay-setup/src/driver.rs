@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use relay_core::prelude::*;
 use relay_secrets::{SecretStore, StoreKey};
-use relay_signal::{LinkEvent, Provisioner, RegistrationStep};
+use relay_signal::{LinkEvent, Provisioner, RateLimited, RegistrationStep};
 use relay_tools::{Clock, Limits, Settings, SystemClock};
 
 use crate::{
@@ -111,13 +111,15 @@ impl Driver {
             let Err(e) = self.run(command, show, &mut pending).await else {
                 continue;
             };
+            let mut message = format!("{e:#}");
+            if let Some(Err(d)) = e.downcast_ref().map(|l| self.defer_provisioning(l)) {
+                message.push_str(&format!(" ({d:#}, so wait that long yourself)"));
+            }
             // NOTE: a failed command drops the rest of its batch. SaveAccess and
             // ConnectClients share one; connecting after a failed save would
             // hand clients a profile in the wrong access mode.
             pending.clear();
-            let failed = SetupEvent::CommandFailed {
-                message: format!("{e:#}"),
-            };
+            let failed = SetupEvent::CommandFailed { message };
             pending.extend(apply(&mut self.state, failed, show));
         }
     }
@@ -255,6 +257,11 @@ impl Driver {
                 Limits::default()
             });
         relay_tools::begin_provisioning(&self.paths.provisioning, &limits, self.clock.now_ms())
+    }
+
+    /// Holds the next link or registration back until Signal's wait is over.
+    fn defer_provisioning(&self, limited: &RateLimited) -> anyhow::Result<()> {
+        relay_tools::defer_provisioning(&self.paths.provisioning, limited, self.clock.now_ms())
     }
 
     // NOTE: the agent opens this same store once it starts, and two processes
@@ -1115,6 +1122,51 @@ mod tests {
             .filter(|e| e.starts_with("request code"))
             .count();
         assert_eq!(requests, 1, "{:?}", world.log());
+    }
+
+    /// When Signal rate-limits a code request for longer than our own
+    /// backoff, a fresh attempt must wait out Signal's time, refused before
+    /// Signal hears of it, and go through once that time has passed.
+    #[tokio::test]
+    async fn a_rate_limited_code_request_extends_the_backoff_to_signals_wait() {
+        let limited = relay_signal::RateLimited {
+            message: "slow down".into(),
+            retry_after: Some(std::time::Duration::from_secs(7200)),
+        };
+        let world = World::new()
+            .stopped_clock()
+            .code(Err(limited.into()))
+            .code(Ok(RegistrationStep::CodeSent));
+        let mut h = Harness::new(&world);
+        let number = SetupEvent::NumberEntered {
+            number: NUMBER.into(),
+        };
+        h.send(SetupEvent::AccountChosen {
+            choice: AccountChoice::OwnNumber,
+        })
+        .await;
+        h.send(number.clone()).await;
+        world.clock.advance(5 * 60 * 1_000 + 1_000);
+        h.send(SetupEvent::Retry).await;
+        let refused = h.send(number.clone()).await;
+        let SetupState::Failed { message, .. } = &refused else {
+            panic!("an attempt inside Signal's wait was not refused: {refused:?}");
+        };
+        assert!(message.contains("try again in 6899s"), "{message}");
+        world.clock.advance(6899 * 1_000);
+        h.send(SetupEvent::Retry).await;
+        let sent = h.send(number).await;
+        assert!(
+            matches!(sent, SetupState::EnterCode { .. }),
+            "{sent:?} {:?}",
+            world.log()
+        );
+        let requests = world
+            .log()
+            .into_iter()
+            .filter(|e| e.starts_with("request code"))
+            .count();
+        assert_eq!(requests, 2, "{:?}", world.log());
     }
 
     /// Every step of the own-number path that fails (requesting a code,
