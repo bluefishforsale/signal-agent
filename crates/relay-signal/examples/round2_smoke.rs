@@ -1,5 +1,5 @@
 //! Manual smoke test of the round 2 additions against a real phone: link as a
-//! new device, then exercise uploads, pins, polls and the directory lookups,
+//! new device, then exercise uploads, pins, polls and the lookups,
 //! sending only to the account's own Note to Self. CI never runs this; it
 //! needs a person to scan the QR code and to look at the phone.
 //!
@@ -70,12 +70,6 @@ async fn main() -> anyhow::Result<()> {
     println!("identities: {:#?}", signal.identities().await?);
     let avatar = signal.avatar(me).await?;
     println!("own avatar: {:?} bytes", avatar.map(|a| a.len()));
-    if let Some(number) = &account.phone_number {
-        println!(
-            "discover own number: {:?}",
-            signal.discover(std::slice::from_ref(number)).await?
-        );
-    }
     if let Some(username) = username {
         println!(
             "username {username}: {:?}",

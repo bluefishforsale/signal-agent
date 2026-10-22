@@ -45,8 +45,8 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
 use crate::{
-    Account, Contact, Device, Group, Identity, Incoming, LinkEvent, Outgoing, Provisioner,
-    RateLimited, RegistrationStep, SendableFile, SignalBackend, Trust, convert,
+    Account, Contact, Device, DiscoveryUnsupported, Group, Identity, Incoming, LinkEvent, Outgoing,
+    Provisioner, RateLimited, RegistrationStep, SendableFile, SignalBackend, Trust, convert,
 };
 
 type Job = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()>>> + Send>;
@@ -322,7 +322,7 @@ impl SignalBackend for PresageSignal {
         &self,
         _numbers: &[String],
     ) -> anyhow::Result<Vec<(String, Option<ServiceId>)>> {
-        bail!("contact discovery is not implemented yet (lane L1b)")
+        Err(DiscoveryUnsupported.into())
     }
 
     async fn lookup_username(&self, username: &str) -> anyhow::Result<Option<ServiceId>> {
@@ -1579,6 +1579,24 @@ mod tests {
         assert!(
             matches!(identities.as_slice(), [identity] if identity.changed),
             "{identities:?}"
+        );
+    }
+
+    /// Number discovery isn't in this version. Asking must fail with the typed
+    /// error a tool can match on, never an empty answer that reads as "nobody
+    /// is on Signal", and never reach Signal.
+    #[tokio::test]
+    async fn discovery_fails_as_unsupported_without_the_network() {
+        let (_dir, path) = temp_store();
+        register_linked(&path).await;
+        let signal = PresageSignal::open(&path, &KEY).await.expect("opens");
+        let err = signal
+            .discover(&["+15550000003".into()])
+            .await
+            .expect_err("discovery answered");
+        assert!(
+            err.downcast_ref::<crate::DiscoveryUnsupported>().is_some(),
+            "untyped: {err:#}"
         );
     }
 
