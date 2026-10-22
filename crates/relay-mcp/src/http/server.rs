@@ -69,6 +69,8 @@ struct Gate {
 struct Limits {
     /// Open connections at once; past this, new ones wait in the backlog.
     connections: usize,
+    /// How long a client may take to finish the TLS handshake.
+    handshake: Duration,
     /// How long a connection may take to send a request's headers.
     headers: Duration,
 }
@@ -76,6 +78,7 @@ struct Limits {
 // A handful of personal MCP clients never comes close to these.
 const LIMITS: Limits = Limits {
     connections: 64,
+    handshake: Duration::from_secs(10),
     headers: Duration::from_secs(30),
 };
 
@@ -118,9 +121,10 @@ async fn serve_with(
             let _slot = slot;
             let served = match tls {
                 None => connection(tcp, peer, gate, limits).await,
-                Some(tls) => match tls.accept(tcp).await {
-                    Ok(stream) => connection(stream, peer, gate, limits).await,
-                    Err(e) => return tracing::debug!(%peer, "TLS handshake failed: {e}"),
+                Some(tls) => match tokio::time::timeout(limits.handshake, tls.accept(tcp)).await {
+                    Ok(Ok(stream)) => connection(stream, peer, gate, limits).await,
+                    Ok(Err(e)) => return tracing::debug!(%peer, "TLS handshake failed: {e}"),
+                    Err(_) => return tracing::debug!(%peer, "TLS handshake timed out"),
                 },
             };
             if let Err(e) = served {
@@ -571,5 +575,26 @@ mod tests {
             .await
             .expect("write");
         closed_by_server(slow, Duration::from_secs(5)).await;
+    }
+
+    /// A client that opens a TLS connection and never says hello must not
+    /// hold its slot forever; the header timeout only starts after TLS.
+    #[tokio::test]
+    async fn a_client_that_never_finishes_the_tls_handshake_is_disconnected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tls = crate::http::Tls::self_signed(dir.path(), &["localhost".to_owned()])
+            .expect("certificate");
+        let listener = Listener::bind(([127, 0, 0, 1], 0).into(), Some(tls.config))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let tokens = Tokens::at(&dir.path().join("http_tokens.json"));
+        let limits = Limits {
+            handshake: Duration::from_millis(200),
+            ..LIMITS
+        };
+        tokio::spawn(serve_with(listener, tokens, "no-agent".into(), limits));
+        let silent = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        closed_by_server(silent, Duration::from_secs(5)).await;
     }
 }
