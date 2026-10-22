@@ -40,7 +40,7 @@ pub async fn run(profile: ProfileName) -> anyhow::Result<()> {
         login: Box::new(AgentAtLogin),
         clients: Clients::system(),
     };
-    let start = SetupState::start(&computer_name());
+    let start = first_state(&paths, &computer_name());
     let mut driver = Driver::new(start, profile, paths, server, services);
     let skip = driver.history_skip();
     // NOTE: listening for Ctrl-C replaces its default exit, so it must still
@@ -53,6 +53,11 @@ pub async fn run(profile: ProfileName) -> anyhow::Result<()> {
         }
     });
     drive(&mut driver, &mut terminal_input()?, &mut io::stdout()).await
+}
+
+/// Where setup begins for the profile at `paths` on `computer`.
+fn first_state(paths: &ProfilePaths, computer: &str) -> SetupState {
+    SetupState::for_profile(computer, paths.load_access().ok())
 }
 
 /// Shows each state and feeds the user's answers to `driver` until done.
@@ -111,6 +116,20 @@ async fn drive(
 /// Draws what the user should see on entering `state`.
 fn render(state: &SetupState, out: &mut impl Write) -> io::Result<()> {
     match state {
+        SetupState::AlreadySetUp {
+            device_name,
+            access,
+        } => writeln!(
+            out,
+            "Signal is already set up on this computer as \"{device_name}\", and Claude can {}.\n\n\
+             What would you like to do?\n  \
+             1) Reconnect Claude, if it can't see your messages (recommended; keeps your Signal link)\n  \
+             2) Link again, only if you removed this computer from Signal on your phone",
+            match access {
+                AccessMode::Full => "read and send your messages",
+                AccessMode::ReadOnly => "read your messages",
+            }
+        ),
         SetupState::ChooseAccount { device_name } => writeln!(
             out,
             "MCP Relay for Signal lets Claude read, search and send your Signal messages.\n\
@@ -256,6 +275,7 @@ fn ask(
     out: &mut impl Write,
 ) -> anyhow::Result<Option<SetupEvent>> {
     let event = match state {
+        SetupState::AlreadySetUp { .. } => prompt(input, out, "Choice [1]: ", parse_set_up_choice)?,
         SetupState::ChooseAccount { .. } => {
             let choice = prompt(input, out, "Choice [1]: ", parse_account_choice)?;
             SetupEvent::AccountChosen { choice }
@@ -357,6 +377,14 @@ fn parse_account_choice(answer: &str) -> Result<AccountChoice, &'static str> {
     match answer {
         "" | "1" => Ok(AccountChoice::LinkExisting),
         "2" => Ok(AccountChoice::OwnNumber),
+        _ => Err("Type 1 or 2, or press Enter for 1."),
+    }
+}
+
+fn parse_set_up_choice(answer: &str) -> Result<SetupEvent, &'static str> {
+    match answer {
+        "" | "1" => Ok(SetupEvent::Reconnect),
+        "2" => Ok(SetupEvent::Relink),
         _ => Err("Type 1 or 2, or press Enter for 1."),
     }
 }
@@ -825,7 +853,8 @@ mod tests {
             clients,
         };
         let paths = ProfilePaths::under(dir.to_path_buf(), &profile);
-        let mut driver = Driver::new(SetupState::start("box"), profile, paths, server, services);
+        let start = first_state(&paths, "box");
+        let mut driver = Driver::new(start, profile, paths, server, services);
         let mut input = io::Cursor::new(answers.to_owned());
         let mut out = Vec::new();
         drive(&mut driver, &mut input, &mut out)
@@ -869,6 +898,33 @@ mod tests {
         );
         let paths = ProfilePaths::under(dir.path().to_path_buf(), &ProfileName::default_profile());
         assert_eq!(paths.load_access().expect("access saved"), AccessMode::Full);
+    }
+
+    /// Setup run again on a set-up box must default to reconnecting Claude,
+    /// never to a second link, and offer re-linking only as a typed choice.
+    #[tokio::test]
+    async fn setup_on_a_set_up_box_reconnects_by_default_and_never_links() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = ProfilePaths::under(dir.path().to_path_buf(), &ProfileName::default_profile());
+        paths
+            .save_access(AccessMode::ReadOnly)
+            .expect("an earlier setup");
+        let clients = Clients::new(
+            relay_setup::claude::Platform::Linux,
+            Box::new(NoClaude),
+            None,
+            None,
+        );
+        let (driver, out) = run_scripted(dir.path(), clients, "\n").await;
+        assert!(out.contains("already set up"), "{out}");
+        assert!(out.contains("2) Link again"), "{out}");
+        assert!(scan(&out).is_empty(), "drew a link QR code: {out}");
+        assert!(
+            matches!(driver.state(), SetupState::Done { .. }),
+            "{:?}",
+            driver.state()
+        );
+        assert_eq!(paths.load_access().expect("kept"), AccessMode::ReadOnly);
     }
 
     /// Claude Desktop on macOS: osascript quits it, and fails the first time.

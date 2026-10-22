@@ -18,7 +18,9 @@ pub fn from_page(event: SetupEvent) -> Option<SetupEvent> {
                 .filter(|c| !c.is_whitespace() && !"()-.".contains(*c))
                 .collect(),
         }),
-        E::AccountChosen { .. }
+        E::Relink
+        | E::Reconnect
+        | E::AccountChosen { .. }
         | E::CodeEntered { .. }
         | E::CodeByVoice
         | E::AccessChosen { .. }

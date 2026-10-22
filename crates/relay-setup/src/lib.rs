@@ -8,6 +8,7 @@ pub mod claude;
 pub mod driver;
 pub mod history;
 mod machine;
+mod profile_lock;
 mod profiles;
 mod uninstall;
 
@@ -16,6 +17,7 @@ pub use captcha::{CAPTCHA_PAGE, captcha_navigation_allowed, captcha_token, paste
 pub use machine::{
     AccountChoice, ClientOutcome, Command, HistoryGap, SetupEvent, SetupState, transition,
 };
+pub use profile_lock::{SetupLock, StoreLock, setup_running};
 pub use profiles::Profiles;
 pub use uninstall::{
     APP_ID, DELETE_DATA_LABEL, Footprint, LAUNCHD_LABEL, Leftover, Machine, Roots, Step,
