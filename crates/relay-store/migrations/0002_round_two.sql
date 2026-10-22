@@ -32,7 +32,7 @@ CREATE TABLE attachments (
 
 CREATE INDEX attachments_newest_first ON attachments (sent_at_ms DESC, message, position);
 
-CREATE INDEX attachments_by_id ON attachments (id);
+CREATE INDEX attachments_by_id ON attachments (id, message);
 
 INSERT INTO attachments (message, position, sent_at_ms, id, attachment)
 SELECT m.id, a.key, m.sent_at_ms, json_extract(a.value, '$.id'), a.value

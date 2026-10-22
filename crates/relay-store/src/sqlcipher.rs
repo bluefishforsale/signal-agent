@@ -763,6 +763,30 @@ mod tests {
         store.close().await.expect("close");
     }
 
+    /// get_attachment and the attachment listing page through every
+    /// attachment the profile ever received, so each page must walk the index
+    /// in order and stop at the limit, never scan messages or sort them all.
+    #[tokio::test]
+    async fn attachment_queries_walk_the_index_without_a_full_scan() {
+        let (store, _dir) = open_temp().await;
+        for sql in [ATTACHMENT_PAGE, ATTACHMENT_BY_ID] {
+            let explain = sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}"));
+            let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(explain)
+                .bind("x")
+                .bind(0)
+                .fetch_all(&store.pool)
+                .await
+                .expect("explain");
+            let details: Vec<_> = plan.into_iter().map(|row| row.3).collect();
+            let indexed = details
+                .iter()
+                .all(|d| d.starts_with("SEARCH ") || d.contains(" USING INDEX "));
+            let sorts = details.iter().any(|d| d.contains("TEMP B-TREE"));
+            assert!(indexed && !sorts, "unindexed plan for {sql}: {details:?}");
+        }
+        store.close().await.expect("close");
+    }
+
     /// The cipher backend must be the one docs/slices.md declares: pure-Rust
     /// crypto, except on Windows, where the fork's build.rs lets the
     /// vendored-OpenSSL feature win over custom crypto. Either backend writes
