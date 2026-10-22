@@ -177,7 +177,13 @@ async fn uninstall(
     from_main_window(webview.label())?;
     // NOTE: the page's checkbox alone must not be able to delete messages;
     // a native dialog the page can't answer asks once more.
-    if delete_data && !confirmed_deleting_data(&app).await {
+    if delete_data
+        && !confirmed_deleting_data(
+            &app,
+            "Uninstall will delete your Signal messages, account data and the keys that unlock them from this computer. This can't be undone.",
+        )
+        .await
+    {
         return Err("Nothing was removed: deleting your messages wasn't confirmed".into());
     }
     run_uninstall(delete_data)
@@ -195,13 +201,34 @@ fn from_main_window(label: &str) -> Result<(), String> {
     Ok(())
 }
 
-async fn confirmed_deleting_data(app: &AppHandle) -> bool {
+/// Removes the account `name` and, when `delete_data`, its messages and key.
+#[tauri::command]
+async fn remove_account(
+    webview: Webview,
+    app: AppHandle,
+    name: String,
+    delete_data: bool,
+) -> Result<Vec<StepOutcome>, String> {
+    from_main_window(webview.label())?;
+    let profile = ProfileName::new(name).map_err(|e| format!("{e:#}"))?;
+    // NOTE: as with uninstall, the page's checkbox alone must not be able to
+    // delete messages.
+    let warning = format!(
+        "Removing \"{profile}\" will delete its Signal messages, account data and the keys that unlock them from this computer. This can't be undone."
+    );
+    if delete_data && !confirmed_deleting_data(&app, &warning).await {
+        return Err("deleting the account's messages wasn't confirmed".into());
+    }
+    run_removal(profile, delete_data)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+async fn confirmed_deleting_data(app: &AppHandle, warning: &str) -> bool {
     use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
     let (tx, rx) = tokio::sync::oneshot::channel();
     app.dialog()
-        .message(
-            "Uninstall will delete your Signal messages, account data and the keys that unlock them from this computer. This can't be undone.",
-        )
+        .message(warning)
         .title("Delete your messages?")
         .kind(MessageDialogKind::Warning)
         .buttons(MessageDialogButtons::OkCancelCustom(
@@ -231,6 +258,19 @@ async fn run_uninstall(_delete_data: bool) -> anyhow::Result<Vec<StepOutcome>> {
         name: "Nothing removed: this is a development build".into(),
         result: Ok(()),
     }])
+}
+
+#[cfg(not(feature = "mock-driver"))]
+async fn run_removal(profile: ProfileName, delete_data: bool) -> anyhow::Result<Vec<StepOutcome>> {
+    tauri::async_runtime::spawn_blocking(move || real::remove(&profile, delete_data)).await?
+}
+
+#[cfg(feature = "mock-driver")]
+async fn run_removal(
+    _profile: ProfileName,
+    _delete_data: bool,
+) -> anyhow::Result<Vec<StepOutcome>> {
+    run_uninstall(false).await
 }
 
 #[tauri::command]
@@ -303,6 +343,7 @@ fn main() {
             update_offer,
             install_update,
             uninstall,
+            remove_account,
             quit
         ])
         .run(tauri::generate_context!());

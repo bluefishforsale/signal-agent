@@ -12,5 +12,6 @@ const APP_COMMANDS: &[&str] = &[
     "update_offer",
     "install_update",
     "uninstall",
+    "remove_account",
     "quit",
 ];

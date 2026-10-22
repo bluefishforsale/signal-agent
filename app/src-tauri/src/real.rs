@@ -5,7 +5,10 @@
 //! registration (the owner's account could be banned); development runs use
 //! `--features mock-driver`.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, bail};
 use async_trait::async_trait;
@@ -60,6 +63,58 @@ pub fn setup(start: SetupState, profile: ProfileName) -> anyhow::Result<Box<dyn 
     )))
 }
 
+/// Removes `profile` from this computer, keeping its messages and key unless
+/// `delete_data`.
+pub fn remove(profile: &ProfileName, delete_data: bool) -> anyhow::Result<Vec<StepOutcome>> {
+    let agent = agent()?;
+    let profiles = Profiles::system()?;
+    let clients = Clients::system();
+    let secrets = relay_secrets::platform_store()?;
+    let entry = ServerEntry::for_profile(profile, &agent, ["mcp", "--profile", profile])?;
+    let paths = profiles.paths(profile);
+    let stop = Step::new(format!("Stop the agent for \"{profile}\""), || {
+        agent_stopped(profile, &paths, AGENT_STOP_WAIT)
+    });
+    let steps = profiles.removal_steps(
+        profile,
+        &clients,
+        &entry,
+        stop,
+        secrets.as_ref(),
+        delete_data,
+    )?;
+    Ok(run_steps(steps))
+}
+
+/// How long an agent gets to stop once nothing may start it: the supervisor
+/// notices within ten seconds and gives it ten more to close its stores.
+const AGENT_STOP_WAIT: Duration = Duration::from_secs(30);
+
+/// Waits up to `limit` for `profile`'s agent to stop answering on its
+/// endpoint. Call from a blocking thread of the async runtime.
+fn agent_stopped(
+    profile: &ProfileName,
+    paths: &ProfilePaths,
+    limit: Duration,
+) -> anyhow::Result<()> {
+    let endpoint = relay_agent::endpoint::name(profile, paths)?;
+    let runtime = tokio::runtime::Handle::current();
+    let deadline = Instant::now() + limit;
+    while runtime
+        .block_on(relay_agent::endpoint::connect(&endpoint))
+        .is_ok()
+    {
+        if Instant::now() >= deadline {
+            bail!(
+                "the agent for \"{profile}\" is still running after {} seconds",
+                limit.as_secs()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    Ok(())
+}
+
 /// The `signal-agent` binary shipped beside the app, which Claude launches.
 pub fn agent() -> anyhow::Result<PathBuf> {
     let me = std::env::current_exe().context("unable to locate this app")?;
@@ -92,7 +147,7 @@ impl LoginItem for AgentAtLogin {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::mpsc, time::Duration};
+    use std::sync::mpsc;
 
     use futures::stream::BoxStream;
     use relay_signal::{Account, HistoryTransfer, LinkEvent, RegistrationStep};
@@ -209,6 +264,31 @@ mod tests {
             server,
             services,
         ))
+    }
+
+    /// Removing an account deletes its files only after its agent lets go of
+    /// them, so the wait must fail while the agent still answers and succeed
+    /// once it has gone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn waiting_for_an_agent_fails_while_it_answers_and_ends_when_it_goes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let profile = ProfileName::new(format!("removal-{}", std::process::id())).expect("name");
+        let paths = ProfilePaths::under(dir.path().to_path_buf(), &profile);
+        std::fs::create_dir_all(&paths.root).expect("profile dir");
+        let endpoint = relay_agent::endpoint::name(&profile, &paths).expect("endpoint");
+        let listener = relay_agent::endpoint::Listener::bind(&endpoint)
+            .await
+            .expect("bind");
+
+        let wait = |limit| {
+            let (profile, paths) = (profile.clone(), paths.clone());
+            tokio::task::spawn_blocking(move || agent_stopped(&profile, &paths, limit))
+        };
+        let running = wait(Duration::from_millis(600)).await.expect("join");
+        assert!(running.is_err(), "returned while the agent answered");
+        drop(listener);
+        let gone = wait(Duration::from_secs(5)).await.expect("join");
+        assert!(gone.is_ok(), "{gone:?}");
     }
 
     /// The window drives relay-setup's own driver: a scan on the phone must

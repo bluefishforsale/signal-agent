@@ -225,6 +225,12 @@
           "markdownDescription": "Enables the quit command without any pre-configured scope."
         },
         {
+          "description": "Enables the remove_account command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-remove-account",
+          "markdownDescription": "Enables the remove_account command without any pre-configured scope."
+        },
+        {
           "description": "Enables the send command without any pre-configured scope.",
           "type": "string",
           "const": "allow-send",
@@ -289,6 +295,12 @@
           "type": "string",
           "const": "deny-quit",
           "markdownDescription": "Denies the quit command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the remove_account command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-remove-account",
+          "markdownDescription": "Denies the remove_account command without any pre-configured scope."
         },
         {
           "description": "Denies the send command without any pre-configured scope.",

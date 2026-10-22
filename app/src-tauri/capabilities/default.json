@@ -18,6 +18,7 @@
     "allow-update-offer",
     "allow-install-update",
     "allow-uninstall",
+    "allow-remove-account",
     "allow-quit"
   ],
   "local": true

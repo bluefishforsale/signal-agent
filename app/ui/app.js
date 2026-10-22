@@ -92,8 +92,14 @@ function showUpdate(offer) {
 }
 
 function showUninstalled(outcomes) {
-  const list = document.querySelector('[data-field="steps"]');
-  list.replaceChildren(...outcomes.map((outcome) => {
+  const list = document.querySelector('[data-screen="uninstalled"] [data-field="steps"]');
+  list.replaceChildren(...stepList(outcomes));
+  document.querySelector('[data-field="uninstall_retry"]').hidden = !outcomes.some((o) => "Err" in o.result);
+  show("uninstalled");
+}
+
+function stepList(outcomes) {
+  return outcomes.map((outcome) => {
     const item = document.createElement("li");
     const failed = "Err" in outcome.result;
     item.className = failed ? "bad" : "ok";
@@ -104,9 +110,47 @@ function showUninstalled(outcomes) {
       item.append(why);
     }
     return item;
-  }));
-  document.querySelector('[data-field="uninstall_retry"]').hidden = !outcomes.some((o) => "Err" in o.result);
-  show("uninstalled");
+  });
+}
+
+function showAdding(name) {
+  const line = document.querySelector('[data-field="adding"]');
+  fill(line, "adding_name", name);
+  fill(line, "adding_claude_name", `signal-${name}`);
+  line.hidden = false;
+}
+
+async function showAccounts() {
+  const section = document.querySelector('[data-screen="accounts"]');
+  const error = section.querySelector('[data-field="accounts_error"]');
+  error.hidden = true;
+  section.querySelector('[data-field="add_account_error"]').hidden = true;
+  try {
+    const accounts = await invoke("accounts");
+    section.querySelector('[data-field="accounts"]').replaceChildren(...accounts.map((account) => {
+      const item = document.createElement("li");
+      item.className = account.set_up ? "ok" : "bad";
+      item.textContent = account.name;
+      const about = document.createElement("small");
+      about.textContent = account.set_up
+        ? `Claude sees it as ${account.claude_name}`
+        : `Setup didn't finish, so Claude can't see it`;
+      const remove = document.createElement("button");
+      remove.dataset.action = "show_remove";
+      remove.dataset.name = account.name;
+      remove.dataset.claudeName = account.claude_name;
+      remove.textContent = "Remove";
+      const actions = document.createElement("div");
+      actions.className = "actions";
+      actions.append(remove);
+      item.append(about, actions);
+      return item;
+    }));
+  } catch (message) {
+    error.textContent = `The accounts couldn't be listed: ${message}`;
+    error.hidden = false;
+  }
+  show("accounts");
 }
 
 function checked(name) {
@@ -131,6 +175,36 @@ const actions = {
     show("uninstall");
   },
   cancel_uninstall: async () => render(await invoke("current")),
+  back: async () => render(await invoke("current")),
+  show_accounts: () => showAccounts(),
+  show_remove: (button) => {
+    const section = document.querySelector('[data-screen="remove_account"]');
+    section.dataset.name = button.dataset.name;
+    fill(section, "account_name", button.dataset.name);
+    fill(section, "account_claude_name", button.dataset.claudeName);
+    section.querySelector('input[name="delete_account_data"]').checked = false;
+    section.querySelector('[data-field="remove_account_error"]').hidden = true;
+    show("remove_account");
+  },
+  remove_account: async (button) => {
+    const section = document.querySelector('[data-screen="remove_account"]');
+    const error = section.querySelector('[data-field="remove_account_error"]');
+    error.hidden = true;
+    const name = section.dataset.name;
+    const deleteData = section.querySelector('input[name="delete_account_data"]').checked;
+    try {
+      const outcomes = await invoke("remove_account", { name, deleteData });
+      const removed = document.querySelector('[data-screen="account_removed"]');
+      fill(removed, "account_name", name);
+      removed.querySelector('[data-field="steps"]').replaceChildren(...stepList(outcomes));
+      removed.querySelector('[data-field="remove_retry"]').hidden = !outcomes.some((o) => "Err" in o.result);
+      show("account_removed");
+    } catch (message) {
+      error.textContent = `Nothing was removed: ${message}`;
+      error.hidden = false;
+      button.disabled = false;
+    }
+  },
   uninstall: async (button) => {
     const error = document.querySelector('[data-field="uninstall_error"]');
     error.hidden = true;
@@ -179,6 +253,22 @@ const forms = {
   enter_number: (data) => send({ event: "number_entered", number: data.get("number") }),
   solve_captcha: (data) => send({ event: "captcha_solved", token: data.get("token") }),
   enter_code: (data) => send({ event: "code_entered", code: data.get("code") }),
+  add_account: async (data) => {
+    const section = document.querySelector('[data-screen="accounts"]');
+    const error = section.querySelector('[data-field="add_account_error"]');
+    error.hidden = true;
+    const name = data.get("name").trim();
+    try {
+      const view = await invoke("add_account", { name });
+      showAdding(name);
+      render(view);
+    } catch (message) {
+      section.querySelector('input[name="name"]').value = name;
+      error.textContent = message;
+      error.hidden = false;
+      section.querySelector('button[type="submit"]').disabled = false;
+    }
+  },
 };
 
 document.addEventListener("click", (e) => {
