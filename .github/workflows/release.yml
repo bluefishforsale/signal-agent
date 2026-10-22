@@ -179,7 +179,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            binutils build-essential ca-certificates clang cmake curl git perl pkg-config
+            binutils build-essential ca-certificates clang cmake curl git perl pkg-config unzip
       - uses: actions/checkout@v4
       - name: Rust toolchain
         run: |
