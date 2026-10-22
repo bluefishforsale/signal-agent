@@ -44,6 +44,9 @@ impl Tokens {
     /// time the token exists outside the client that holds it.
     pub fn create(&self, name: &str, scope: AccessMode) -> anyhow::Result<String> {
         let mut saved = self.load()?;
+        if saved.iter().any(|t| t.name == name) {
+            bail!("a token named \"{name}\" already exists; revoke it first");
+        }
         let mut bytes = [0u8; 32];
         getrandom::fill(&mut bytes).map_err(|e| anyhow!("no OS randomness: {e}"))?;
         let token = hex::encode(bytes);
@@ -163,5 +166,17 @@ mod tests {
             }]
         );
         assert!(tokens.revoke("laptop").is_err(), "revoked twice silently");
+    }
+
+    /// Names are how the user revokes a client and how requests are logged,
+    /// so two live tokens must never share one.
+    #[test]
+    fn a_second_token_under_a_name_in_use_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tokens = tokens(&dir);
+        tokens.create("laptop", AccessMode::Full).expect("create");
+        let again = tokens.create("laptop", AccessMode::ReadOnly);
+        assert!(again.is_err(), "duplicate name accepted");
+        assert_eq!(tokens.list().expect("list").len(), 1);
     }
 }
