@@ -420,8 +420,17 @@ impl MessageStore for SqlCipherStore {
         bail!("the attachment index is not implemented yet (lane L2b)")
     }
 
-    async fn next_poll_vote(&self, _poll: MessageId) -> anyhow::Result<u32> {
-        bail!("poll vote counts are not implemented yet (lane L2b)")
+    async fn next_poll_vote(&self, poll: MessageId) -> anyhow::Result<u32> {
+        let (count,): (i64,) = sqlx::query_as(
+            "INSERT INTO poll_votes (author, sent_at_ms, count) VALUES (?, ?, 1) \
+             ON CONFLICT (author, sent_at_ms) DO UPDATE SET count = count + 1 \
+             RETURNING count",
+        )
+        .bind(poll.author.to_string())
+        .bind(to_i64(poll.sent_at_ms)?)
+        .fetch_one(&self.pool)
+        .await?;
+        u32::try_from(count).with_context(|| format!("no votes left on poll {poll:?}"))
     }
 
     async fn schedule(&self, _send: &ScheduledSend) -> anyhow::Result<JobId> {

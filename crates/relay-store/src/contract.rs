@@ -613,7 +613,7 @@ async fn poll_vote_counts_rise_per_poll() {
     let poll = msg(1, 1, Recipient::Contact(sid(1)), "").id;
     let other = msg(1, 2, Recipient::Contact(sid(1)), "").id;
     let stores = Stores::open().await;
-    for (name, store) in stores.round_two() {
+    for (name, store) in stores.each() {
         let counts = [
             store.next_poll_vote(poll).await.expect("vote"),
             store.next_poll_vote(poll).await.expect("vote"),
