@@ -52,8 +52,13 @@ pub trait DesktopHistory: Send + Sync {
     /// Whether Signal Desktop's data is on this computer.
     fn found(&self) -> bool;
 
-    /// Imports Desktop's messages, reporting how many so far.
-    async fn import(&self, progress: &mut (dyn FnMut(u64) + Send)) -> anyhow::Result<()>;
+    /// Imports Desktop's messages, refusing a Desktop signed in to any account
+    /// but `our_aci`, and reporting how many so far.
+    async fn import(
+        &self,
+        our_aci: ServiceId,
+        progress: &mut (dyn FnMut(u64) + Send),
+    ) -> anyhow::Result<()>;
 }
 
 /// Starts a profile's agent now and at every login.
@@ -316,7 +321,10 @@ impl Driver {
                 let mut progress = |imported| {
                     pending.extend(apply(state, SetupEvent::DesktopProgress { imported }, show));
                 };
-                self.services.desktop.import(&mut progress).await?;
+                let aci = self
+                    .linked
+                    .context("no linked account to import Desktop's history into")?;
+                self.services.desktop.import(aci, &mut progress).await?;
                 SetupEvent::DesktopImportDone
             }
             Command::ConnectClients => {
@@ -734,8 +742,12 @@ mod tests {
             self.desktop.lock().expect("desktop").is_some()
         }
 
-        async fn import(&self, progress: &mut (dyn FnMut(u64) + Send)) -> anyhow::Result<()> {
-            self.push("import desktop");
+        async fn import(
+            &self,
+            our_aci: ServiceId,
+            progress: &mut (dyn FnMut(u64) + Send),
+        ) -> anyhow::Result<()> {
+            self.push(format!("import desktop as {our_aci}"));
             let steps = self.desktop.lock().expect("desktop").clone();
             for imported in steps.unwrap_or_default() {
                 progress(imported);
@@ -972,8 +984,9 @@ mod tests {
     }
 
     /// Signal Desktop's history is never offered when Desktop is absent and
-    /// never read without a yes; with a yes, its progress shows and access is
-    /// still saved before the agent starts.
+    /// never read without a yes; with a yes, it is read as the linked account
+    /// (so another account's Desktop is refused), its progress shows, and
+    /// access is still saved before the agent starts.
     #[tokio::test]
     async fn signal_desktop_is_offered_only_when_found_and_read_only_on_yes() {
         let access = SetupEvent::AccessChosen {
@@ -1008,7 +1021,10 @@ mod tests {
                 .await;
             assert!(matches!(done, SetupState::Done { .. }), "{done:?}");
             let log = world.log();
-            let read = log.iter().position(|e| e == "import desktop");
+            let aci = account(ProfileKind::Linked).service_id;
+            let read = log
+                .iter()
+                .position(|e| *e == format!("import desktop as {aci}"));
             assert_eq!(read.is_some(), yes, "yes={yes}: {log:?}");
             let progress: Vec<_> = h
                 .shown

@@ -98,12 +98,16 @@ impl DesktopHistory for SignalDesktop {
             .is_some_and(relay_history::is_signal_desktop)
     }
 
-    async fn import(&self, progress: &mut (dyn FnMut(u64) + Send)) -> anyhow::Result<()> {
+    async fn import(
+        &self,
+        our_aci: ServiceId,
+        progress: &mut (dyn FnMut(u64) + Send),
+    ) -> anyhow::Result<()> {
         let Some(dir) = self.dir.as_deref().filter(|_| self.found()) else {
             anyhow::bail!("Signal Desktop isn't on this computer");
         };
         let store = self.store.open().await?;
-        relay_history::import_signal_desktop(dir, &store, &mut |p| progress(p.imported))
+        relay_history::import_signal_desktop(dir, our_aci, &store, &mut |p| progress(p.imported))
             .await
             .with_context(|| format!("importing Signal Desktop from \"{}\"", dir.display()))?;
         Ok(())
