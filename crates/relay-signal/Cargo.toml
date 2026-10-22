@@ -9,6 +9,7 @@ anyhow.workspace = true
 async-trait.workspace = true
 base64 = "0.22.1"
 futures.workspace = true
+getrandom.workspace = true
 mime_guess = "2.0.5"
 relay-core.workspace = true
 # Same version and TLS setup as libsignal-service, for the two link-and-sync
@@ -58,7 +59,6 @@ libsqlite3-sys = { version = "0.36.0", features = ["bundled-sqlcipher-vendored-o
 
 [dev-dependencies]
 chrono = "0.4.45"
-getrandom.workspace = true
 http = "1.5.0"
 proptest.workspace = true
 tempfile = "3.27.0"

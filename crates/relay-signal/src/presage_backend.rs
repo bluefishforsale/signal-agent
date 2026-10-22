@@ -46,8 +46,8 @@ use tracing::warn;
 
 use crate::{
     Account, Contact, Device, DiscoveryUnsupported, Group, HistoryTransfer, Identity, Incoming,
-    LinkEvent, Outgoing, Provisioner, RateLimited, RegistrationStep, SendableFile, SignalBackend,
-    StickerImage, StickerPack, Trust, convert, transfer::PendingTransfer,
+    LinkEvent, Outgoing, Provisioner, RateLimited, RegistrationStep, RequestResponse, SendableFile,
+    SignalBackend, StickerImage, StickerPack, Trust, convert, transfer::PendingTransfer,
 };
 
 type Job = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()>>> + Send>;
@@ -705,6 +705,32 @@ async fn send(
                 })?;
         }
         return Ok(());
+    }
+    if let Outgoing::MessageRequestResponse { response } = message {
+        let Recipient::Contact(contact) = to else {
+            bail!("a message request answer only goes to a contact, not group {to:?}");
+        };
+        if response == RequestResponse::Accept {
+            manager
+                .send_message(
+                    convert::aci(contact),
+                    convert::profile_key_update(sent_at_ms),
+                    sent_at_ms,
+                )
+                .await
+                .map_err(|e| {
+                    signal_error(e, format!("unable to share the profile with {contact}"))
+                })?;
+        }
+        let me = manager.registration_data().service_ids.aci();
+        return manager
+            .send_message(
+                me,
+                convert::request_response_sync(contact, response)?,
+                sent_at_ms,
+            )
+            .await
+            .map_err(|e| signal_error(e, "unable to tell this account's devices the answer"));
     }
     match to {
         Recipient::Contact(contact) => {
@@ -1467,6 +1493,29 @@ mod tests {
                 "sticker {sticker_id}: unclear error: {err:#}"
             );
         }
+    }
+
+    /// A message request comes from a person; answering one for a group
+    /// would mean joining or leaving it, a group change, so it must fail
+    /// before anything reaches Signal.
+    #[tokio::test]
+    async fn a_message_request_answer_to_a_group_is_refused_without_the_network() {
+        let (_dir, path) = temp_store();
+        register_linked(&path).await;
+        let signal = PresageSignal::open(&path, &KEY).await.expect("opens");
+        let err = signal
+            .send(
+                Recipient::Group(GroupId::new([3; 32])),
+                Outgoing::MessageRequestResponse {
+                    response: crate::RequestResponse::Accept,
+                },
+            )
+            .await
+            .expect_err("answered a request for a group");
+        assert!(
+            err.to_string().contains("only goes to a contact"),
+            "unclear error: {err:#}"
+        );
     }
 
     /// Sticker tools answer from the packs presage already stored, so listing

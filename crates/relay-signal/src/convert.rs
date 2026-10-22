@@ -29,7 +29,7 @@ use presage::{
 };
 use relay_core::prelude::*;
 
-use crate::{Account, Incoming, Outgoing, StickerInfo, StickerPack};
+use crate::{Account, Incoming, Outgoing, RequestResponse, StickerInfo, StickerPack};
 
 /// What `content` means to the agent, or `None` when it carries nothing the
 /// agent keeps (delivery receipts, calls, stories, key syncs). `me` is the
@@ -358,6 +358,11 @@ pub(crate) fn content_body(
         Outgoing::Sticker { .. } => {
             bail!("a sticker goes out through sticker_body, once its pack is looked up")
         }
+        Outgoing::MessageRequestResponse { .. } => {
+            bail!(
+                "a message request answer goes out through profile_key_update and request_response_sync"
+            )
+        }
         Outgoing::ExpirationTimer { .. } if group.is_some() => {
             bail!("a timer update only goes to a contact; a group's timer is a group change")
         }
@@ -367,6 +372,50 @@ pub(crate) fn content_body(
             ..Default::default()
         })),
     })
+}
+
+/// A message that only hands the recipient this account's profile key, which
+/// presage attaches to every data message it sends.
+pub(crate) fn profile_key_update(sent_at_ms: u64) -> ContentBody {
+    ContentBody::DataMessage(DataMessage {
+        timestamp: Some(sent_at_ms),
+        flags: Some(data_message::Flags::ProfileKeyUpdate as u32),
+        ..Default::default()
+    })
+}
+
+/// Tells this account's other devices how it answered `thread`'s message
+/// request.
+pub(crate) fn request_response_sync(
+    thread: ServiceId,
+    response: RequestResponse,
+) -> anyhow::Result<ContentBody> {
+    use sync_message::message_request_response::Type;
+    let r#type = match response {
+        RequestResponse::Accept => Type::Accept,
+        RequestResponse::Delete => Type::Delete,
+    };
+    Ok(ContentBody::SynchronizeMessage(SyncMessage {
+        content: Some(SyncContent::MessageRequestResponse(
+            sync_message::MessageRequestResponse {
+                thread_aci_binary: Some(aci(thread).service_id_binary()),
+                r#type: Some(r#type as i32),
+                ..Default::default()
+            },
+        )),
+        padding: Some(sync_padding()?),
+        ..Default::default()
+    }))
+}
+
+/// 1 to 512 random bytes, as Signal's apps pad sync messages so their size
+/// doesn't give away what they carry.
+fn sync_padding() -> anyhow::Result<Vec<u8>> {
+    let mut size = [0u8; 2];
+    getrandom::fill(&mut size).map_err(|e| anyhow::anyhow!("no OS randomness: {e}"))?;
+    let mut padding = vec![0; 1 + usize::from(u16::from_le_bytes(size) % 512)];
+    getrandom::fill(&mut padding).map_err(|e| anyhow::anyhow!("no OS randomness: {e}"))?;
+    Ok(padding)
 }
 
 /// What to put on the wire for sticker `sticker_id` of `pack`, whose image
@@ -1091,6 +1140,47 @@ mod tests {
                 update.flags,
                 Some(data_message::Flags::ExpirationTimerUpdate as u32)
             );
+        }
+    }
+
+    proptest! {
+        /// Accepting a request must hand the requester our profile key in a
+        /// message flagged as a profile-key update, or their app keeps
+        /// showing us as a stranger.
+        #[test]
+        fn accepting_a_request_sends_a_flagged_profile_key_update(sent_at_ms in 1u64..) {
+            let ContentBody::DataMessage(update) = profile_key_update(sent_at_ms) else {
+                panic!("the profile key update is not a data message");
+            };
+            prop_assert_eq!(update.flags, Some(data_message::Flags::ProfileKeyUpdate as u32));
+            prop_assert_eq!(update.timestamp, Some(sent_at_ms));
+            prop_assert_eq!(update.body, None);
+        }
+    }
+
+    proptest! {
+        /// Our other devices match the answer to a conversation by the
+        /// requester's ACI, and must see the same answer we gave.
+        #[test]
+        fn the_request_answer_syncs_to_own_devices_naming_the_requester(
+            accept in any::<bool>(),
+        ) {
+            let response = if accept { RequestResponse::Accept } else { RequestResponse::Delete };
+            let ContentBody::SynchronizeMessage(sync) =
+                request_response_sync(ServiceId::new(ALICE), response).expect("converts")
+            else {
+                panic!("the answer is not a sync message");
+            };
+            let Some(SyncContent::MessageRequestResponse(answer)) = sync.content else {
+                panic!("the sync carries no message request response");
+            };
+            prop_assert_eq!(answer.thread_aci_binary, Some(ALICE.as_bytes().to_vec()));
+            let expected = if accept {
+                sync_message::message_request_response::Type::Accept
+            } else {
+                sync_message::message_request_response::Type::Delete
+            };
+            prop_assert_eq!(answer.r#type, Some(expected as i32));
         }
     }
 

@@ -172,6 +172,22 @@ pub enum Outgoing {
     ExpirationTimer {
         seconds: u32,
     },
+    /// Answers a message request from a contact this account hasn't talked
+    /// to. Accepting shares this account's profile with them and tells its
+    /// own devices; deleting only tells its own devices. Only sendable to a
+    /// contact.
+    MessageRequestResponse {
+        response: RequestResponse,
+    },
+}
+
+/// An answer to a message request. Blocking is a storage-service contact
+/// edit, so it isn't one of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestResponse {
+    Accept,
+    Delete,
 }
 
 /// Something that arrived, from another person or synced from the account's

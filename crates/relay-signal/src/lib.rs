@@ -12,7 +12,7 @@ mod transfer;
 pub use backend::{
     Account, Contact, Device, DiscoveryUnsupported, Group, HISTORY_ARCHIVE_FILE, HistoryTransfer,
     Identity, Incoming, LinkEvent, Outgoing, Provisioner, RateLimited, RegistrationStep,
-    SignalBackend, StickerImage, StickerInfo, StickerPack, Trust,
+    RequestResponse, SignalBackend, StickerImage, StickerInfo, StickerPack, Trust,
 };
 pub use fake::FakeSignal;
 pub use files::{SendRoots, SendableFile};
@@ -22,6 +22,7 @@ pub mod prelude {
     pub use crate::{
         Account, Contact, Device, DiscoveryUnsupported, FakeSignal, Group, HistoryTransfer,
         Identity, Incoming, LinkEvent, Outgoing, Provisioner, RateLimited, RegistrationStep,
-        SendRoots, SendableFile, SignalBackend, StickerImage, StickerInfo, StickerPack, Trust,
+        RequestResponse, SendRoots, SendableFile, SignalBackend, StickerImage, StickerInfo,
+        StickerPack, Trust,
     };
 }

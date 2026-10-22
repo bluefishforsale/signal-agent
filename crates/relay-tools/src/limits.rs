@@ -14,8 +14,8 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use relay_core::prelude::*;
 use relay_signal::{
-    Account, Contact, Device, Group, Identity, Incoming, Outgoing, RateLimited, SendableFile,
-    SignalBackend, StickerImage, StickerPack,
+    Account, Contact, Device, Group, Identity, Incoming, Outgoing, RateLimited, RequestResponse,
+    SendableFile, SignalBackend, StickerImage, StickerPack,
 };
 use relay_store::MessageStore;
 use serde::{Deserialize, Serialize};
@@ -206,9 +206,15 @@ impl Limiter {
         self
     }
 
-    /// Counts one message to `to`, or refuses it.
-    async fn admit(&self, store: &dyn MessageStore, to: Recipient) -> anyhow::Result<()> {
-        let known = !store.history(to, None, 1).await?.is_empty();
+    /// Counts one message to `to`, or refuses it. A `first_contact` counts
+    /// against the new-recipient cap whatever the history holds.
+    async fn admit(
+        &self,
+        store: &dyn MessageStore,
+        to: Recipient,
+        first_contact: bool,
+    ) -> anyhow::Result<()> {
+        let known = !first_contact && !store.history(to, None, 1).await?.is_empty();
         let now = self.clock.now_ms();
         let mut state = self.state.lock().expect("limiter state");
         if now < state.sends_paused_until_ms {
@@ -466,7 +472,15 @@ impl SignalBackend for Guarded {
     }
     async fn send(&self, to: Recipient, message: Outgoing) -> anyhow::Result<MessageId> {
         if counts(&message) {
-            self.limiter.admit(self.store.as_ref(), to).await?;
+            let first_contact = matches!(
+                message,
+                Outgoing::MessageRequestResponse {
+                    response: RequestResponse::Accept
+                }
+            );
+            self.limiter
+                .admit(self.store.as_ref(), to, first_contact)
+                .await?;
         }
         let sent = self.inner.send(to, message).await;
         // The pause holds in memory even when it can't be saved, and the
@@ -530,7 +544,8 @@ impl SignalBackend for Guarded {
 }
 
 /// Messages a person sees count; typing indicators and read receipts are
-/// background chatter every Signal client sends freely.
+/// background chatter every Signal client sends freely. Deleting a message
+/// request reaches only this account's own devices.
 // Stickers, pins, unpins, poll creates, votes and closes, and admin deletes
 // all show up in the conversation for everyone in it, so they count like text.
 fn counts(message: &Outgoing) -> bool {
@@ -546,8 +561,15 @@ fn counts(message: &Outgoing) -> bool {
         | Outgoing::PollVote { .. }
         | Outgoing::PollTerminate { .. }
         | Outgoing::AdminDelete { .. }
-        | Outgoing::ExpirationTimer { .. } => true,
-        Outgoing::Typing { .. } | Outgoing::ReadReceipt { .. } => false,
+        | Outgoing::ExpirationTimer { .. }
+        | Outgoing::MessageRequestResponse {
+            response: RequestResponse::Accept,
+        } => true,
+        Outgoing::Typing { .. }
+        | Outgoing::ReadReceipt { .. }
+        | Outgoing::MessageRequestResponse {
+            response: RequestResponse::Delete,
+        } => false,
     }
 }
 
@@ -824,6 +846,48 @@ mod tests {
             result.is_ok(),
             "the cap did not reset after a day: {result:?}"
         );
+    }
+
+    /// A message request means the stranger already wrote, so their history
+    /// is no evidence we know them: accepting is a first contact and spends
+    /// the new-recipient cap, while deleting only tells our own devices and
+    /// spends nothing.
+    #[tokio::test]
+    async fn accepting_a_message_request_is_a_first_contact_and_deleting_one_is_free() {
+        let limiter = Arc::new(Limiter::new(
+            Limits {
+                new_recipients_per_day: 1,
+                ..Limits::default()
+            },
+            Arc::new(FakeClock::default()),
+        ));
+        let (ctx, signal) = ctx();
+        for stranger in [2, 3] {
+            ctx.store
+                .insert(&incoming(stranger, 1, "hi, it's me"))
+                .await
+                .expect("seed");
+        }
+        let guarded = guard(Some(&limiter), &ctx).signal;
+        let answer = |response| Outgoing::MessageRequestResponse { response };
+        guarded
+            .send(Recipient::Contact(sid(2)), answer(RequestResponse::Accept))
+            .await
+            .expect("first accept within the cap");
+        let result = guarded
+            .send(Recipient::Contact(sid(3)), answer(RequestResponse::Accept))
+            .await;
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|e| e.downcast_ref::<LimitExceeded>().is_some()),
+            "a second accept went past a cap of one: {result:?}"
+        );
+        guarded
+            .send(Recipient::Contact(sid(3)), answer(RequestResponse::Delete))
+            .await
+            .expect("a delete spent the new-recipient cap");
+        assert_eq!(signal.sent().len(), 2, "{:?}", signal.sent());
     }
 
     /// Restarting the agent must not refill the send buckets, or a client that
