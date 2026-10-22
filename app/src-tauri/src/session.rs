@@ -82,7 +82,10 @@ impl Session {
         }
         let at_rest = matches!(
             *self.screen.lock().expect("screen lock"),
-            View::ChooseAccount { .. } | View::Done { .. } | View::Failed { .. }
+            View::AlreadySetUp { .. }
+                | View::ChooseAccount { .. }
+                | View::Done { .. }
+                | View::Failed { .. }
         );
         if !at_rest {
             bail!("finish or close this account's setup first");
@@ -288,6 +291,21 @@ mod tests {
         );
         let switched = session.switch_to(scripted());
         assert!(switched.is_err(), "switched halfway through");
+    }
+
+    /// Opening the app on a set-up account shows "already set up", where
+    /// Advanced offers Accounts, so adding another account must work there.
+    #[tokio::test(start_paused = true)]
+    async fn an_already_set_up_account_can_be_switched_out() {
+        let (session, _run) = Session::new(
+            Box::new(Scripted::new(
+                SetupState::for_profile("Mac", Some(relay_core::AccessMode::Full)),
+                link_at_once,
+            )),
+            |_| {},
+        );
+        let switched = session.switch_to(scripted());
+        assert!(switched.is_ok(), "refused from already set up");
     }
 
     /// A click setup ignores changes nothing, but the page still needs a

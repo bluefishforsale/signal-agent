@@ -436,6 +436,25 @@ mod tests {
         }
     }
 
+    /// "Add another account" lives under Advanced, so every screen the app
+    /// can open on must reach Accounts, or a set-up user can't add one.
+    #[test]
+    fn accounts_are_reachable_from_every_screen_the_app_opens_on() {
+        let page = include_str!("../../ui/index.html");
+        for screen in ["choose_account", "already_set_up"] {
+            let start = format!("<section data-screen=\"{screen}\"");
+            let section = page
+                .split(&start)
+                .nth(1)
+                .and_then(|rest| rest.split("</section>").next())
+                .unwrap_or_else(|| panic!("index.html has no {screen} screen"));
+            assert!(
+                section.contains("data-action=\"show_accounts\""),
+                "{screen} has no way to Accounts"
+            );
+        }
+    }
+
     /// The box that deletes messages and keys must say exactly that, in the
     /// words the acceptance checklist tells the tester to look for.
     #[test]
