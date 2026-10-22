@@ -5,11 +5,29 @@ use std::sync::Arc;
 
 use anyhow::bail;
 use futures::StreamExt;
+use relay_core::ProfileName;
 use relay_signal::{Incoming, SignalBackend};
 use relay_store::MessageStore;
+use relay_tools::WebhookUrl;
+
+/// Where newly captured messages are posted, for one profile.
+pub(crate) struct Webhook {
+    profile: ProfileName,
+    pub(crate) url: WebhookUrl,
+}
+
+impl Webhook {
+    pub(crate) fn new(profile: ProfileName, url: WebhookUrl) -> Self {
+        Self { profile, url }
+    }
+}
 
 /// Applies every event from `signal.incoming()` to `store` until the stream ends.
-pub(crate) async fn run(signal: Arc<dyn SignalBackend>, store: Arc<dyn MessageStore>) {
+pub(crate) async fn run(
+    signal: Arc<dyn SignalBackend>,
+    store: Arc<dyn MessageStore>,
+    webhook: Option<Webhook>,
+) {
     let mut events = signal.incoming();
     while let Some(event) = events.next().await {
         let result = match event {
@@ -119,7 +137,7 @@ mod tests {
     async fn received_messages_land_in_the_store_without_a_client() {
         let signal = fake();
         let store = Arc::new(MemoryStore::default());
-        let capture = tokio::spawn(run(signal.clone(), store.clone()));
+        let capture = tokio::spawn(run(signal.clone(), store.clone(), None));
         signal.push(Incoming::Message(msg(2, 10, "dinner at 8")));
         let hits = eventually(|| async {
             store
@@ -142,7 +160,7 @@ mod tests {
     async fn a_forged_edit_is_refused_and_capture_keeps_going() {
         let signal = fake();
         let store = Arc::new(MemoryStore::default());
-        let capture = tokio::spawn(run(signal.clone(), store.clone()));
+        let capture = tokio::spawn(run(signal.clone(), store.clone(), None));
         let original = msg(2, 10, "original");
         let conversation = original.conversation;
         signal.push(Incoming::Message(original.clone()));
@@ -179,7 +197,7 @@ mod tests {
     async fn deletes_are_applied_with_their_sender() {
         let signal = fake();
         let store = Arc::new(MemoryStore::default());
-        let capture = tokio::spawn(run(signal.clone(), store.clone()));
+        let capture = tokio::spawn(run(signal.clone(), store.clone(), None));
         let original = msg(2, 10, "oops");
         let conversation = original.conversation;
         signal.push(Incoming::Message(original.clone()));
@@ -208,7 +226,7 @@ mod tests {
     async fn read_syncs_clear_unread() {
         let signal = fake();
         let store = Arc::new(MemoryStore::default());
-        let capture = tokio::spawn(run(signal.clone(), store.clone()));
+        let capture = tokio::spawn(run(signal.clone(), store.clone(), None));
         let original = msg(2, 10, "seen it");
         signal.push(Incoming::Message(original.clone()));
         signal.push(Incoming::Read {
@@ -239,7 +257,7 @@ mod tests {
     async fn a_message_claiming_another_authors_id_is_dropped_and_the_original_is_unchanged() {
         let signal = fake();
         let store = Arc::new(MemoryStore::default());
-        let capture = tokio::spawn(run(signal.clone(), store.clone()));
+        let capture = tokio::spawn(run(signal.clone(), store.clone(), None));
         let original = msg(2, 10, "original");
         signal.push(Incoming::Message(original.clone()));
         let mut forged = msg(2, 11, "forged");
@@ -273,7 +291,7 @@ mod tests {
     async fn an_identity_change_does_not_interrupt_capture() {
         let signal = fake();
         let store = Arc::new(MemoryStore::default());
-        let capture = tokio::spawn(run(signal.clone(), store.clone()));
+        let capture = tokio::spawn(run(signal.clone(), store.clone(), None));
         signal.push(Incoming::IdentityChanged {
             contact: ServiceId::new(Uuid::from_u128(2)),
         });
@@ -322,7 +340,7 @@ mod tests {
         let group = GroupId::new([7; 32]);
         let signal = fake_with_group(group, &[3]);
         let store = Arc::new(MemoryStore::default());
-        let capture = tokio::spawn(run(signal.clone(), store.clone()));
+        let capture = tokio::spawn(run(signal.clone(), store.clone(), None));
         let original = group_msg(group, 2, 10, "spam");
         signal.push(Incoming::Message(original.clone()));
         signal.push(Incoming::AdminDelete {
@@ -346,7 +364,7 @@ mod tests {
         let group = GroupId::new([7; 32]);
         let signal = fake_with_group(group, &[3]);
         let store = Arc::new(MemoryStore::default());
-        let capture = tokio::spawn(run(signal.clone(), store.clone()));
+        let capture = tokio::spawn(run(signal.clone(), store.clone(), None));
         let original = group_msg(group, 2, 10, "keep me");
         signal.push(Incoming::Message(original.clone()));
         signal.push(Incoming::AdminDelete {
