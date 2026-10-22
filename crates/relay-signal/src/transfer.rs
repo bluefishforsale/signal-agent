@@ -703,4 +703,37 @@ mod tests {
             )
         );
     }
+
+    /// A file left by an earlier, killed run may hold another archive's
+    /// bytes; a fresh fetch must replace it, never resume onto it.
+    #[tokio::test]
+    async fn a_stale_archive_file_is_replaced_not_resumed() {
+        let archive = b"the new archive".to_vec();
+        let server = FakeServer::start(vec![
+            json("200 OK", r#"{"cdn":0,"key":"k"}"#),
+            bytes("200 OK", "", &archive, archive.len()),
+        ])
+        .await;
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(
+            dir.path().join(ARCHIVE_FILE),
+            b"stale bytes from a killed run",
+        )
+        .expect("stale file");
+        let transfer = source(&server)
+            .fetch(LinkAndSyncKey::new([5; 32]), dir.path())
+            .await
+            .expect("fetched");
+        let HistoryTransfer::Archive { path, .. } = transfer else {
+            panic!("no archive: {transfer:?}");
+        };
+        assert_eq!(std::fs::read(&path).expect("file"), archive);
+        let requests = server.requests();
+        assert!(
+            requests
+                .iter()
+                .all(|r| !r.to_lowercase().contains("range:")),
+            "resumed onto a stale file: {requests:?}"
+        );
+    }
 }
