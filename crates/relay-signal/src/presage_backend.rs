@@ -22,6 +22,7 @@ use futures::{StreamExt, stream::BoxStream};
 use presage::{
     Manager,
     libsignal_service::{
+        ProfileManagerError,
         configuration::SignalServers,
         prelude::{MessageSenderError, ServiceError, phonenumber::PhoneNumber},
         provisioning::ProvisioningError,
@@ -325,8 +326,46 @@ impl SignalBackend for PresageSignal {
         Ok(aci.map(|aci| ServiceId::new(aci.into())))
     }
 
-    async fn avatar(&self, _of: Recipient) -> anyhow::Result<Option<Vec<u8>>> {
-        bail!("avatars are not implemented yet (lane L1b)")
+    async fn avatar(&self, of: Recipient) -> anyhow::Result<Option<Vec<u8>>> {
+        let me = self.account.service_id;
+        let mut manager = self.manager.clone();
+        self.worker
+            .run(move || async move {
+                match of {
+                    Recipient::Contact(contact) => {
+                        let profile_key = if contact == me {
+                            Some(manager.registration_data().profile_key())
+                        } else {
+                            manager
+                                .store()
+                                .profile_key(&convert::aci(contact).into())
+                                .await
+                                .context("unable to read profile keys")?
+                        };
+                        let Some(profile_key) = profile_key else {
+                            bail!("{contact} hasn't shared their profile key, so their picture can't be read");
+                        };
+                        manager
+                            .retrieve_profile_avatar_by_uuid(contact.uuid(), profile_key)
+                            .await
+                            .map_err(|e| {
+                                signal_error(e, format!("unable to fetch the picture of {contact}"))
+                            })
+                    }
+                    Recipient::Group(id) => {
+                        let (master_key, group) = group_by_id(manager.store(), id).await?;
+                        let context = GroupContextV2 {
+                            master_key: Some(master_key.to_vec()),
+                            revision: Some(group.revision),
+                            group_change: None,
+                        };
+                        manager.retrieve_group_avatar(context).await.map_err(|e| {
+                            signal_error(e, format!("unable to fetch the avatar of group {id}"))
+                        })
+                    }
+                }
+            })
+            .await?
     }
 
     async fn identities(&self) -> anyhow::Result<Vec<Identity>> {
@@ -833,7 +872,8 @@ where
 fn rate_limited<S: std::error::Error>(error: &presage::Error<S>) -> Option<RateLimited> {
     match error {
         presage::Error::ServiceError(service)
-        | presage::Error::ProvisioningError(ProvisioningError::ServiceError(service)) => {
+        | presage::Error::ProvisioningError(ProvisioningError::ServiceError(service))
+        | presage::Error::ProfileManagerError(ProfileManagerError::ServiceError(service)) => {
             service_rate_limited(service)
         }
         presage::Error::MessageSenderError(sender) => match sender.as_ref() {
@@ -1287,6 +1327,64 @@ mod tests {
         );
     }
 
+    /// A contact's profile picture is encrypted with their profile key; with
+    /// none shared, there's nothing to decrypt, so fetching it from Signal
+    /// would only spend a request. It must fail clearly instead.
+    #[tokio::test]
+    async fn a_contacts_avatar_without_their_profile_key_fails_without_the_network() {
+        let (_dir, path) = temp_store();
+        register_linked(&path).await;
+        let signal = PresageSignal::open(&path, &KEY).await.expect("opens");
+        let alice = ServiceId::new(uuid::Uuid::from_u128(0xa11ce));
+        let err = signal
+            .avatar(Recipient::Contact(alice))
+            .await
+            .expect_err("fetched an avatar with no profile key");
+        assert!(
+            err.to_string().contains("profile key"),
+            "unclear error: {err:#}"
+        );
+    }
+
+    /// Pictures presage already fetched come from its store, for a contact
+    /// under their profile key and for a group under its public id, without
+    /// asking Signal again.
+    #[tokio::test]
+    async fn cached_avatars_come_from_the_store() {
+        let (_dir, path) = temp_store();
+        register_linked(&path).await;
+        let me = uuid::Uuid::parse_str(ME).expect("uuid");
+        let alice = uuid::Uuid::from_u128(0xa11ce);
+        seed(&path, move |mut store| async move {
+            let key = presage::libsignal_service::prelude::ProfileKey::create([5; 32]);
+            store.upsert_profile_key(&alice, key).await.expect("key");
+            store
+                .save_profile_avatar(alice, key, &vec![1, 2, 3])
+                .await
+                .expect("profile avatar");
+            store
+                .save_group([4; 32], cached_group("cats", &[me]))
+                .await
+                .expect("group");
+            store
+                .save_group_avatar([4; 32], &vec![4, 5])
+                .await
+                .expect("group avatar");
+        })
+        .await;
+        let signal = PresageSignal::open(&path, &KEY).await.expect("opens");
+        let contact = signal
+            .avatar(Recipient::Contact(ServiceId::new(alice)))
+            .await
+            .expect("contact avatar");
+        assert_eq!(contact, Some(vec![1, 2, 3]));
+        let group = signal
+            .avatar(Recipient::Group(convert::group_id([4; 32])))
+            .await
+            .expect("group avatar");
+        assert_eq!(group, Some(vec![4, 5]));
+    }
+
     /// Sending to a group the account isn't in must fail with a reason, before
     /// anything reaches Signal, as it does on FakeSignal.
     #[tokio::test]
@@ -1621,6 +1719,21 @@ mod tests {
         let limited = error
             .downcast_ref::<RateLimited>()
             .unwrap_or_else(|| panic!("an upload 429 went unrecognized: {error:#}"));
+        assert_eq!(limited.retry_after, Some(Duration::from_secs(30)));
+    }
+
+    /// Fetching a contact's profile for their picture wraps Signal's answer in
+    /// a profile error; a 429 there must still be recognized.
+    #[test]
+    fn a_rate_limited_profile_fetch_is_recognized() {
+        let error = TestError::ProfileManagerError(
+            presage::libsignal_service::ProfileManagerError::ServiceError(
+                ServiceError::RateLimitExceeded {
+                    retry_after: Some(chrono::Duration::seconds(30)),
+                },
+            ),
+        );
+        let limited = rate_limited(&error).expect("a profile 429 went unrecognized");
         assert_eq!(limited.retry_after, Some(Duration::from_secs(30)));
     }
 
