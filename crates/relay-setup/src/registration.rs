@@ -242,4 +242,84 @@ mod tests {
         assert!(commands.is_empty(), "retry re-sent by itself: {commands:?}");
         assert_eq!(signal.requests.load(Ordering::SeqCst), 1);
     }
+
+    /// Stands in for Signal asking for a captcha before it will send a code.
+    #[derive(Default)]
+    struct WantsCaptcha {
+        captchas: std::sync::Mutex<Vec<Option<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provisioner for WantsCaptcha {
+        fn link(&self, _: String) -> BoxStream<'static, anyhow::Result<LinkEvent>> {
+            futures::stream::empty().boxed()
+        }
+
+        async fn request_code(
+            &self,
+            _: &str,
+            captcha: Option<&str>,
+            _: bool,
+        ) -> anyhow::Result<RegistrationStep> {
+            let mut captchas = self.captchas.lock().expect("captchas lock");
+            captchas.push(captcha.map(str::to_owned));
+            Ok(match captcha {
+                None => RegistrationStep::CaptchaRequired,
+                Some(_) => RegistrationStep::CodeSent,
+            })
+        }
+
+        async fn verify_code(&self, _: &str) -> anyhow::Result<RegistrationStep> {
+            Ok(RegistrationStep::Registered {
+                account: relay_signal::Account {
+                    service_id: relay_core::ServiceId::parse(
+                        "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
+                    )?,
+                    phone_number: Some("+15555550123".into()),
+                    kind: relay_core::ProfileKind::Primary,
+                    device_name: "Claude".into(),
+                },
+            })
+        }
+    }
+
+    /// The whole own-number flow, driven the way a front end drives it: the
+    /// token the captcha page navigates to must reach Signal unchanged on the
+    /// second request, and the number ends up a primary profile.
+    #[tokio::test]
+    async fn own_number_registration_carries_the_captured_token_to_signal() {
+        let signal = WantsCaptcha::default();
+        let mut state = SetupState::EnterNumber;
+        let mut pending = vec![SetupEvent::NumberEntered {
+            number: "+15555550123".into(),
+        }];
+        while let Some(event) = pending.pop() {
+            let (next, commands) = transition(&state, event);
+            state = next;
+            for command in &commands {
+                pending.extend(run_registration(command, &signal).await);
+            }
+            match &state {
+                SetupState::SolveCaptcha { .. } => {
+                    let link = format!("signalcaptcha://{HCAPTCHA}");
+                    let token = captcha_token(&link).expect("token from link");
+                    pending.push(SetupEvent::CaptchaSolved { token });
+                }
+                SetupState::EnterCode { .. } => pending.push(SetupEvent::CodeEntered {
+                    code: "123456".into(),
+                }),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            state,
+            SetupState::ChooseAccess {
+                kind: relay_core::ProfileKind::Primary
+            }
+        );
+        assert_eq!(
+            *signal.captchas.lock().expect("captchas lock"),
+            [None, Some(HCAPTCHA.to_owned())]
+        );
+    }
 }

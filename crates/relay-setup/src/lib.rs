@@ -10,13 +10,14 @@ mod uninstall;
 
 pub use machine::{AccountChoice, ClientOutcome, Command, SetupEvent, SetupState, transition};
 pub use profiles::Profiles;
-pub use registration::{CAPTCHA_PAGE, captcha_navigation_allowed, captcha_token};
+pub use registration::{CAPTCHA_PAGE, captcha_navigation_allowed, captcha_token, run_registration};
 pub use uninstall::{Step, StepOutcome, run_steps, uninstall_steps};
 
 pub mod prelude {
     pub use crate::{
-        AccountChoice, ClientOutcome, Command, SetupEvent, SetupState, Step, StepOutcome,
+        AccountChoice, CAPTCHA_PAGE, ClientOutcome, Command, Profiles, SetupEvent, SetupState,
+        Step, StepOutcome, captcha_navigation_allowed, captcha_token,
         claude::{ClaudeClient, ClientReport, ClientStatus, Clients, ServerEntry},
-        run_steps, transition, uninstall_steps,
+        run_registration, run_steps, transition, uninstall_steps,
     };
 }
