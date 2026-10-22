@@ -2,6 +2,7 @@
 //! Claude clients launch, and the terminal setup flow, in one binary so every
 //! platform ships a single signed executable.
 
+mod history_cli;
 mod http_cli;
 mod setup_tty;
 
@@ -44,6 +45,9 @@ enum Cmd {
     /// The HTTP endpoint for remote MCP clients (Advanced).
     #[command(subcommand)]
     Http(http_cli::HttpCmd),
+    /// Bring in earlier messages after setup.
+    #[command(subcommand)]
+    History(history_cli::HistoryCmd),
 }
 
 #[tokio::main]
@@ -88,6 +92,7 @@ async fn main() -> anyhow::Result<()> {
             let paths = ProfilePaths::for_profile(&profile)?;
             http_cli::run(cmd, &paths, &mut std::io::stdout())
         }
+        Cmd::History(cmd) => history_cli::run(cmd, &profile, &mut std::io::stdout()).await,
     }
 }
 
@@ -152,6 +157,28 @@ mod tests {
         assert!(
             matches!(cli.command, Cmd::Agent { all_profiles: true }),
             "parsed as a single profile's agent"
+        );
+    }
+
+    /// The human path to Signal Desktop's history after setup, as setup and
+    /// the docs name it.
+    #[test]
+    fn the_desktop_import_command_line_parses() {
+        let cli = Cli::try_parse_from([
+            "signal-agent",
+            "history",
+            "import-desktop",
+            "--from",
+            "/elsewhere/Signal",
+        ])
+        .expect("parse");
+        assert!(
+            matches!(
+                cli.command,
+                Cmd::History(history_cli::HistoryCmd::ImportDesktop { from: Some(ref dir) })
+                    if dir == std::path::Path::new("/elsewhere/Signal")
+            ),
+            "parsed as something else"
         );
     }
 

@@ -22,6 +22,8 @@ pub fn from_page(event: SetupEvent) -> Option<SetupEvent> {
         | E::CodeEntered { .. }
         | E::CodeByVoice
         | E::AccessChosen { .. }
+        | E::SkipHistory
+        | E::DesktopImportChosen { .. }
         | E::RestartDesktop
         | E::Retry => Some(event),
         E::LinkUri { .. }
@@ -31,6 +33,11 @@ pub fn from_page(event: SetupEvent) -> Option<SetupEvent> {
         | E::Registered
         | E::HistoryProgress { .. }
         | E::HistoryDone
+        | E::NoHistory { .. }
+        | E::DesktopFound
+        | E::DesktopAbsent
+        | E::DesktopProgress { .. }
+        | E::DesktopImportDone
         | E::ClientsConnected { .. }
         | E::CommandFailed { .. } => None,
     }
@@ -96,6 +103,13 @@ mod tests {
                 total: None,
             },
             SetupEvent::HistoryDone,
+            SetupEvent::NoHistory {
+                reason: HistoryGap::NotSent,
+            },
+            SetupEvent::DesktopFound,
+            SetupEvent::DesktopAbsent,
+            SetupEvent::DesktopProgress { imported: 1 },
+            SetupEvent::DesktopImportDone,
             SetupEvent::ClientsConnected {
                 clients: Vec::new(),
             },
@@ -151,6 +165,15 @@ mod tests {
                 r#"{"event":"restart_desktop"}"#,
             ),
             (r#"event: "retry""#, r#"{"event":"retry"}"#),
+            (r#"event: "skip_history""#, r#"{"event":"skip_history"}"#),
+            (
+                r#"event: "desktop_import_chosen", import: true"#,
+                r#"{"event":"desktop_import_chosen","import":true}"#,
+            ),
+            (
+                r#"event: "desktop_import_chosen", import: false"#,
+                r#"{"event":"desktop_import_chosen","import":false}"#,
+            ),
             (
                 r#"event: "number_entered", number: "#,
                 r#"{"event":"number_entered","number":"+15555550123"}"#,

@@ -2,18 +2,26 @@
 //! commands they return against injected services, and feeds the results back
 //! in, so each front end only renders states and reports what the user did.
 
-use std::{collections::VecDeque, fs, path::Path, sync::Arc};
+use std::{
+    collections::VecDeque,
+    fs, io,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::{Context, bail};
 use async_trait::async_trait;
 use futures::StreamExt;
-use relay_core::prelude::*;
+use relay_core::{LinkAndSyncKey, prelude::*};
 use relay_secrets::{SecretStore, StoreKey};
-use relay_signal::{LinkEvent, Provisioner, RateLimited, RegistrationStep};
+use relay_signal::{
+    HISTORY_ARCHIVE_FILE, HistoryTransfer, LinkEvent, Provisioner, RateLimited, RegistrationStep,
+};
 use relay_tools::{Clock, Limits, Settings, SystemClock};
+use tokio::sync::watch;
 
 use crate::{
-    Command, Profiles, SetupEvent, SetupState,
+    Command, HistoryGap, Profiles, SetupEvent, SetupState,
     claude::{Clients, ServerEntry},
     transition,
 };
@@ -25,14 +33,33 @@ pub trait OpenProvisioner: Send + Sync {
     async fn open(&self, path: &Path, key: &StoreKey) -> anyhow::Result<Box<dyn Provisioner>>;
 }
 
-/// Brings a newly linked device's earlier messages into its store.
+/// Writes the history archive a phone sent a newly linked device into its
+/// store.
 #[async_trait]
 pub trait HistoryImport: Send + Sync {
-    /// Imports everything available, reporting messages imported so far and
-    /// the total when known.
+    /// Imports `archive`, encrypted under `key` for the account `our_aci`,
+    /// reporting messages imported so far and the total when known.
     async fn import(
         &self,
+        archive: &Path,
+        key: &LinkAndSyncKey,
+        our_aci: ServiceId,
         progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
+    ) -> anyhow::Result<()>;
+}
+
+/// Signal Desktop's own history on this computer, read only if the user opts in.
+#[async_trait]
+pub trait DesktopHistory: Send + Sync {
+    /// Whether Signal Desktop's data is on this computer.
+    fn found(&self) -> bool;
+
+    /// Imports Desktop's messages, refusing a Desktop signed in to any account
+    /// but `our_aci`, and reporting how many so far.
+    async fn import(
+        &self,
+        our_aci: ServiceId,
+        progress: &mut (dyn FnMut(u64) + Send),
     ) -> anyhow::Result<()>;
 }
 
@@ -46,8 +73,35 @@ pub struct Services {
     pub signal: Box<dyn OpenProvisioner>,
     pub secrets: Box<dyn SecretStore>,
     pub history: Box<dyn HistoryImport>,
+    pub desktop: Box<dyn DesktopHistory>,
     pub login: Box<dyn LoginItem>,
     pub clients: Clients,
+}
+
+/// Stops a history import from outside the driver. The import holds the
+/// driver until it ends, which can be an hour, so a Skip click queued behind it
+/// would never be seen.
+#[derive(Clone)]
+pub struct HistorySkip(Arc<watch::Sender<Import>>);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Import {
+    Idle,
+    Running,
+    Skipped,
+}
+
+impl HistorySkip {
+    /// Abandons the history import running now. Returns whether one was.
+    pub fn skip(&self) -> bool {
+        self.0.send_if_modified(|import| {
+            let running = *import == Import::Running;
+            if running {
+                *import = Import::Skipped;
+            }
+            running
+        })
+    }
 }
 
 /// What a front end passes to watch each state as setup enters it.
@@ -61,7 +115,10 @@ pub struct Driver {
     server: ServerEntry,
     services: Services,
     provisioner: Option<Box<dyn Provisioner>>,
+    /// The account the link created, whose ACI the phone's archive is bound to.
+    linked: Option<ServiceId>,
     clock: Arc<dyn Clock>,
+    skip: HistorySkip,
     /// Whether this registration attempt already asked for a call.
     called: bool,
 }
@@ -83,8 +140,10 @@ impl Driver {
             server,
             services,
             provisioner: None,
+            linked: None,
             called: false,
             clock: Arc::new(SystemClock),
+            skip: HistorySkip(Arc::new(watch::Sender::new(Import::Idle))),
         }
     }
 
@@ -98,6 +157,11 @@ impl Driver {
         &self.state
     }
 
+    /// What a front end calls when the user skips history.
+    pub fn history_skip(&self) -> HistorySkip {
+        self.skip.clone()
+    }
+
     /// The secret store's warning, for setup to show before anything is stored.
     pub fn key_caveat(&self) -> Option<&'static str> {
         self.services.secrets.caveat()
@@ -106,7 +170,7 @@ impl Driver {
     /// Applies `event`, then runs every command it leads to, showing each state
     /// as it is entered. Returns once setup waits on the user again.
     pub async fn dispatch(&mut self, event: SetupEvent, show: Show<'_>) {
-        let mut pending: VecDeque<Command> = apply(&mut self.state, event, show).into();
+        let mut pending: VecDeque<Command> = apply(&mut self.state, &self.skip, event, show).into();
         while let Some(command) = pending.pop_front() {
             let Err(e) = self.run(command, show, &mut pending).await else {
                 continue;
@@ -120,7 +184,7 @@ impl Driver {
             // hand clients a profile in the wrong access mode.
             pending.clear();
             let failed = SetupEvent::CommandFailed { message };
-            pending.extend(apply(&mut self.state, failed, show));
+            pending.extend(apply(&mut self.state, &self.skip, failed, show));
         }
     }
 
@@ -142,13 +206,19 @@ impl Driver {
                     match event? {
                         LinkEvent::Uri { uri } => pending.extend(apply(
                             &mut self.state,
+                            &self.skip,
                             SetupEvent::LinkUri { uri },
                             show,
                         )),
-                        LinkEvent::Linked { .. } => break,
+                        LinkEvent::Linked { account } => {
+                            self.linked = Some(account.service_id);
+                            break;
+                        }
                     }
                 }
-                self.close_signal_store();
+                // NOTE: the store stays open until the history step ends. The
+                // phone's history key lives only in this provisioner; closing
+                // it here would lose the transfer.
                 SetupEvent::Linked
             }
             Command::RequestCode {
@@ -200,15 +270,71 @@ impl Driver {
                 return Ok(());
             }
             Command::ImportHistory => {
-                let state = &mut self.state;
+                let Self {
+                    state,
+                    provisioner,
+                    linked,
+                    paths,
+                    services,
+                    skip,
+                    ..
+                } = self;
                 let mut progress = |imported, total| {
                     let event = SetupEvent::HistoryProgress { imported, total };
-                    pending.extend(apply(state, event, show));
+                    pending.extend(apply(state, skip, event, show));
                 };
-                self.services.history.import(&mut progress).await?;
-                SetupEvent::HistoryDone
+                let history = async {
+                    let (Some(provisioner), Some(aci)) = (provisioner.as_deref(), *linked) else {
+                        return Ok(Some(HistoryGap::NotSent));
+                    };
+                    let (path, key) = match provisioner.transfer_history(&paths.root).await? {
+                        HistoryTransfer::Archive { path, key } => (path, key),
+                        HistoryTransfer::NotOffered | HistoryTransfer::NoUpload => {
+                            return Ok(Some(HistoryGap::NotSent));
+                        }
+                        HistoryTransfer::Relink => return Ok(Some(HistoryGap::RelinkRequested)),
+                        HistoryTransfer::TimedOut => return Ok(Some(HistoryGap::TimedOut)),
+                    };
+                    let archive = Downloaded(path);
+                    services
+                        .history
+                        .import(&archive.0, &key, aci, &mut progress)
+                        .await?;
+                    anyhow::Ok(None)
+                };
+                let mut skipped = skip.0.subscribe();
+                let outcome = tokio::select! {
+                    outcome = history => Some(outcome),
+                    _ = skipped.wait_for(|import| *import == Import::Skipped) => None,
+                };
+                skip.0.send_replace(Import::Idle);
+                match outcome {
+                    None => {
+                        drop(Downloaded(paths.root.join(HISTORY_ARCHIVE_FILE)));
+                        SetupEvent::SkipHistory
+                    }
+                    Some(outcome) => match outcome? {
+                        None => SetupEvent::HistoryDone,
+                        Some(reason) => SetupEvent::NoHistory { reason },
+                    },
+                }
+            }
+            Command::FindDesktop if self.services.desktop.found() => SetupEvent::DesktopFound,
+            Command::FindDesktop => SetupEvent::DesktopAbsent,
+            Command::ImportDesktop => {
+                let state = &mut self.state;
+                let mut progress = |imported| {
+                    let event = SetupEvent::DesktopProgress { imported };
+                    pending.extend(apply(state, &self.skip, event, show));
+                };
+                let aci = self
+                    .linked
+                    .context("no linked account to import Desktop's history into")?;
+                self.services.desktop.import(aci, &mut progress).await?;
+                SetupEvent::DesktopImportDone
             }
             Command::ConnectClients => {
+                self.close_signal_store();
                 self.services.login.register(&self.profile)?;
                 SetupEvent::ClientsConnected {
                     clients: self.services.clients.reregister_missing(&self.server),
@@ -219,7 +345,7 @@ impl Driver {
                 return Ok(());
             }
         };
-        pending.extend(apply(&mut self.state, event, show));
+        pending.extend(apply(&mut self.state, &self.skip, event, show));
         Ok(())
     }
 
@@ -299,9 +425,35 @@ impl Driver {
     }
 }
 
+/// A downloaded history archive, deleted once setup is done with it, however
+/// the import ends.
+struct Downloaded(PathBuf);
+
+impl Drop for Downloaded {
+    fn drop(&mut self) {
+        match fs::remove_file(&self.0) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                tracing::warn!("unable to delete \"{}\": {e}", self.0.display());
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Moves `state` on by `event`, showing it if it changed.
-fn apply(state: &mut SetupState, event: SetupEvent, show: Show<'_>) -> Vec<Command> {
+fn apply(
+    state: &mut SetupState,
+    skip: &HistorySkip,
+    event: SetupEvent,
+    show: Show<'_>,
+) -> Vec<Command> {
     let (next, commands) = transition(state, event);
+    // NOTE: armed before the history screen shows, not when the import
+    // starts: a Skip pressed in between would otherwise be lost and queue
+    // behind the phone's hour-long wait.
+    if commands.contains(&Command::ImportHistory) {
+        skip.0.send_replace(Import::Running);
+    }
     if next != *state {
         *state = next;
         show(state);
@@ -339,7 +491,18 @@ mod tests {
         }
     }
 
-    type Imports = VecDeque<anyhow::Result<Vec<(u64, Option<u64>)>>>;
+    /// What the phone does about history after a link.
+    enum Sent {
+        /// An archive whose import reports these steps.
+        Archive(Vec<(u64, Option<u64>)>),
+        /// An archive that fails to import.
+        Corrupt,
+        Nothing(HistoryGap),
+        Fails(anyhow::Error),
+        Stalls,
+    }
+
+    const ARCHIVE: &str = HISTORY_ARCHIVE_FILE;
 
     /// The fakes' shared state: what Signal and the OS will do, and everything
     /// every fake did, in order. Clones share it, so two setup runs can see one
@@ -350,7 +513,8 @@ mod tests {
         log: Arc<Mutex<Vec<String>>>,
         links: Arc<Mutex<VecDeque<Vec<anyhow::Result<LinkEvent>>>>>,
         codes: Arc<Mutex<VecDeque<anyhow::Result<RegistrationStep>>>>,
-        imports: Arc<Mutex<Imports>>,
+        phone: Arc<Mutex<VecDeque<Sent>>>,
+        desktop: Arc<Mutex<Option<Vec<u64>>>>,
         failures: Arc<Mutex<Vec<&'static str>>>,
         opened_with: Arc<Mutex<Vec<StoreKey>>>,
         secrets: Arc<MemorySecretStore>,
@@ -383,7 +547,8 @@ mod tests {
                 log: Arc::default(),
                 links: Arc::default(),
                 codes: Arc::default(),
-                imports: Arc::default(),
+                phone: Arc::default(),
+                desktop: Arc::default(),
                 failures: Arc::default(),
                 opened_with: Arc::default(),
                 secrets: Arc::default(),
@@ -415,9 +580,30 @@ mod tests {
             self
         }
 
-        /// The next history import reports `progress`, or fails.
+        fn sends(self, sent: Sent) -> Self {
+            self.phone.lock().expect("phone").push_back(sent);
+            self
+        }
+
+        /// The phone next sends an archive whose import reports `progress`, or
+        /// fetching it fails.
         fn import(self, progress: anyhow::Result<Vec<(u64, Option<u64>)>>) -> Self {
-            self.imports.lock().expect("imports").push_back(progress);
+            self.sends(progress.map_or_else(Sent::Fails, Sent::Archive))
+        }
+
+        /// The phone next keeps the history long-poll waiting forever.
+        fn stalled_history(self) -> Self {
+            self.sends(Sent::Stalls)
+        }
+
+        /// The phone next sends no history, for `reason`.
+        fn no_history(self, reason: HistoryGap) -> Self {
+            self.sends(Sent::Nothing(reason))
+        }
+
+        /// Signal Desktop is on this computer, and importing it reports `progress`.
+        fn with_desktop(self, progress: Vec<u64>) -> Self {
+            *self.desktop.lock().expect("desktop") = Some(progress);
             self
         }
 
@@ -508,6 +694,30 @@ mod tests {
             self.0.push(format!("verify {code}"));
             self.0.next_code()
         }
+
+        async fn transfer_history(&self, dir: &Path) -> anyhow::Result<HistoryTransfer> {
+            self.0.push("transfer history");
+            let sent = self.0.phone.lock().expect("phone").pop_front();
+            let content = match sent.unwrap_or(Sent::Archive(Vec::new())) {
+                Sent::Archive(steps) => serde_json::to_string(&steps)?,
+                Sent::Corrupt => "corrupt".to_owned(),
+                Sent::Nothing(HistoryGap::NotSent) => return Ok(HistoryTransfer::NotOffered),
+                Sent::Nothing(HistoryGap::RelinkRequested) => return Ok(HistoryTransfer::Relink),
+                Sent::Nothing(HistoryGap::TimedOut) => return Ok(HistoryTransfer::TimedOut),
+                Sent::Fails(e) => return Err(e),
+                Sent::Stalls => {
+                    fs::write(dir.join(ARCHIVE), "half a download")?;
+                    let _waiting = Waiting(self.0.clone());
+                    return futures::future::pending().await;
+                }
+            };
+            let path = dir.join(ARCHIVE);
+            fs::write(&path, content)?;
+            Ok(HistoryTransfer::Archive {
+                path,
+                key: LinkAndSyncKey::new([7; 32]),
+            })
+        }
     }
 
     #[async_trait]
@@ -536,17 +746,44 @@ mod tests {
     impl HistoryImport for World {
         async fn import(
             &self,
+            archive: &Path,
+            _: &LinkAndSyncKey,
+            our_aci: ServiceId,
             progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
         ) -> anyhow::Result<()> {
-            self.push("import history");
-            let steps = self
-                .imports
-                .lock()
-                .expect("imports")
-                .pop_front()
-                .unwrap_or_else(|| Ok(vec![]))?;
+            self.push(format!("import history as {our_aci}"));
+            let steps: Vec<(u64, Option<u64>)> = serde_json::from_slice(&fs::read(archive)?)?;
             for (imported, total) in steps {
                 progress(imported, total);
+            }
+            Ok(())
+        }
+    }
+
+    /// Logs when a stalled import is abandoned.
+    struct Waiting(World);
+
+    impl Drop for Waiting {
+        fn drop(&mut self) {
+            self.0.push("stop waiting for history");
+        }
+    }
+
+    #[async_trait]
+    impl DesktopHistory for World {
+        fn found(&self) -> bool {
+            self.desktop.lock().expect("desktop").is_some()
+        }
+
+        async fn import(
+            &self,
+            our_aci: ServiceId,
+            progress: &mut (dyn FnMut(u64) + Send),
+        ) -> anyhow::Result<()> {
+            self.push(format!("import desktop as {our_aci}"));
+            let steps = self.desktop.lock().expect("desktop").clone();
+            for imported in steps.unwrap_or_default() {
+                progress(imported);
             }
             Ok(())
         }
@@ -607,6 +844,7 @@ mod tests {
                 signal: Box::new(world.clone()),
                 secrets: Box::new(world.clone()),
                 history: Box::new(world.clone()),
+                desktop: Box::new(world.clone()),
                 login: Box::new(world.clone()),
                 clients: Clients::new(
                     Platform::MacOs,
@@ -760,8 +998,9 @@ mod tests {
         assert_eq!(
             after_link,
             [
+                "transfer history",
+                "import history as 00000000-0000-0000-0000-000000000007",
                 "close store",
-                "import history",
                 "start agent personal, access ReadOnly",
                 "claude mcp add -s user signal-personal -- \
                  /tmp/signal-agent mcp, access ReadOnly",
@@ -774,6 +1013,253 @@ mod tests {
                     .to_string()
             )),
             "{log:?}"
+        );
+    }
+
+    /// Signal Desktop's history is never offered when Desktop is absent and
+    /// never read without a yes; with a yes, it is read as the linked account
+    /// (so another account's Desktop is refused), its progress shows, and
+    /// access is still saved before the agent starts.
+    #[tokio::test]
+    async fn signal_desktop_is_offered_only_when_found_and_read_only_on_yes() {
+        let access = SetupEvent::AccessChosen {
+            access: AccessMode::Full,
+        };
+        let absent = World::new().link(vec![linked()]);
+        let mut h = Harness::new(&absent);
+        h.send(LINK).await;
+        let done = h.send(access.clone()).await;
+        assert!(matches!(done, SetupState::Done { .. }), "{done:?}");
+        assert!(
+            !h.shown
+                .iter()
+                .any(|s| matches!(s, SetupState::OfferDesktopImport { .. })),
+            "offered an absent Desktop: {:?}",
+            h.shown
+        );
+
+        for yes in [false, true] {
+            let world = World::new().link(vec![linked()]).with_desktop(vec![10, 20]);
+            let mut h = Harness::new(&world);
+            h.send(LINK).await;
+            let offer = h.send(access.clone()).await;
+            assert_eq!(
+                offer,
+                SetupState::OfferDesktopImport {
+                    access: AccessMode::Full
+                }
+            );
+            let done = h
+                .send(SetupEvent::DesktopImportChosen { import: yes })
+                .await;
+            assert!(matches!(done, SetupState::Done { .. }), "{done:?}");
+            let log = world.log();
+            let aci = account(ProfileKind::Linked).service_id;
+            let read = log
+                .iter()
+                .position(|e| *e == format!("import desktop as {aci}"));
+            assert_eq!(read.is_some(), yes, "yes={yes}: {log:?}");
+            let progress: Vec<_> = h
+                .shown
+                .iter()
+                .filter_map(|s| match s {
+                    SetupState::ImportingDesktop { imported, .. } => Some(*imported),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(progress, if yes { vec![0, 10, 20] } else { vec![] });
+            if let Some(read) = read {
+                let started = log.iter().position(|e| e.starts_with("start agent"));
+                assert!(started > Some(read), "agent started first: {log:?}");
+            }
+        }
+    }
+
+    /// When the phone sends no history, setup says why and waits; carrying on
+    /// still saves access before the agent starts.
+    #[tokio::test]
+    async fn missing_history_waits_on_the_user_then_finishes_setup() {
+        let world = World::new()
+            .link(vec![linked()])
+            .no_history(HistoryGap::RelinkRequested);
+        let mut h = Harness::new(&world);
+        h.send(LINK).await;
+        let waiting = h
+            .send(SetupEvent::AccessChosen {
+                access: AccessMode::ReadOnly,
+            })
+            .await;
+        assert_eq!(
+            waiting,
+            SetupState::HistoryUnavailable {
+                reason: HistoryGap::RelinkRequested,
+                access: AccessMode::ReadOnly
+            }
+        );
+        assert!(
+            !world.log().iter().any(|e| e.starts_with("start agent")),
+            "{:?}",
+            world.log()
+        );
+        let done = h.send(SetupEvent::SkipHistory).await;
+        assert!(matches!(done, SetupState::Done { .. }), "{done:?}");
+        assert!(
+            world
+                .log()
+                .contains(&"start agent personal, access ReadOnly".to_owned()),
+            "{:?}",
+            world.log()
+        );
+    }
+
+    /// The window draws the history screen before the import starts, so a
+    /// Skip pressed the moment it appears must still count; it once queued
+    /// behind the phone's hour-long wait (Windows CI).
+    #[tokio::test]
+    async fn a_skip_pressed_as_the_history_screen_appears_counts() {
+        let world = World::new().link(vec![linked()]).stalled_history();
+        let mut h = Harness::new(&world);
+        h.send(LINK).await;
+        let skip = h.driver.history_skip();
+        let mut pressed = false;
+        let mut show = |state: &SetupState| {
+            if matches!(state, SetupState::ImportingHistory { .. }) && !pressed {
+                pressed = skip.skip();
+            }
+        };
+        let access = SetupEvent::AccessChosen {
+            access: AccessMode::Full,
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            h.driver.dispatch(access, &mut show),
+        )
+        .await
+        .expect("the skip was lost before the import started");
+        assert!(
+            matches!(h.driver.state(), SetupState::Done { .. }),
+            "{:?}",
+            h.driver.state()
+        );
+    }
+
+    /// Skip only stops an import in progress. Pressed at any other time (a
+    /// terminal's Ctrl-C at a prompt, a late click) it must report that it did
+    /// nothing, and must not cancel an import that starts later.
+    #[tokio::test]
+    async fn a_skip_with_no_import_running_does_nothing() {
+        let world = World::new()
+            .link(vec![linked()])
+            .import(Ok(vec![(1, Some(1))]));
+        let mut h = Harness::new(&world);
+        h.send(LINK).await;
+        assert!(!h.driver.history_skip().skip(), "claimed to skip nothing");
+        h.send(SetupEvent::AccessChosen {
+            access: AccessMode::Full,
+        })
+        .await;
+        assert!(
+            h.shown.contains(&SetupState::ImportingHistory {
+                imported: 1,
+                total: Some(1),
+                access: AccessMode::Full
+            }),
+            "a stale skip cut the import short: {:?}",
+            h.shown
+        );
+    }
+
+    /// The phone may take up to an hour to send history, or never send it.
+    /// Skip must stop waiting at once and finish setup, from the moment the
+    /// history screen shows.
+    #[tokio::test]
+    async fn skip_stops_waiting_for_history_and_finishes_setup() {
+        let world = World::new().link(vec![linked()]).stalled_history();
+        let mut h = Harness::new(&world);
+        h.send(LINK).await;
+        let skip = h.driver.history_skip();
+        let access = SetupEvent::AccessChosen {
+            access: AccessMode::Full,
+        };
+        let press = async {
+            while !skip.skip() {
+                tokio::task::yield_now().await;
+            }
+        };
+        let (done, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(h.send(access), press)
+        })
+        .await
+        .expect("skip did not stop the wait");
+        assert!(matches!(done, SetupState::Done { .. }), "{done:?}");
+        let log = world.log();
+        let stopped = log.iter().position(|e| e == "stop waiting for history");
+        let started = log.iter().position(|e| e.starts_with("start agent"));
+        assert!(
+            stopped.is_some() && stopped < started,
+            "the wait outlived the skip: {log:?}"
+        );
+        assert!(
+            !world.paths().root.join(ARCHIVE).exists(),
+            "a skipped download was left behind"
+        );
+    }
+
+    /// The phone's archive is imported as the account just linked, since its
+    /// key is bound to that ACI, and then deleted, all while the link's Signal
+    /// store still holds the transfer; the store closes before the agent opens it.
+    #[tokio::test]
+    async fn the_phones_archive_is_imported_as_the_linked_account_then_deleted() {
+        let world = World::new()
+            .link(vec![linked()])
+            .import(Ok(vec![(5, None)]));
+        let mut h = Harness::new(&world);
+        h.send(LINK).await;
+        h.send(SetupEvent::AccessChosen {
+            access: AccessMode::Full,
+        })
+        .await;
+        let aci = account(ProfileKind::Linked).service_id;
+        let log = world.log();
+        let after_link: Vec<_> = log
+            .iter()
+            .skip_while(|e| !e.starts_with("link as"))
+            .skip(1)
+            .take(4)
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            after_link,
+            [
+                "transfer history",
+                &format!("import history as {aci}"),
+                "close store",
+                "start agent personal, access Full",
+            ],
+            "{log:?}"
+        );
+        assert!(
+            !world.paths().root.join(ARCHIVE).exists(),
+            "the downloaded archive was left behind"
+        );
+    }
+
+    /// An archive that fails to import is deleted all the same; nothing can
+    /// import it later, since the phone's key for it is single-use.
+    #[tokio::test]
+    async fn an_archive_that_fails_to_import_is_still_deleted() {
+        let world = World::new().link(vec![linked()]).sends(Sent::Corrupt);
+        let mut h = Harness::new(&world);
+        h.send(LINK).await;
+        let failed = h
+            .send(SetupEvent::AccessChosen {
+                access: AccessMode::Full,
+            })
+            .await;
+        assert_failed(&failed, "history import");
+        assert!(
+            !world.paths().root.join(ARCHIVE).exists(),
+            "a failed archive was left behind"
         );
     }
 

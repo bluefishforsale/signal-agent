@@ -8,7 +8,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use relay_setup::prelude::*;
+use relay_setup::{driver::HistorySkip, prelude::*};
 use tokio::sync::mpsc;
 
 use crate::view::{View, view};
@@ -24,12 +24,18 @@ pub trait Setup: Send {
     async fn dispatch(&mut self, event: SetupEvent, show: Show<'_>);
 
     fn state(&self) -> &SetupState;
+
+    /// Stops a history import while `dispatch` is still running it.
+    fn history_skip(&self) -> Option<HistorySkip> {
+        None
+    }
 }
 
 /// Setup in progress, as the window's commands see it.
 pub struct Session {
     events: mpsc::UnboundedSender<SetupEvent>,
     screen: Arc<Mutex<View>>,
+    skip: Option<HistorySkip>,
 }
 
 impl Session {
@@ -41,6 +47,7 @@ impl Session {
     ) -> (Self, impl Future<Output = ()> + Send + 'static) {
         let (events, mut queued) = mpsc::unbounded_channel();
         let screen = Arc::new(Mutex::new(view(setup.state())));
+        let skip = setup.history_skip();
         let shown = Arc::clone(&screen);
         let run = async move {
             let mut redraw = move |state: &SetupState| {
@@ -57,7 +64,14 @@ impl Session {
                 redraw(setup.state());
             }
         };
-        (Self { events, screen }, run)
+        (
+            Self {
+                events,
+                screen,
+                skip,
+            },
+            run,
+        )
     }
 
     /// The screen for the current state.
@@ -65,8 +79,12 @@ impl Session {
         self.screen.lock().expect("screen lock").clone()
     }
 
-    /// Queues `event` for the driver.
+    /// Queues `event` for the driver. Skip also goes straight to a running
+    /// history import, which would otherwise hold the queue.
     pub fn send(&self, event: SetupEvent) {
+        if let (SetupEvent::SkipHistory, Some(skip)) = (&event, &self.skip) {
+            skip.skip();
+        }
         if self.events.send(event).is_err() {
             eprintln!("setup has stopped; ignoring a click");
         }
