@@ -26,6 +26,7 @@ impl Registry {
             .with(read::SearchMessages)
             .with(send::SendMessage)
             .with(send::SendGroupMessage)
+            .with(send::SendNoteToSelf)
     }
 
     pub fn with(mut self, tool: impl Tool + 'static) -> Self {

@@ -109,6 +109,46 @@ impl Tool for SendGroupMessage {
     }
 }
 
+pub struct SendNoteToSelf;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SendNoteToSelfInput {
+    message: String,
+}
+
+#[async_trait]
+impl Tool for SendNoteToSelf {
+    fn name(&self) -> &'static str {
+        "send_note_to_self"
+    }
+    fn description(&self) -> &'static str {
+        "Send a message to your own Note to Self chat, which syncs to all your Signal \
+         devices. Use for reminders, bookmarks or drafts; use send_message to message anyone \
+         else. message is the text. Not idempotent. Saved to the local store. Returns the \
+         new message's id."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "message": {"type": "string", "minLength": 1, "description": "Note text to save"},
+            },
+            "required": ["message"],
+            "additionalProperties": false,
+        })
+    }
+    fn writes(&self) -> bool {
+        true
+    }
+    async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
+        let input: SendNoteToSelfInput = parse(input)?;
+        let body = non_blank("message", input.message)?;
+        let me = ctx.signal.account().await?.service_id;
+        send_text(ctx, Recipient::Contact(me), body, None).await
+    }
+}
+
 /// The quoted message named by an author and send time, which must come
 /// together or not at all.
 async fn quote(
@@ -298,6 +338,31 @@ mod tests {
         assert_eq!(signal.sent(), [(to, text)]);
         let stored = ctx.store.history(to, None, 10).await.unwrap();
         assert_eq!(stored[0].quote, Some(quoted), "{stored:?}");
+    }
+
+    /// Note to Self is the DM with your own account; it must go there and be
+    /// stored there, never to a contact.
+    #[tokio::test]
+    async fn send_note_to_self_sends_to_the_accounts_own_conversation() {
+        let (ctx, signal) = ctx(AccessMode::Full, ProfileKind::Linked);
+        let out = Registry::standard()
+            .call(
+                &ctx,
+                "send_note_to_self",
+                json!({"message": "buy cat food"}),
+            )
+            .await
+            .unwrap();
+        let me = Recipient::Contact(sid(ME));
+        let text = Outgoing::Text {
+            body: "buy cat food".into(),
+            quote: None,
+        };
+        assert_eq!(signal.sent(), [(me, text)]);
+        let id: MessageId = serde_json::from_value(out["id"].clone()).unwrap();
+        let stored = ctx.store.history(me, None, 10).await.unwrap();
+        assert_eq!(stored.len(), 1, "{stored:?}");
+        assert_eq!(stored[0].id, id);
     }
 
     /// Half a quote can't name a message; sending it as a plain message would
