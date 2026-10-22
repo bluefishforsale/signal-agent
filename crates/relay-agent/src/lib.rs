@@ -14,7 +14,7 @@ use anyhow::{Context, bail};
 use relay_core::prelude::*;
 use relay_signal::SignalBackend;
 use relay_store::MessageStore;
-use relay_tools::{Registry, ToolContext};
+use relay_tools::{Clock, Limiter, Limits, Registry, SystemClock, ToolContext};
 use rmcp::ServiceExt;
 use tokio::task::JoinSet;
 
@@ -147,9 +147,19 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
     // start capturing whether or not that works.
     tokio::task::spawn_blocking(move || startup::reregister_claude_entries(&profile));
     let (signal, store) = open_backend_and_store(&config).await?;
-    Agent::new(signal, store, Registry::standard(), config.access)
+    let registry = registry(&config.paths, Arc::new(SystemClock))?;
+    Agent::new(signal, store, registry, config.access)
         .serve(listener, stop_requested())
         .await
+}
+
+/// The shipped tools under limits kept in the profile directory, so
+/// restarting the agent doesn't reset them.
+// NOTE: the default limits apply until they're read from settings (#72).
+fn registry(paths: &ProfilePaths, clock: Arc<dyn Clock>) -> anyhow::Result<Registry> {
+    let limiter =
+        Limiter::new(Limits::default(), clock).persisted(paths.root.join("limits.json"))?;
+    Ok(Registry::standard().with_limiter(limiter))
 }
 
 /// Resolves when the OS asks the agent to stop: Ctrl-C anywhere, and SIGTERM
@@ -212,6 +222,66 @@ pub(crate) mod tests {
             kind: ProfileKind::Linked,
             device_name: "test".into(),
         }))
+    }
+
+    struct FakeClock(std::sync::atomic::AtomicU64);
+
+    impl relay_tools::Clock for FakeClock {
+        fn now_ms(&self) -> u64 {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl FakeClock {
+        fn advance(&self, ms: u64) {
+            self.0.fetch_add(ms, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// An AI client that can crash or restart the agent must not get a fresh
+    /// day of first contacts out of it: the agent's limits live on disk.
+    #[tokio::test]
+    async fn the_new_recipient_cap_holds_across_an_agent_restart() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let profile = ProfileName::new("default").expect("valid profile");
+        let paths = ProfilePaths::under(tmp.path().to_owned(), &profile);
+        std::fs::create_dir_all(&paths.root).expect("profile dir");
+        let clock = Arc::new(FakeClock(0.into()));
+        let signal = fake_signal();
+        let ctx = ToolContext {
+            store: Arc::new(MemoryStore::default()),
+            signal: signal.clone(),
+            access: AccessMode::Full,
+            kind: ProfileKind::Linked,
+        };
+        let dm = |n: u128| {
+            let to = ServiceId::new(Uuid::from_u128(n)).to_string();
+            serde_json::json!({"recipient": to, "message": "hi"})
+        };
+        let agent = registry(&paths, clock.clone()).expect("registry");
+        for n in 10..30 {
+            let result = agent.call(&ctx, "send_message", dm(n)).await;
+            assert!(
+                result.is_ok(),
+                "new recipient {n} refused under the cap: {result:?}"
+            );
+            clock.advance(3_000);
+        }
+        let restarted = registry(&paths, clock.clone()).expect("registry after restart");
+        let result = restarted.call(&ctx, "send_message", dm(30)).await;
+        let Err(relay_tools::ToolError::Internal(e)) = &result else {
+            panic!("21st new recipient after a restart was not refused: {result:?}");
+        };
+        let refusal = e.downcast_ref::<relay_tools::LimitExceeded>();
+        assert!(
+            refusal.is_some_and(|r| r.limit.contains("new conversations")),
+            "refused for the wrong reason: {e:#}"
+        );
+        assert_eq!(
+            signal.sent().len(),
+            20,
+            "a refused first contact reached Signal"
+        );
     }
 
     /// Wraps a MemoryStore and records whether close() was awaited.
