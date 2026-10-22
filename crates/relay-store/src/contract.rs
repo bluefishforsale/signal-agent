@@ -707,3 +707,39 @@ async fn cancelling_a_job_removes_it_once() {
     }
     stores.close().await;
 }
+
+/// Claims must hold under real concurrency, not just back to back: the tick
+/// and run_scheduled_messages can race while new jobs are being scheduled,
+/// and any job handed to two callers is a message sent twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parallel_claimers_never_share_a_job() {
+    const JOBS: u64 = 60;
+    let stores = Stores::open().await;
+    for (name, store) in stores.each() {
+        let claimer = || async {
+            let mut claimed = vec![];
+            for _ in 0..JOBS {
+                let due = store.take_due(u64::MAX).await.expect("tick");
+                claimed.extend(due.into_iter().map(|j| j.id));
+                tokio::task::yield_now().await;
+            }
+            claimed
+        };
+        let scheduler = async {
+            for t in 0..JOBS {
+                store.schedule(&later(1, t)).await.expect("schedule");
+                tokio::task::yield_now().await;
+            }
+        };
+        let (a, b, c, d, ()) = tokio::join!(claimer(), claimer(), claimer(), claimer(), scheduler);
+        let leftover = store.take_due(u64::MAX).await.expect("tick");
+        let mut all: Vec<_> = [a, b, c, d].concat();
+        all.extend(leftover.into_iter().map(|j| j.id));
+        let claims = all.len();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), claims, "{name}: a job was claimed twice");
+        assert_eq!(all.len() as u64, JOBS, "{name}: a job was never claimed");
+    }
+    stores.close().await;
+}
