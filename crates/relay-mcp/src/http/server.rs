@@ -255,6 +255,18 @@ mod tests {
             .expect("client")
     }
 
+    async fn post(addr: SocketAddr, token: Option<&str>) -> reqwest::StatusCode {
+        let mut request = client()
+            .post(format!("http://{addr}/mcp"))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        request.send().await.expect("request").status()
+    }
+
     /// PRD acceptance 10: a request with no token must be refused before it
     /// reaches the agent at all.
     #[tokio::test]
@@ -262,15 +274,35 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let tokens = Tokens::at(&dir.path().join("http_tokens.json"));
         let addr = start(tokens, "no-agent".into()).await;
-        let response = client()
-            .post(format!("http://{addr}/mcp"))
-            .header("content-type", "application/json")
-            .header("accept", "application/json, text/event-stream")
-            .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)
-            .send()
+        assert_eq!(post(addr, None).await, reqwest::StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            post(addr, Some("guess")).await,
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+    }
+
+    /// PRD acceptance 10: revoking a token must lock its client out on the
+    /// very next request, without restarting the endpoint.
+    #[tokio::test]
+    async fn a_token_revoked_while_serving_is_refused_on_its_next_request() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (agent, _) = agent(dir.path(), Registry::default().with(ProbeSend)).await;
+        let path = dir.path().join("http_tokens.json");
+        let token = Tokens::at(&path)
+            .create("laptop", AccessMode::Full)
+            .expect("create");
+        let addr = start(Tokens::at(&path), agent).await;
+        let client = remote(addr, &token).await;
+        client
+            .peer()
+            .list_tools(None)
             .await
-            .expect("request");
-        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+            .expect("before revoking");
+        Tokens::at(&path).revoke("laptop").expect("revoke");
+        assert_eq!(
+            post(addr, Some(&token)).await,
+            reqwest::StatusCode::UNAUTHORIZED
+        );
     }
 
     /// PRD acceptance 10, swept over every shipped tool: a read-only token
