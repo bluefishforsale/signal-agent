@@ -45,8 +45,9 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
 use crate::{
-    Account, Contact, Device, DiscoveryUnsupported, Group, Identity, Incoming, LinkEvent, Outgoing,
-    Provisioner, RateLimited, RegistrationStep, SendableFile, SignalBackend, Trust, convert,
+    Account, Contact, Device, DiscoveryUnsupported, Group, HistoryTransfer, Identity, Incoming,
+    LinkEvent, Outgoing, Provisioner, RateLimited, RegistrationStep, SendableFile, SignalBackend,
+    Trust, convert, transfer::PendingTransfer,
 };
 
 type Job = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()>>> + Send>;
@@ -446,7 +447,11 @@ pub struct PresageProvisioner {
     store: SqliteStore,
     servers: SignalServers,
     pending: Mutex<Option<Manager<SqliteStore, Confirmation>>>,
+    history: OfferedHistory,
 }
+
+/// The history transfer the last link was offered, until it is fetched.
+type OfferedHistory = Arc<Mutex<Option<anyhow::Result<PendingTransfer>>>>;
 
 impl PresageProvisioner {
     /// Opens (creating if needed) the store at `path`, encrypted with `key`,
@@ -461,6 +466,7 @@ impl PresageProvisioner {
                 Servers::Staging => SignalServers::Staging,
             },
             pending: Mutex::new(None),
+            history: OfferedHistory::default(),
         })
     }
 }
@@ -470,10 +476,11 @@ impl Provisioner for PresageProvisioner {
     fn link(&self, device_name: String) -> BoxStream<'static, anyhow::Result<LinkEvent>> {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (worker, store, servers) = (self.worker.clone(), self.store.clone(), self.servers);
+        let history = self.history.clone();
         let start = async move {
             let started = worker
                 .run(move || async move {
-                    tokio::task::spawn_local(link(store, servers, device_name, tx));
+                    tokio::task::spawn_local(link(store, servers, device_name, history, tx));
                 })
                 .await;
             match started {
@@ -521,6 +528,22 @@ impl Provisioner for PresageProvisioner {
         }
     }
 
+    async fn transfer_history(&self, dir: &Path) -> anyhow::Result<HistoryTransfer> {
+        let offered = self.history.lock().expect("offered history lock").take();
+        let Some(offered) = offered else {
+            return Ok(HistoryTransfer::NotOffered);
+        };
+        let mut pending = offered?;
+        match pending.fetch(dir).await {
+            Ok(fetched) => Ok(pending.hand_over(fetched)),
+            Err(e) => {
+                // Kept for a retry: the key exists nowhere else.
+                *self.history.lock().expect("offered history lock") = Some(Ok(pending));
+                Err(e)
+            }
+        }
+    }
+
     async fn verify_code(&self, code: &str) -> anyhow::Result<RegistrationStep> {
         // Cloned, not taken: a mistyped code can be retried on the same session.
         let Some(confirmation) = self
@@ -553,6 +576,7 @@ async fn link(
     store: SqliteStore,
     servers: SignalServers,
     device_name: String,
+    history: OfferedHistory,
     tx: mpsc::UnboundedSender<anyhow::Result<LinkEvent>>,
 ) {
     if store.is_registered().await {
@@ -569,7 +593,7 @@ async fn link(
             async move {
                 if let Ok(uri) = uri_rx.await {
                     let _ = tx.send(Ok(LinkEvent::Uri {
-                        uri: uri.to_string(),
+                        uri: offering_history(uri).to_string(),
                     }));
                 }
             }
@@ -580,9 +604,16 @@ async fn link(
         )
         .await;
         let event = match linked {
-            Ok(manager) => Ok(LinkEvent::Linked {
-                account: convert::account(manager.registration_data(), manager.registration_type()),
-            }),
+            Ok(manager) => {
+                *history.lock().expect("offered history lock") =
+                    PendingTransfer::after_link(manager.registration_data());
+                Ok(LinkEvent::Linked {
+                    account: convert::account(
+                        manager.registration_data(),
+                        manager.registration_type(),
+                    ),
+                })
+            }
             // The provisioning socket closed with no scan: the URI expired.
             // NOTE: only this loops. Any other failure, a rate limit above all,
             // ends the link; looping on it would re-ask Signal unattended.
@@ -592,6 +623,16 @@ async fn link(
         let _ = tx.send(event);
         return;
     }
+}
+
+/// `uri` with the capabilities Signal Desktop advertises, so the phone offers
+/// to transfer its message history.
+// NOTE: libsignal-service builds the URI without them; Android skips the offer
+// unless `backup5` is here (docs/link-and-sync.md).
+fn offering_history(mut uri: url::Url) -> url::Url {
+    uri.query_pairs_mut()
+        .append_pair("capabilities", "nopni,nopni2,backup5");
+    uri
 }
 
 async fn send(
@@ -1027,7 +1068,6 @@ async fn open_store(path: &Path, key: &[u8; 32]) -> anyhow::Result<SqliteStore> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::HistoryTransfer;
     use presage::{
         libsignal_service::{
             content::{ContentBody, Metadata},
@@ -1705,6 +1745,31 @@ mod tests {
         assert!(
             err.to_string().contains("request a code first"),
             "unclear error: {err:#}"
+        );
+    }
+
+    /// Android only offers to transfer history when the QR code's URI
+    /// advertises backup5 (and checks nopni2); without it the phone links
+    /// silently without history and never sends a key.
+    #[test]
+    fn the_link_uri_asks_the_phone_to_offer_history() {
+        let uri = url::Url::parse("sgnl://linkdevice?uuid=abc&pub_key=xyz").expect("uri");
+        let offered = offering_history(uri);
+        let query: HashMap<_, _> = offered.query_pairs().into_owned().collect();
+        assert_eq!(
+            query.get("capabilities").map(String::as_str),
+            Some("nopni,nopni2,backup5"),
+            "{offered}"
+        );
+        assert_eq!(
+            query.get("uuid").map(String::as_str),
+            Some("abc"),
+            "{offered}"
+        );
+        assert_eq!(
+            query.get("pub_key").map(String::as_str),
+            Some("xyz"),
+            "{offered}"
         );
     }
 

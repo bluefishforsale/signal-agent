@@ -278,6 +278,10 @@ pub enum RegistrationStep {
     },
 }
 
+/// The name `Provisioner::transfer_history` downloads the archive under, in
+/// the directory it is given.
+pub const HISTORY_ARCHIVE_FILE: &str = "link-and-sync.archive";
+
 /// How the history transfer the phone may offer at link time ended.
 #[derive(Debug)]
 pub enum HistoryTransfer {
@@ -301,7 +305,9 @@ pub trait Provisioner: Send + Sync {
     fn link(&self, device_name: String) -> BoxStream<'static, anyhow::Result<LinkEvent>>;
     /// After `link` reports `Linked`, waits for the history the phone offered
     /// to send and downloads it into `dir`. Fails with `RateLimited` when
-    /// Signal refuses as rate-limited, and never retries that.
+    /// Signal refuses as rate-limited, and never retries that itself. After a
+    /// failure the caller may call again; inside Signal's wait that fails
+    /// with `RateLimited` without asking Signal.
     async fn transfer_history(&self, _dir: &Path) -> anyhow::Result<HistoryTransfer> {
         Ok(HistoryTransfer::NotOffered)
     }
