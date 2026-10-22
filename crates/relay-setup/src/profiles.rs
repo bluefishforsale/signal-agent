@@ -9,6 +9,12 @@ use relay_core::{ProfileName, ProfilePaths};
 use relay_secrets::{SecretStore, StoreKey};
 use serde::{Deserialize, Serialize};
 
+use crate::{
+    Step,
+    claude::{Clients, ServerEntry},
+    uninstall_steps,
+};
+
 /// The registry file's contents.
 #[derive(Default, Serialize, Deserialize)]
 struct Registry {
@@ -65,6 +71,46 @@ impl Profiles {
         ProfilePaths::under(self.base.clone(), profile)
     }
 
+    /// The cleanup that removes `profile`: its Claude entries, the caller's
+    /// `login_item` step, its key, its data when `delete_data`, and finally
+    /// its place in the list. `entry` must be this profile's entry.
+    pub fn removal_steps<'a>(
+        &'a self,
+        profile: &'a ProfileName,
+        clients: &'a Clients,
+        entry: &'a ServerEntry,
+        login_item: Step<'a>,
+        secrets: &'a dyn SecretStore,
+        delete_data: bool,
+    ) -> anyhow::Result<Vec<Step<'a>>> {
+        if entry.name != profile.mcp_server_name() {
+            bail!(
+                "Claude entry \"{}\" does not belong to profile \"{profile}\"",
+                entry.name
+            );
+        }
+        let key = Step::new("Remove the database key", move || secrets.delete(profile));
+        let data = delete_data.then(|| {
+            let root = self.paths(profile).root;
+            Step::new("Delete messages and account data", move || {
+                fs::remove_dir_all(&root)
+                    .with_context(|| format!("unable to delete \"{}\"", root.display()))
+            })
+        });
+        let forget = Step::new(format!("Forget profile \"{profile}\""), move || {
+            self.forget(profile)
+        });
+        let mut steps = uninstall_steps(clients, entry, login_item, key, data);
+        steps.push(forget);
+        Ok(steps)
+    }
+
+    fn forget(&self, profile: &ProfileName) -> anyhow::Result<()> {
+        let mut registry = self.load()?;
+        registry.profiles.retain(|p| p != profile);
+        self.save(&registry)
+    }
+
     // NOTE: a key already in the secret store is kept, not replaced. It may be
     // the only way to open data a previous install of this profile left
     // behind, and overwriting it would make that data unreadable for good.
@@ -117,11 +163,15 @@ impl Profiles {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::{cell::Cell, collections::HashSet, path::Path};
 
     use relay_secrets::MemorySecretStore;
 
     use super::*;
+    use crate::{
+        claude::{ClaudeClient, Platform, RunOutput, Runner},
+        run_steps,
+    };
 
     fn name(s: &str) -> ProfileName {
         ProfileName::new(s).expect("valid profile name")
@@ -216,5 +266,106 @@ mod tests {
         let registry = Profiles::system().expect("system registry");
         let agent = ProfilePaths::for_profile(&profile).expect("agent paths");
         assert_eq!(registry.paths(&profile), agent);
+    }
+
+    struct NoCli;
+
+    impl Runner for NoCli {
+        fn run(&self, program: &Path, _: &[String]) -> anyhow::Result<RunOutput> {
+            anyhow::bail!("unexpected run of {}", program.display())
+        }
+    }
+
+    /// Removing one account must take away everything of that profile (its
+    /// Claude entry, login item, key, data, and its place in the list) and
+    /// nothing of any other profile's.
+    #[test]
+    fn removing_a_profile_cleans_up_only_that_profile() {
+        let base = tempfile::tempdir().expect("temp data dir");
+        let desktop = tempfile::tempdir().expect("temp Desktop dir");
+        let clients = Clients::new(
+            Platform::MacOs,
+            Box::new(NoCli),
+            None,
+            Some(desktop.path().into()),
+        );
+        let secrets = MemorySecretStore::default();
+        let profiles = Profiles::under(base.path().into());
+        let personal = profiles.ensure_default(&secrets).expect("default profile");
+        let bot = profiles.create("bot", &secrets).expect("create bot");
+        let entry = |p: &ProfileName| {
+            ServerEntry::for_profile(p, Path::new("/bin/signal-agent"), ["mcp"]).expect("entry")
+        };
+        for p in [&personal, &bot] {
+            clients
+                .register(ClaudeClient::Desktop, &entry(p))
+                .expect("register");
+            fs::create_dir_all(profiles.paths(p).root).expect("profile dir");
+            fs::write(profiles.paths(p).message_store, b"db").expect("store file");
+        }
+
+        let login_item_removed = Cell::new(false);
+        let bot_entry = entry(&bot);
+        let steps = profiles
+            .removal_steps(
+                &bot,
+                &clients,
+                &bot_entry,
+                Step::new("login item", || {
+                    login_item_removed.set(true);
+                    Ok(())
+                }),
+                &secrets,
+                true,
+            )
+            .expect("removal steps");
+        let outcomes = run_steps(steps);
+        assert!(
+            outcomes.iter().all(|o| o.result.is_ok()),
+            "a step failed: {outcomes:?}"
+        );
+
+        assert!(login_item_removed.get(), "login item step never ran");
+        let config = fs::read_to_string(desktop.path().join("claude_desktop_config.json"))
+            .expect("Desktop config");
+        assert!(
+            config.contains("signal-personal") && !config.contains("signal-bot"),
+            "{config}"
+        );
+        assert!(secrets.get(&bot).expect("read").is_none(), "bot key kept");
+        assert!(
+            secrets.get(&personal).expect("read").is_some(),
+            "personal key lost"
+        );
+        assert!(!profiles.paths(&bot).root.exists(), "bot data kept");
+        assert!(
+            profiles.paths(&personal).message_store.exists(),
+            "personal data lost"
+        );
+        assert_eq!(profiles.list().expect("list"), [personal]);
+    }
+
+    /// Removing `bot` with `personal`'s Claude entry would unregister the
+    /// wrong account from Claude, so a mismatched entry is refused up front.
+    #[test]
+    fn removal_refuses_another_profiles_claude_entry() {
+        let base = tempfile::tempdir().expect("temp data dir");
+        let secrets = MemorySecretStore::default();
+        let profiles = Profiles::under(base.path().into());
+        let personal = profiles.ensure_default(&secrets).expect("default profile");
+        let bot = profiles.create("bot", &secrets).expect("create bot");
+        let clients = Clients::new(Platform::MacOs, Box::new(NoCli), None, None);
+        let wrong = ServerEntry::for_profile(&personal, Path::new("/bin/signal-agent"), ["mcp"])
+            .expect("entry");
+
+        let refused = profiles.removal_steps(
+            &bot,
+            &clients,
+            &wrong,
+            Step::new("login item", || Ok(())),
+            &secrets,
+            false,
+        );
+        assert!(refused.is_err(), "accepted another profile's entry");
     }
 }
