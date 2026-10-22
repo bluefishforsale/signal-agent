@@ -278,6 +278,10 @@ pub enum RegistrationStep {
     },
 }
 
+/// The name `Provisioner::transfer_history` downloads the archive under, in
+/// the directory it is given.
+pub const HISTORY_ARCHIVE_FILE: &str = "link-and-sync.archive";
+
 /// How the history transfer the phone may offer at link time ended.
 #[derive(Debug)]
 pub enum HistoryTransfer {

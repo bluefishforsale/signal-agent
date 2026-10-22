@@ -22,7 +22,7 @@ use serde::Deserialize;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use url::Url;
 
-use crate::{HistoryTransfer, RateLimited};
+use crate::{HISTORY_ARCHIVE_FILE, HistoryTransfer, RateLimited};
 
 /// The history the phone offered while linking, waiting to be fetched.
 pub(crate) struct PendingTransfer {
@@ -168,9 +168,6 @@ enum ArchiveResponse {
 // presage's own, so these calls look like the rest of the client's.
 const USER_AGENT: &str = "presage-rs-0.8.0-dev";
 
-/// The downloaded archive's name in the profile directory.
-const ARCHIVE_FILE: &str = "link-and-sync.archive";
-
 /// How long to hold a retry back when Signal rate-limited without saying
 /// how long to wait.
 const RATE_LIMITED_WAIT: Duration = Duration::from_secs(5 * 60);
@@ -242,7 +239,7 @@ impl ArchiveSource {
             Waited::NoUpload => return Ok(Fetched::NoUpload),
             Waited::TimedOut => return Ok(Fetched::TimedOut),
         };
-        let path = dir.join(ARCHIVE_FILE);
+        let path = dir.join(HISTORY_ARCHIVE_FILE);
         if let Err(e) = self.download(cdn, &key, &path).await {
             // A retry starts the download over, never resuming this file.
             let _ = tokio::fs::remove_file(&path).await;
@@ -764,7 +761,7 @@ mod tests {
         .await;
         let dir = tempfile::tempdir().expect("dir");
         std::fs::write(
-            dir.path().join(ARCHIVE_FILE),
+            dir.path().join(HISTORY_ARCHIVE_FILE),
             b"stale bytes from a killed run",
         )
         .expect("stale file");

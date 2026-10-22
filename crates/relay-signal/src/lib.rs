@@ -10,8 +10,9 @@ mod presage_backend;
 mod transfer;
 
 pub use backend::{
-    Account, Contact, Device, DiscoveryUnsupported, Group, HistoryTransfer, Identity, Incoming,
-    LinkEvent, Outgoing, Provisioner, RateLimited, RegistrationStep, SignalBackend, Trust,
+    Account, Contact, Device, DiscoveryUnsupported, Group, HISTORY_ARCHIVE_FILE, HistoryTransfer,
+    Identity, Incoming, LinkEvent, Outgoing, Provisioner, RateLimited, RegistrationStep,
+    SignalBackend, Trust,
 };
 pub use fake::FakeSignal;
 pub use files::{SendRoots, SendableFile};
