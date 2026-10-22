@@ -10,6 +10,7 @@ aes-gcm = "0.11.1"
 anyhow.workspace = true
 base64 = "0.22.1"
 cbc = "0.2.1"
+dirs.workspace = true
 futures.workspace = true
 hex = "0.4.3"
 # NOTE: same git source and tag as libsignal-service-rs (and so presage) uses.

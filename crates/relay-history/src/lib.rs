@@ -7,7 +7,7 @@ mod desktop;
 mod desktop_key;
 mod link_and_sync;
 
-pub use desktop::import_signal_desktop;
+pub use desktop::{import_signal_desktop, is_signal_desktop, signal_desktop_dir};
 pub use link_and_sync::{LinkAndSyncKey, import_link_and_sync};
 
 /// How far an import has got.

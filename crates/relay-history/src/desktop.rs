@@ -2,7 +2,10 @@
 //! Desktop and want more than the phone's link-time transfer gave them. It only
 //! reads Desktop's database; it never writes to it.
 
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use anyhow::Context;
 use base64::Engine as _;
@@ -13,6 +16,17 @@ use serde_json::Value;
 use sqlx::{ConnectOptions as _, Connection as _, sqlite::SqliteConnectOptions};
 
 use crate::{ImportProgress, ImportSummary, desktop_key, full_name};
+
+/// Where Signal Desktop keeps its data on this OS: Application Support on
+/// macOS, `%APPDATA%` on Windows, `$XDG_CONFIG_HOME` on Linux.
+pub fn signal_desktop_dir() -> Option<PathBuf> {
+    dirs::config_dir().map(|dir| dir.join("Signal"))
+}
+
+/// Whether `dir` holds Signal Desktop's data: its config and its database.
+pub fn is_signal_desktop(dir: &Path) -> bool {
+    dir.join("config.json").is_file() && dir.join("sql").join("db.sqlite").is_file()
+}
 
 /// Imports the messages in Signal Desktop's database under `signal_dir` (its
 /// data directory, holding `config.json` and `sql/db.sqlite`) into `store`.
@@ -294,6 +308,24 @@ mod tests {
                 .expect("import");
             (store, summary)
         }
+    }
+
+    /// Setup offers the import only where Desktop's data really is: a folder
+    /// with its config and database, not a leftover or unrelated "Signal"
+    /// folder, which would fail after the user said yes.
+    #[test]
+    fn only_a_folder_with_desktops_config_and_database_counts_as_desktop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        assert!(!is_signal_desktop(root), "empty folder");
+        std::fs::write(root.join("config.json"), "{}").expect("config");
+        assert!(!is_signal_desktop(root), "config without a database");
+        std::fs::create_dir(root.join("sql")).expect("sql");
+        std::fs::write(root.join("sql/db.sqlite"), "").expect("db");
+        assert!(is_signal_desktop(root), "config and database");
+        std::fs::remove_file(root.join("config.json")).expect("rm");
+        assert!(!is_signal_desktop(root), "database without a config");
+        assert!(!is_signal_desktop(&root.join("missing")), "missing folder");
     }
 
     fn aci(s: &str) -> ServiceId {
