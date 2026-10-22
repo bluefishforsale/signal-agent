@@ -15,6 +15,8 @@
       <button class="primary" data-action="install_update">Install and restart</button>
     </div>
 
+    <p class="note" data-field="adding" hidden>Setting up the account <strong data-field="adding_name"></strong>. Claude will see it as <strong data-field="adding_claude_name"></strong>.</p>
+
     <!-- Each section is one screen, named after the setup state it draws. -->
 
     <section data-screen="move" hidden>
@@ -34,6 +36,7 @@
         <p>Link again only if you removed this computer from Signal on your phone. It replaces this computer's link and pauses Claude's access to Signal until you finish.</p>
         <div class="actions">
           <button data-action="relink">Link again</button>
+          <button data-action="show_accounts">Accounts</button>
           <button data-action="show_uninstall">Uninstall MCP Relay for Signal</button>
         </div>
       </details>
@@ -58,7 +61,10 @@
       <div class="actions"><button class="primary" data-action="choose_account">Continue</button></div>
       <details class="advanced">
         <summary>Advanced</summary>
-        <div class="actions"><button data-action="show_uninstall">Uninstall MCP Relay for Signal</button></div>
+        <div class="actions">
+          <button data-action="show_accounts">Accounts</button>
+          <button data-action="show_uninstall">Uninstall MCP Relay for Signal</button>
+        </div>
       </details>
     </section>
 
@@ -191,6 +197,47 @@
         <div class="actions"><button class="primary" data-action="restart_desktop">Restart Claude Desktop</button></div>
       </div>
       <p data-field="no_restart">Open Claude and ask it about your messages.</p>
+      <details class="advanced">
+        <summary>Advanced</summary>
+        <div class="actions"><button data-action="show_accounts">Accounts</button></div>
+      </details>
+    </section>
+
+    <section data-screen="accounts" hidden>
+      <h1>Accounts</h1>
+      <p>Each account is its own Signal number or link, and Claude sees each one under its own name.</p>
+      <ul class="clients" data-field="accounts"></ul>
+      <p class="error" data-field="accounts_error" hidden></p>
+      <form data-action="add_account">
+        <p><strong>Add another account</strong></p>
+        <p class="note">Give it a short name, like work or bot, using lowercase letters, numbers and hyphens.</p>
+        <input type="text" name="name" placeholder="work" autocomplete="off" spellcheck="false" maxlength="32" required>
+        <p class="error" data-field="add_account_error" hidden></p>
+        <div class="actions"><button class="primary" type="submit">Add account</button></div>
+      </form>
+      <div class="actions"><button data-action="back">Back</button></div>
+    </section>
+
+    <section data-screen="remove_account" hidden>
+      <h1>Remove <span data-field="account_name"></span></h1>
+      <p>This stops the account's background agent and removes <strong data-field="account_claude_name"></strong> from your Claude apps. Your other accounts keep working.</p>
+      <label class="choice">
+        <input type="checkbox" name="delete_account_data">
+        <span><strong>Also delete this account's messages, account data and the keys that unlock them</strong>
+        <small>Leave this unticked to keep them, so adding the account again later picks up where you left off.</small></span>
+      </label>
+      <p class="error" data-field="remove_account_error" hidden></p>
+      <div class="actions">
+        <button data-action="show_accounts">Cancel</button>
+        <button class="primary danger" data-action="remove_account">Remove</button>
+      </div>
+    </section>
+
+    <section data-screen="account_removed" hidden>
+      <h1>Removed <span data-field="account_name"></span></h1>
+      <ul class="clients" data-field="steps"></ul>
+      <p data-field="remove_retry" hidden>Some steps failed, so the account is still listed. Fix what they name, then remove it again.</p>
+      <div class="actions"><button class="primary" data-action="show_accounts">Back to accounts</button></div>
     </section>
 
     <section data-screen="uninstall" hidden>

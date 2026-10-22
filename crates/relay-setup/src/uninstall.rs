@@ -3,7 +3,7 @@
 
 mod footprint;
 
-use std::{fs, io, path::Path};
+use std::{cell::Cell, fs, io, path::Path, rc::Rc};
 
 use anyhow::Context;
 use relay_core::ProfileName;
@@ -15,6 +15,7 @@ use crate::{
     claude::{ClaudeClient, Clients, Platform, Runner, ServerEntry, SystemRunner},
 };
 
+pub(crate) use footprint::ACCESS_FILE;
 pub use footprint::{
     APP_ID, DELETE_DATA_LABEL, Footprint, LAUNCHD_LABEL, Leftover, Roots, checklist,
 };
@@ -35,6 +36,22 @@ impl<'a> Step<'a> {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// This step, skipped once any step sharing `failed` has failed.
+    pub(crate) fn unless_failed(self, failed: Rc<Cell<bool>>) -> Self {
+        let action = self.action;
+        Self {
+            name: self.name,
+            action: Box::new(move || {
+                if failed.get() {
+                    anyhow::bail!("skipped because an earlier step failed");
+                }
+                let result = action();
+                failed.set(result.is_err());
+                result
+            }),
+        }
     }
 }
 
@@ -260,7 +277,7 @@ fn succeeded(runner: &dyn Runner, program: &str, args: &[String]) -> anyhow::Res
 }
 
 /// Removes the file or folder at `path`; one that isn't there is fine.
-fn remove_path(path: &Path) -> anyhow::Result<()> {
+pub(crate) fn remove_path(path: &Path) -> anyhow::Result<()> {
     let removed = match fs::symlink_metadata(path) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => Err(e),

@@ -4,11 +4,14 @@
 const APP_COMMANDS: &[&str] = &[
     "current",
     "send",
+    "accounts",
+    "add_account",
     "open_captcha",
     "needs_move",
     "move_to_applications",
     "update_offer",
     "install_update",
     "uninstall",
+    "remove_account",
     "quit",
 ];

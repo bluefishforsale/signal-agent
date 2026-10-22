@@ -3,6 +3,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod accounts;
 mod captcha;
 mod input;
 #[cfg(feature = "mock-driver")]
@@ -18,6 +19,7 @@ mod view;
 
 use std::time::Duration;
 
+use relay_core::ProfileName;
 use relay_setup::prelude::*;
 use scripted::Scripted;
 use session::{Session, Setup};
@@ -38,17 +40,32 @@ mod placement {
     }
 }
 
-/// Who carries setup forward: relay-setup's driver, or the scripted
-/// walk-through in development builds.
+/// Who carries `profile`'s setup forward: relay-setup's driver, or the
+/// scripted walk-through in development builds.
 #[cfg(not(feature = "mock-driver"))]
-fn setup() -> Box<dyn Setup> {
-    let start = start_state();
-    real::setup(start.clone()).unwrap_or_else(|e| Box::new(Scripted::new(start, unavailable(e))))
+fn setup(profile: ProfileName) -> Box<dyn Setup> {
+    let start = start_state(&profile);
+    real::setup(start.clone(), profile)
+        .unwrap_or_else(|e| Box::new(Scripted::new(start, unavailable(e))))
 }
 
 #[cfg(feature = "mock-driver")]
-fn setup() -> Box<dyn Setup> {
-    Box::new(Scripted::new(start_state(), mock::script))
+fn setup(profile: ProfileName) -> Box<dyn Setup> {
+    Box::new(Scripted::new(start_state(&profile), mock::script))
+}
+
+/// The accounts on this computer, or in development builds a scratch list
+/// that never touches the developer's own setup.
+#[cfg(not(feature = "mock-driver"))]
+fn profiles() -> anyhow::Result<Profiles> {
+    Profiles::system()
+}
+
+#[cfg(feature = "mock-driver")]
+fn profiles() -> anyhow::Result<Profiles> {
+    Ok(Profiles::under(
+        std::env::temp_dir().join("mcp-relay-for-signal-dev"),
+    ))
 }
 
 /// Fails each step with why setup couldn't start, instead of pretending.
@@ -65,7 +82,9 @@ fn unavailable(why: anyhow::Error) -> impl Fn(&Command) -> Vec<(Duration, SetupE
     }
 }
 
-fn start_state() -> SetupState {
+/// Where `profile`'s setup opens: "already set up" once it has finished.
+#[cfg_attr(feature = "mock-driver", allow(unused_variables))]
+fn start_state(profile: &ProfileName) -> SetupState {
     // Lets a development build open on any screen, for screenshots.
     #[cfg(feature = "mock-driver")]
     if let Some(state) = std::env::var("RELAY_SETUP_STATE")
@@ -77,7 +96,7 @@ fn start_state() -> SetupState {
     #[cfg(feature = "mock-driver")]
     return SetupState::start(&computer_name());
     #[cfg(not(feature = "mock-driver"))]
-    SetupState::for_profile(&computer_name(), real::saved_access())
+    SetupState::for_profile(&computer_name(), real::saved_access(profile))
 }
 
 /// The name the user gave this computer, which the phone shows for the link.
@@ -115,6 +134,24 @@ fn send(event: SetupEvent, session: State<'_, Session>, app: AppHandle) {
 }
 
 #[tauri::command]
+fn accounts() -> Result<Vec<accounts::Account>, String> {
+    profiles()
+        .and_then(|profiles| accounts::list(&profiles))
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Starts setup of a new account called `name` in the window.
+#[tauri::command]
+fn add_account(name: String, session: State<'_, Session>) -> Result<View, String> {
+    let start = || -> anyhow::Result<View> {
+        let profile = profiles()?.available(&name)?;
+        tauri::async_runtime::spawn(session.switch_to(setup(profile))?);
+        Ok(session.view())
+    };
+    start().map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
 fn open_captcha(app: AppHandle) -> Result<(), String> {
     let handle = app.clone();
     captcha::open(&app, move |token| {
@@ -145,7 +182,13 @@ async fn uninstall(
     from_main_window(webview.label())?;
     // NOTE: the page's checkbox alone must not be able to delete messages;
     // a native dialog the page can't answer asks once more.
-    if delete_data && !confirmed_deleting_data(&app).await {
+    if delete_data
+        && !confirmed_deleting_data(
+            &app,
+            "Uninstall will delete your Signal messages, account data and the keys that unlock them from this computer. This can't be undone.",
+        )
+        .await
+    {
         return Err("Nothing was removed: deleting your messages wasn't confirmed".into());
     }
     run_uninstall(delete_data)
@@ -163,13 +206,34 @@ fn from_main_window(label: &str) -> Result<(), String> {
     Ok(())
 }
 
-async fn confirmed_deleting_data(app: &AppHandle) -> bool {
+/// Removes the account `name` and, when `delete_data`, its messages and key.
+#[tauri::command]
+async fn remove_account(
+    webview: Webview,
+    app: AppHandle,
+    name: String,
+    delete_data: bool,
+) -> Result<Vec<StepOutcome>, String> {
+    from_main_window(webview.label())?;
+    let profile = ProfileName::new(name).map_err(|e| format!("{e:#}"))?;
+    // NOTE: as with uninstall, the page's checkbox alone must not be able to
+    // delete messages.
+    let warning = format!(
+        "Removing \"{profile}\" will delete its Signal messages, account data and the keys that unlock them from this computer. This can't be undone."
+    );
+    if delete_data && !confirmed_deleting_data(&app, &warning).await {
+        return Err("deleting the account's messages wasn't confirmed".into());
+    }
+    run_removal(profile, delete_data)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+async fn confirmed_deleting_data(app: &AppHandle, warning: &str) -> bool {
     use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
     let (tx, rx) = tokio::sync::oneshot::channel();
     app.dialog()
-        .message(
-            "Uninstall will delete your Signal messages, account data and the keys that unlock them from this computer. This can't be undone.",
-        )
+        .message(warning)
         .title("Delete your messages?")
         .kind(MessageDialogKind::Warning)
         .buttons(MessageDialogButtons::OkCancelCustom(
@@ -205,6 +269,19 @@ async fn run_uninstall(_delete_data: bool) -> anyhow::Result<Vec<StepOutcome>> {
         name: "Nothing removed: this is a development build".into(),
         result: Ok(()),
     }])
+}
+
+#[cfg(not(feature = "mock-driver"))]
+async fn run_removal(profile: ProfileName, delete_data: bool) -> anyhow::Result<Vec<StepOutcome>> {
+    tauri::async_runtime::spawn_blocking(move || real::remove(&profile, delete_data)).await?
+}
+
+#[cfg(feature = "mock-driver")]
+async fn run_removal(
+    _profile: ProfileName,
+    _delete_data: bool,
+) -> anyhow::Result<Vec<StepOutcome>> {
+    run_uninstall(false).await
 }
 
 #[tauri::command]
@@ -246,7 +323,7 @@ fn main() {
                     eprintln!("unable to redraw the setup window: {e}");
                 }
             };
-            let (session, run) = Session::new(setup(), redraw);
+            let (session, run) = Session::new(setup(ProfileName::default_profile()), redraw);
             app.manage(session);
             tauri::async_runtime::spawn(run);
             tauri::async_runtime::spawn(updater::watch(app.handle().clone()));
@@ -269,12 +346,15 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             current,
             send,
+            accounts,
+            add_account,
             open_captcha,
             needs_move,
             move_to_applications,
             update_offer,
             install_update,
             uninstall,
+            remove_account,
             quit
         ])
         .run(tauri::generate_context!());
@@ -331,6 +411,47 @@ mod tests {
                 .collect();
             let declared: Vec<String> = APP_COMMANDS.iter().map(|c| c.replace('_', "-")).collect();
             assert_eq!(granted, declared, "{}", path.display());
+        }
+    }
+
+    /// A command the page invokes but the capabilities don't grant fails only
+    /// at run time, in the window, so every invoke in app.js must be declared.
+    #[test]
+    fn every_command_the_page_invokes_is_declared() {
+        let page = include_str!("../../ui/app.js");
+        let invoked: Vec<&str> = page
+            .split("invoke(\"")
+            .skip(1)
+            .filter_map(|rest| rest.split('"').next())
+            .collect();
+        assert!(
+            invoked.contains(&"current"),
+            "found no invokes: {invoked:?}"
+        );
+        for command in invoked {
+            assert!(
+                APP_COMMANDS.contains(&command),
+                "app.js invokes undeclared {command:?}"
+            );
+        }
+    }
+
+    /// "Add another account" lives under Advanced, so every screen the app
+    /// can open on must reach Accounts, or a set-up user can't add one.
+    #[test]
+    fn accounts_are_reachable_from_every_screen_the_app_opens_on() {
+        let page = include_str!("../../ui/index.html");
+        for screen in ["choose_account", "already_set_up"] {
+            let start = format!("<section data-screen=\"{screen}\"");
+            let section = page
+                .split(&start)
+                .nth(1)
+                .and_then(|rest| rest.split("</section>").next())
+                .unwrap_or_else(|| panic!("index.html has no {screen} screen"));
+            assert!(
+                section.contains("data-action=\"show_accounts\""),
+                "{screen} has no way to Accounts"
+            );
         }
     }
 

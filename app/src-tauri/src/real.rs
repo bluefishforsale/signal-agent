@@ -5,14 +5,17 @@
 //! registration (the owner's account could be banned); development runs use
 //! `--features mock-driver`.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, bail};
 use async_trait::async_trait;
 use relay_core::prelude::*;
 use relay_secrets::StoreKey;
 use relay_setup::{
-    AgentKeys,
+    AgentKeys, SetupLock, StoreLock,
     claude::{Clients, ServerEntry},
     driver::{Driver, HistorySkip, LoginItem, OpenProvisioner, Services},
     history::{LinkAndSync, ProfileStore, SignalDesktop},
@@ -37,9 +40,8 @@ impl Setup for Driver {
     }
 }
 
-/// Setup of the default profile, starting at `start`.
-pub fn setup(start: SetupState) -> anyhow::Result<Box<dyn Setup>> {
-    let profile = ProfileName::default_profile();
+/// Setup of `profile`, starting at `start`.
+pub fn setup(start: SetupState, profile: ProfileName) -> anyhow::Result<Box<dyn Setup>> {
     let agent = agent()?;
     let server = ServerEntry::for_profile(&profile, &agent, ["mcp", "--profile", &profile])?;
     let paths = ProfilePaths::for_profile(&profile)?;
@@ -60,9 +62,55 @@ pub fn setup(start: SetupState) -> anyhow::Result<Box<dyn Setup>> {
     )))
 }
 
-/// The access choice the default profile's last setup saved, if it finished.
-pub fn saved_access() -> Option<AccessMode> {
-    let paths = ProfilePaths::for_profile(&ProfileName::default_profile()).ok()?;
+/// Removes `profile` from this computer, keeping its messages and key unless
+/// `delete_data`.
+pub fn remove(profile: &ProfileName, delete_data: bool) -> anyhow::Result<Vec<StepOutcome>> {
+    let agent = agent()?;
+    let profiles = Profiles::system()?;
+    let clients = Clients::system();
+    let secrets = AgentKeys::new(agent.clone());
+    let entry = ServerEntry::for_profile(profile, &agent, ["mcp", "--profile", profile])?;
+    let paths = profiles.paths(profile);
+    let stop = Step::new(format!("Stop the agent for \"{profile}\""), || {
+        agent_stopped(profile, &paths, AGENT_STOP_WAIT)
+    });
+    let steps = profiles.removal_steps(profile, &clients, &entry, stop, &secrets, delete_data)?;
+    Ok(run_steps(steps))
+}
+
+/// How long an agent gets to stop: it checks for setup's lock every two
+/// seconds, then closes its stores.
+const AGENT_STOP_WAIT: Duration = Duration::from_secs(30);
+
+/// Waits up to `limit` for `profile`'s agent to let go of its stores,
+/// holding setup's lock meanwhile so the agent stops and nothing starts one.
+// NOTE: both locks are let go of before the profile folder is deleted, since
+// Windows can't delete a folder with an open file; the access choice is gone
+// by then, so nothing starts the agent again.
+fn agent_stopped(
+    profile: &ProfileName,
+    paths: &ProfilePaths,
+    limit: Duration,
+) -> anyhow::Result<()> {
+    let Some(_setup) = SetupLock::try_acquire(paths)? else {
+        bail!("setup is running on \"{profile}\"; finish or close it first");
+    };
+    let deadline = Instant::now() + limit;
+    while StoreLock::try_acquire(paths)?.is_none() {
+        if Instant::now() >= deadline {
+            bail!(
+                "the agent for \"{profile}\" is still running after {} seconds",
+                limit.as_secs()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    Ok(())
+}
+
+/// The access choice `profile`'s last setup saved, if it finished.
+pub fn saved_access(profile: &ProfileName) -> Option<AccessMode> {
+    let paths = ProfilePaths::for_profile(profile).ok()?;
     paths.load_access().ok()
 }
 
@@ -98,7 +146,7 @@ impl LoginItem for AgentAtLogin {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::mpsc, time::Duration};
+    use std::sync::mpsc;
 
     use futures::stream::BoxStream;
     use relay_signal::{Account, HistoryTransfer, LinkEvent, RegistrationStep};
@@ -215,6 +263,46 @@ mod tests {
             server,
             services,
         ))
+    }
+
+    /// Removing an account deletes its files only after its agent lets go of
+    /// them. Any agent, even one the stdio shim started outside the
+    /// supervisor, lets go when it sees setup's lock, so the wait must hold
+    /// that lock and return only once the store lock is free.
+    #[test]
+    fn waiting_for_an_agent_holds_the_setup_lock_until_the_agent_lets_go() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let profile = ProfileName::new("bot").expect("name");
+        let paths = ProfilePaths::under(dir.path().to_path_buf(), &profile);
+        let stores = relay_setup::StoreLock::try_acquire(&paths)
+            .expect("lock")
+            .expect("free");
+        let agent_paths = paths.clone();
+        let agent = std::thread::spawn(move || {
+            while !relay_setup::setup_running(&agent_paths) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            drop(stores);
+        });
+
+        let waited = agent_stopped(&profile, &paths, Duration::from_secs(5));
+        assert!(waited.is_ok(), "{waited:?}");
+        agent.join().expect("stand-in agent");
+    }
+
+    /// An agent that never lets go must fail the wait, so removal stops
+    /// before deleting anything under it.
+    #[test]
+    fn waiting_for_an_agent_that_never_lets_go_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let profile = ProfileName::new("bot").expect("name");
+        let paths = ProfilePaths::under(dir.path().to_path_buf(), &profile);
+        let _stores = relay_setup::StoreLock::try_acquire(&paths)
+            .expect("lock")
+            .expect("free");
+
+        let waited = agent_stopped(&profile, &paths, Duration::from_millis(300));
+        assert!(waited.is_err(), "returned while the agent held the stores");
     }
 
     /// The window drives relay-setup's own driver: a scan on the phone must
