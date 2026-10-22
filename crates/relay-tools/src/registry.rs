@@ -6,8 +6,8 @@ use relay_core::prelude::*;
 use serde_json::Value;
 
 use crate::{
-    Limiter, Tool, ToolContext, ToolError, admin, directory, limits, local, lookup, media, mutate,
-    pins, polls, read, schedule, send, stickers, webhook,
+    Limiter, Tool, ToolContext, ToolError, account, admin, directory, limits, local, lookup, media,
+    mutate, pins, polls, read, schedule, send, stickers, webhook,
 };
 
 /// The set of tools a profile serves.
@@ -38,6 +38,7 @@ impl Registry {
             .with(send::SetTyping)
             .with(send::SetExpirationTimer)
             .with(send::SendReadReceipt)
+            .with(send::SendMessageRequestResponse)
             .with(mutate::ReactToMessage)
             .with(mutate::EditMessage)
             .with(mutate::DeleteMessage)
@@ -72,8 +73,10 @@ impl Registry {
             .with(media::SendGroupSticker)
             .with(stickers::ListStickerPacks)
             .with(stickers::GetSticker)
+            .with(stickers::AddStickerPack)
             .with(lookup::GetProfile)
             .with(lookup::GetUserStatus)
+            .with(account::UpdateProfile)
     }
 
     /// Applies account-safety limits to every send a tool makes.
@@ -238,6 +241,44 @@ mod tests {
         assert!(signal.sent().is_empty(), "a read-only sweep reached Signal");
     }
 
+    /// Sweep every shipped tool: on a linked profile a primary-only tool must
+    /// be neither listed nor run, even with full access and an input its own
+    /// schema accepts, and nothing may reach Signal. Linked profiles are the
+    /// owner's own identity, so this is the gate that keeps a client from
+    /// renaming them. New tools are covered by being registered.
+    #[tokio::test]
+    async fn every_primary_only_standard_tool_is_hidden_and_refused_on_linked_profiles() {
+        let registry = Registry::standard();
+        let (linked, signal) = ctx(AccessMode::Full, ProfileKind::Linked);
+        let primary_only: Vec<_> = registry
+            .all()
+            .filter(|t| t.needs_primary() && !EXCLUDED.contains(&t.name()))
+            .collect();
+        assert!(
+            !primary_only.is_empty(),
+            "no primary-only tool is registered, so this sweep checks nothing"
+        );
+        for tool in primary_only {
+            let name = tool.name();
+            let listed = registry.visible(&linked).any(|t| t.name() == name);
+            assert!(
+                !listed,
+                "primary-only tool {name} visible on a linked profile"
+            );
+            let (valid, _) = object_probes(name, &tool.input_schema());
+            let result = registry.call(&linked, name, Value::Object(valid)).await;
+            assert!(
+                matches!(result, Err(ToolError::NeedsPrimary(_))),
+                "{name} on a linked profile returned {result:?}"
+            );
+        }
+        assert!(signal.sent().is_empty(), "a linked sweep reached Signal");
+        assert!(
+            signal.profile_updates().is_empty(),
+            "a linked sweep changed the profile"
+        );
+    }
+
     /// A value the property's schema accepts, so each probe below breaks
     /// exactly one field of an otherwise valid input.
     fn sample(name: &str, prop: &Value) -> Value {
@@ -248,6 +289,10 @@ mod tests {
             Some("signal-recipient" | "signal-service-id") => json!(sid(2).to_string()),
             Some("signal-group-id") => json!("ab".repeat(32)),
             Some("signal-sticker-pack") => json!("ab".repeat(16)),
+            Some("signal-sticker-key") => json!("ab".repeat(32)),
+            // The same pack and key as the samples above, so a tool given
+            // both forms sees them agree.
+            Some("signal-sticker-link") => json!(sticker_link(&"ab".repeat(16), &"ab".repeat(32))),
             Some("e164") => json!("+15550000002"),
             Some("iso-datetime") => json!("2024-01-01T00:00:00Z"),
             Some(other) => panic!("{name}: no sample for format \"{other}\"; add one here"),
@@ -319,6 +364,41 @@ mod tests {
                         json!("ab".repeat(32)),
                         json!(sid(2).to_string()),
                     ]),
+                    Some("signal-sticker-key") => bad.extend([
+                        json!("g".repeat(64)),
+                        json!("ab".repeat(31)),
+                        json!("ab".repeat(33)),
+                        json!("é".repeat(32)),
+                        json!(sid(2).to_string()),
+                    ]),
+                    // Anything but Signal's own https link carrying exactly a
+                    // well-formed pack id and key.
+                    Some("signal-sticker-link") => {
+                        let (id, key) = ("ab".repeat(16), "ab".repeat(32));
+                        let good = sticker_link(&id, &key);
+                        bad.extend(
+                            [
+                                good.replace("https://", "http://"),
+                                good.replace("signal.art", "signal.art.example"),
+                                good.replace("signal.art", "evil.example"),
+                                good.replace("signal.art", "signal.art:8443"),
+                                good.replace("signal.art", "user@signal.art"),
+                                good.replace("/addstickers/", "/addstickers"),
+                                good.replace("/addstickers/", "/addstickers/x"),
+                                good.replace("/#", "/?x=1#"),
+                                good.replace('#', "?"),
+                                good.replace(&format!("&pack_key={key}"), ""),
+                                good.replace(&format!("pack_id={id}&"), ""),
+                                format!("{good}&pack_id={id}"),
+                                format!("{good}&extra=1"),
+                                sticker_link(&"g".repeat(32), &key),
+                                sticker_link(&id, &"ab".repeat(31)),
+                                "https://signal.art/addstickers/".into(),
+                                "not a url".into(),
+                            ]
+                            .map(|s| json!(s)),
+                        );
+                    }
                     Some("iso-datetime") => bad.extend([
                         json!("yesterday"),
                         json!("2024-13-01"),
@@ -380,6 +460,10 @@ mod tests {
             other => panic!("{name}: no bad values for type {other:?}; add some here"),
         }
         bad
+    }
+
+    fn sticker_link(id: &str, key: &str) -> String {
+        format!("https://signal.art/addstickers/#pack_id={id}&pack_key={key}")
     }
 
     type Object = serde_json::Map<String, Value>;

@@ -275,6 +275,77 @@ pub fn sticker_pack(s: &str) -> Result<StickerPackId, ToolError> {
     StickerPackId::parse(s).map_err(|e| ToolError::InvalidInput(e.to_string()))
 }
 
+pub fn sticker_key_schema() -> Value {
+    json!({
+        "type": "string",
+        "format": "signal-sticker-key",
+        "description": "The sticker pack's key (64 hex characters)",
+    })
+}
+
+/// A sticker pack's 32-byte key, from 64 hex characters.
+pub fn sticker_key(s: &str) -> Result<[u8; 32], ToolError> {
+    let invalid = || {
+        ToolError::InvalidInput(format!(
+            "\"{s}\" is not a sticker pack key (64 hex characters)"
+        ))
+    };
+    if s.len() != 64 {
+        return Err(invalid());
+    }
+    let mut key = [0u8; 32];
+    for (byte, pair) in key.iter_mut().zip(s.as_bytes().chunks(2)) {
+        let pair = std::str::from_utf8(pair).map_err(|_| invalid())?;
+        *byte = u8::from_str_radix(pair, 16).map_err(|_| invalid())?;
+    }
+    Ok(key)
+}
+
+pub fn sticker_link_schema() -> Value {
+    json!({
+        "type": "string",
+        "format": "signal-sticker-link",
+        "description": "Signal's link to the pack: https://signal.art/addstickers/#pack_id=...&pack_key=...",
+    })
+}
+
+/// The pack and key a signal.art sticker link names. Nothing but Signal's own
+/// https link with exactly a pack_id and a pack_key in its fragment passes.
+pub fn sticker_link(s: &str) -> Result<(StickerPackId, [u8; 32]), ToolError> {
+    let invalid = |why: &str| {
+        ToolError::InvalidInput(format!(
+            "\"{s}\" is not a Signal sticker link ({why}); it looks like \
+             https://signal.art/addstickers/#pack_id=...&pack_key=..."
+        ))
+    };
+    let url = url::Url::parse(s).map_err(|_| invalid("not a URL"))?;
+    let signal_art = url.scheme() == "https"
+        && url.host_str() == Some("signal.art")
+        && url.port().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.path() == "/addstickers/"
+        && url.query().is_none();
+    if !signal_art {
+        return Err(invalid("not https://signal.art/addstickers/"));
+    }
+    let (mut pack, mut key) = (None, None);
+    for pair in url.fragment().unwrap_or_default().split('&') {
+        let (slot, value) = match pair.split_once('=') {
+            Some(("pack_id", v)) => (&mut pack, v),
+            Some(("pack_key", v)) => (&mut key, v),
+            _ => return Err(invalid("its fragment holds more than pack_id and pack_key")),
+        };
+        if slot.replace(value).is_some() {
+            return Err(invalid("a field appears twice"));
+        }
+    }
+    let (Some(pack), Some(key)) = (pack, key) else {
+        return Err(invalid("it needs both pack_id and pack_key"));
+    };
+    Ok((sticker_pack(pack)?, sticker_key(key)?))
+}
+
 /// Text that must say something: refused when empty or only whitespace.
 pub fn non_blank(field: &str, s: String) -> Result<String, ToolError> {
     if s.trim().is_empty() {

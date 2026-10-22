@@ -9,7 +9,10 @@ use serde_json::{Value, json};
 
 use crate::{
     Tool, ToolContext, ToolError,
-    input::{parse, sticker_pack, sticker_pack_schema},
+    input::{
+        parse, sticker_key, sticker_key_schema, sticker_link, sticker_link_schema, sticker_pack,
+        sticker_pack_schema,
+    },
     media::sticker_id_schema,
 };
 
@@ -104,10 +107,77 @@ impl Tool for GetSticker {
     }
 }
 
+pub struct AddStickerPack;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AddStickerPackInput {
+    url: Option<String>,
+    pack_id: Option<String>,
+    pack_key: Option<String>,
+}
+
+#[async_trait]
+impl Tool for AddStickerPack {
+    fn name(&self) -> &'static str {
+        "add_sticker_pack"
+    }
+    fn description(&self) -> &'static str {
+        "Install a sticker pack on this account, downloading it from Signal and telling your \
+         other devices. Name it by url, Signal's https://signal.art/addstickers/ link, or by \
+         pack_id and pack_key together; if both forms are given they must name the same pack. \
+         Spends one lookup from the daily lookup limit. Returns the pack id to use with \
+         send_sticker."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "url": sticker_link_schema(),
+                "pack_id": sticker_pack_schema(),
+                "pack_key": sticker_key_schema(),
+            },
+            "additionalProperties": false,
+        })
+    }
+    fn writes(&self) -> bool {
+        true
+    }
+    async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
+        let input: AddStickerPackInput = parse(input)?;
+        let from_link = input.url.as_deref().map(sticker_link).transpose()?;
+        let given = match (input.pack_id, input.pack_key) {
+            (Some(id), Some(key)) => Some((sticker_pack(&id)?, sticker_key(&key)?)),
+            (None, None) => None,
+            _ => {
+                return Err(ToolError::InvalidInput(
+                    "pack_id and pack_key go together".into(),
+                ));
+            }
+        };
+        let (pack, key) = match (from_link, given) {
+            (Some(link), Some(given)) if link != given => {
+                return Err(ToolError::InvalidInput(
+                    "url and pack_id/pack_key name different packs".into(),
+                ));
+            }
+            (Some(pack), _) | (None, Some(pack)) => pack,
+            (None, None) => {
+                return Err(ToolError::InvalidInput(
+                    "name the pack by url, or by pack_id and pack_key".into(),
+                ));
+            }
+        };
+        ctx.signal.install_sticker_pack(pack, key).await?;
+        Ok(json!({ "pack_id": pack.to_string() }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use base64::{Engine, engine::general_purpose::STANDARD};
     use relay_core::prelude::*;
+    use relay_signal::SignalBackend;
     use serde_json::json;
 
     use crate::{Registry, testing::*};
@@ -177,5 +247,54 @@ mod tests {
                 .await;
             assert!(result.is_err(), "{pack_id}/{sticker_id}: {result:?}");
         }
+    }
+
+    /// A pack arrives as Signal's share link or as its id and key; either
+    /// must install that exact pack, and a link that isn't Signal's, or that
+    /// disagrees with the id given beside it, must be refused before anything
+    /// is downloaded.
+    #[tokio::test]
+    async fn add_sticker_pack_installs_from_a_signal_link_or_id_and_key_and_nothing_else() {
+        let (ctx, signal) = ctx_of(|s| s);
+        let registry = Registry::standard();
+        let (a, b) = ("aa".repeat(16), "bb".repeat(16));
+        let key = "cd".repeat(32);
+        let link =
+            |id: &str| format!("https://signal.art/addstickers/#pack_id={id}&pack_key={key}");
+        for input in [
+            json!({"url": link(&a)}),
+            json!({"pack_id": b, "pack_key": key}),
+            json!({"url": link(&b), "pack_id": b, "pack_key": key}),
+        ] {
+            registry
+                .call(&ctx, "add_sticker_pack", input.clone())
+                .await
+                .unwrap_or_else(|e| panic!("{input} refused: {e}"));
+        }
+        for bad in [
+            json!({"url": link(&a).replace("https://signal.art", "https://signal.art.evil.example")}),
+            json!({"url": link(&a).replace("https", "http")}),
+            json!({"url": link(&a).replace("addstickers", "stickers")}),
+            json!({"url": link(&a).replace("#", "?")}),
+            json!({"url": format!("{}&pack_id={b}", link(&a))}),
+            json!({"url": link(&a), "pack_id": b, "pack_key": key}),
+            json!({"pack_id": a}),
+            json!({"pack_key": key}),
+            json!({}),
+        ] {
+            let result = registry.call(&ctx, "add_sticker_pack", bad.clone()).await;
+            assert!(
+                matches!(result, Err(crate::ToolError::InvalidInput(_))),
+                "{bad} not refused as invalid: {result:?}"
+            );
+        }
+        let installed: Vec<_> = signal
+            .sticker_packs()
+            .await
+            .unwrap()
+            .iter()
+            .map(|p| p.id.to_string())
+            .collect();
+        assert_eq!(installed, [a, b]);
     }
 }
