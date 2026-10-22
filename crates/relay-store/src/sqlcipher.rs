@@ -14,8 +14,8 @@ use sqlx::{
 };
 
 use crate::{
-    JobId, MessageStore, ScheduledJob, ScheduledSend, SearchQuery, StoreStats, StoredAttachment,
-    ensure_author,
+    JobId, JobState, MessageStore, ScheduledJob, ScheduledSend, SearchQuery, StoreStats,
+    StoredAttachment, ensure_author,
 };
 
 /// A profile's encrypted message history.
@@ -125,6 +125,39 @@ impl TryFrom<MessageRow> for Message {
             quote,
             edited: row.edited,
             deleted: row.deleted,
+        })
+    }
+}
+
+/// A `scheduled_jobs` row as stored.
+#[derive(FromRow)]
+struct JobRow {
+    id: i64,
+    recipient: String,
+    body: String,
+    send_at_ms: i64,
+    state: String,
+    error: Option<String>,
+}
+
+impl TryFrom<JobRow> for ScheduledJob {
+    type Error = anyhow::Error;
+
+    fn try_from(row: JobRow) -> anyhow::Result<Self> {
+        let state = match (row.state.as_str(), row.error) {
+            ("pending", _) => JobState::Pending,
+            ("sending", _) => JobState::Sending,
+            ("failed", Some(error)) => JobState::Failed { error },
+            (state, error) => bail!("corrupt job state {state:?} with error {error:?}"),
+        };
+        Ok(ScheduledJob {
+            id: JobId(to_u64(row.id)?),
+            send: ScheduledSend {
+                recipient: parse_recipient(&row.recipient)?,
+                body: row.body,
+                send_at_ms: to_u64(row.send_at_ms)?,
+            },
+            state,
         })
     }
 }
@@ -457,20 +490,51 @@ impl MessageStore for SqlCipherStore {
         u32::try_from(count).with_context(|| format!("no votes left on poll {poll:?}"))
     }
 
-    async fn schedule(&self, _send: &ScheduledSend) -> anyhow::Result<JobId> {
-        bail!("scheduled sends are not implemented yet (lane L2b)")
+    async fn schedule(&self, send: &ScheduledSend) -> anyhow::Result<JobId> {
+        let (id,): (i64,) = sqlx::query_as(
+            "INSERT INTO scheduled_jobs (recipient, body, send_at_ms, state) \
+             VALUES (?, ?, ?, 'pending') RETURNING id",
+        )
+        .bind(recipient_key(send.recipient))
+        .bind(&send.body)
+        .bind(to_i64(send.send_at_ms)?)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(JobId(to_u64(id)?))
     }
 
     async fn scheduled(&self) -> anyhow::Result<Vec<ScheduledJob>> {
-        bail!("scheduled sends are not implemented yet (lane L2b)")
+        let rows: Vec<JobRow> = sqlx::query_as(
+            "SELECT id, recipient, body, send_at_ms, state, error FROM scheduled_jobs \
+             ORDER BY send_at_ms, id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(ScheduledJob::try_from).collect()
     }
 
     async fn cancel_scheduled(&self, _id: JobId) -> anyhow::Result<bool> {
         bail!("scheduled sends are not implemented yet (lane L2b)")
     }
 
-    async fn take_due(&self, _now_ms: u64) -> anyhow::Result<Vec<ScheduledJob>> {
-        bail!("scheduled sends are not implemented yet (lane L2b)")
+    // NOTE: one UPDATE ... RETURNING, so the claim and the read are a single
+    // write. A SELECT then UPDATE would let two callers read the same pending
+    // job before either marked it, and both would send it.
+    async fn take_due(&self, now_ms: u64) -> anyhow::Result<Vec<ScheduledJob>> {
+        let rows: Vec<JobRow> = sqlx::query_as(
+            "UPDATE scheduled_jobs SET state = 'sending' \
+             WHERE state = 'pending' AND send_at_ms <= ? \
+             RETURNING id, recipient, body, send_at_ms, state, error",
+        )
+        .bind(to_i64(now_ms)?)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut due = rows
+            .into_iter()
+            .map(ScheduledJob::try_from)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        due.sort_by_key(|j| (j.send.send_at_ms, j.id));
+        Ok(due)
     }
 
     async fn finish_scheduled(

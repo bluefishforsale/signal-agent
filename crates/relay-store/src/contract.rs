@@ -637,7 +637,7 @@ fn later(recipient: u128, send_at_ms: u64) -> ScheduledSend {
 #[tokio::test]
 async fn a_due_job_is_claimed_exactly_once() {
     let stores = Stores::open().await;
-    for (name, store) in stores.round_two() {
+    for (name, store) in stores.each() {
         let late = store.schedule(&later(1, 200)).await.expect("schedule");
         let soon = store.schedule(&later(2, 100)).await.expect("schedule");
         let listed: Vec<_> = store
