@@ -208,6 +208,8 @@ impl Driver {
                 self.services.history.import(&mut progress).await?;
                 SetupEvent::HistoryDone
             }
+            Command::FindDesktop => SetupEvent::DesktopAbsent,
+            Command::ImportDesktop => bail!("Signal Desktop import is not wired in yet"),
             Command::ConnectClients => {
                 self.services.login.register(&self.profile)?;
                 SetupEvent::ClientsConnected {
