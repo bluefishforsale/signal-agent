@@ -4,5 +4,5 @@
 mod http;
 mod stdio;
 
-pub use http::Tokens;
+pub use http::{Grant, Tokens};
 pub use stdio::run_stdio;

@@ -7,7 +7,7 @@ use std::{fs, path::Path};
 
 use anyhow::Context;
 
-pub use tokens::Tokens;
+pub use tokens::{Grant, Tokens};
 
 /// Writes `bytes` to `path` readable only by the current user.
 fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {

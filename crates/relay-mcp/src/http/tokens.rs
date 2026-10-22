@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, anyhow};
+use anyhow::{Context, anyhow, bail};
 use relay_core::AccessMode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -54,6 +54,30 @@ impl Tokens {
         });
         self.save(&saved)?;
         Ok(token)
+    }
+
+    /// Every live token's client and scope.
+    pub fn list(&self) -> anyhow::Result<Vec<Grant>> {
+        Ok(self
+            .load()?
+            .into_iter()
+            .map(|t| Grant {
+                name: t.name,
+                scope: t.scope,
+            })
+            .collect())
+    }
+
+    /// Deletes the token made for `name`, so that client is refused from its
+    /// next request on.
+    pub fn revoke(&self, name: &str) -> anyhow::Result<()> {
+        let mut saved = self.load()?;
+        let before = saved.len();
+        saved.retain(|t| t.name != name);
+        if saved.len() == before {
+            bail!("no token is named \"{name}\"");
+        }
+        self.save(&saved)
     }
 
     /// The grant `presented` carries, if it is a live token.
@@ -115,5 +139,29 @@ mod tests {
             "token stored in the clear: {saved}"
         );
         assert_eq!(tokens.verify("not-a-token").expect("verify"), None);
+    }
+
+    /// Revoking a client must lock it out at once without touching any other
+    /// client's token, and the list must show what's left.
+    #[test]
+    fn a_revoked_token_stops_verifying_and_others_keep_working() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tokens = tokens(&dir);
+        let laptop = tokens.create("laptop", AccessMode::Full).expect("create");
+        let phone = tokens
+            .create("phone", AccessMode::ReadOnly)
+            .expect("create");
+        tokens.revoke("laptop").expect("revoke");
+        assert_eq!(tokens.verify(&laptop).expect("verify"), None, "revoked");
+        assert!(tokens.verify(&phone).expect("verify").is_some(), "other");
+        let listed = tokens.list().expect("list");
+        assert_eq!(
+            listed,
+            vec![Grant {
+                name: "phone".into(),
+                scope: AccessMode::ReadOnly
+            }]
+        );
+        assert!(tokens.revoke("laptop").is_err(), "revoked twice silently");
     }
 }
