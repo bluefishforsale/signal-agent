@@ -60,6 +60,7 @@ jobs:
       # fast instead of reaching Signal. Loopback stays reachable for local test servers.
       - run: cargo test --offline
         env:
+          SIGNAL_AGENT_TEST_OS_KEYRING: "1"
           HTTPS_PROXY: http://127.0.0.1:9
           HTTP_PROXY: http://127.0.0.1:9
           ALL_PROXY: http://127.0.0.1:9
