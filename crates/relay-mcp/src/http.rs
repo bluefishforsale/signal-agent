@@ -3,6 +3,7 @@
 
 mod proxy;
 mod server;
+mod settings;
 mod tls;
 mod tokens;
 
@@ -11,6 +12,7 @@ use std::{fs, path::Path};
 use anyhow::Context;
 
 pub use server::{Listener, serve};
+pub use settings::{HttpSettings, TlsFiles};
 pub use tls::Tls;
 pub use tokens::{Grant, Tokens};
 
