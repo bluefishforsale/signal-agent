@@ -541,6 +541,11 @@ impl SignalBackend for Guarded {
     ) -> anyhow::Result<Option<StickerImage>> {
         self.inner.sticker(pack, sticker_id).await
     }
+    // A pack download reaches the CDN on a client-chosen link, like a lookup.
+    async fn install_sticker_pack(&self, pack: StickerPackId, key: [u8; 32]) -> anyhow::Result<()> {
+        self.limiter.admit_lookups(1)?;
+        self.inner.install_sticker_pack(pack, key).await
+    }
 }
 
 /// Messages a person sees count; typing indicators and read receipts are
@@ -890,6 +895,43 @@ mod tests {
         assert_eq!(signal.sent().len(), 2, "{:?}", signal.sent());
     }
 
+    /// Installing a sticker pack downloads it from Signal's CDN on a link a
+    /// client chose, so a looping client must run out of the lookup budget
+    /// before it can make the account fetch pack after pack.
+    #[tokio::test]
+    async fn installing_sticker_packs_spends_the_lookup_budget() {
+        let one = NonZeroU32::new(1).expect("nonzero literal");
+        let limiter = Arc::new(Limiter::new(
+            Limits {
+                lookup_burst_per_minute: one,
+                ..Limits::default()
+            },
+            Arc::new(FakeClock::default()),
+        ));
+        let (ctx, signal) = ctx();
+        let guarded = guard(Some(&limiter), &ctx).signal;
+        let (first, second) = (StickerPackId::new([1; 16]), StickerPackId::new([2; 16]));
+        guarded
+            .install_sticker_pack(first, [7; 32])
+            .await
+            .expect("first install within budget");
+        let result = guarded.install_sticker_pack(second, [7; 32]).await;
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|e| e.downcast_ref::<LimitExceeded>().is_some()),
+            "a second install went past a budget of one: {result:?}"
+        );
+        let installed: Vec<_> = signal
+            .sticker_packs()
+            .await
+            .expect("lists")
+            .iter()
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(installed, [first], "a refused install reached Signal");
+    }
+
     /// Restarting the agent must not refill the send buckets, or a client that
     /// can crash the agent gets a fresh burst each time.
     #[tokio::test]
@@ -1215,6 +1257,13 @@ mod tests {
             sticker_id: u32,
         ) -> anyhow::Result<Option<StickerImage>> {
             self.inner.sticker(pack, sticker_id).await
+        }
+        async fn install_sticker_pack(
+            &self,
+            pack: StickerPackId,
+            key: [u8; 32],
+        ) -> anyhow::Result<()> {
+            self.inner.install_sticker_pack(pack, key).await
         }
     }
 

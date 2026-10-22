@@ -309,6 +309,10 @@ pub trait SignalBackend: Send + Sync {
         pack: StickerPackId,
         sticker_id: u32,
     ) -> anyhow::Result<Option<StickerImage>>;
+    /// Downloads sticker pack `pack`, decrypted with its 32-byte `key`, from
+    /// Signal's CDN into the local store, and tells this account's other
+    /// devices it was installed.
+    async fn install_sticker_pack(&self, pack: StickerPackId, key: [u8; 32]) -> anyhow::Result<()>;
 }
 
 /// Progress while linking as a secondary device.

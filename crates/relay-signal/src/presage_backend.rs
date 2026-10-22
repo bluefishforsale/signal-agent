@@ -476,6 +476,14 @@ impl SignalBackend for PresageSignal {
             })
             .await?
     }
+
+    async fn install_sticker_pack(&self, pack: StickerPackId, key: [u8; 32]) -> anyhow::Result<()> {
+        let mut manager = self.manager.clone();
+        self.worker
+            .run(move || async move { manager.install_sticker_pack(pack.as_bytes(), &key).await })
+            .await?
+            .map_err(|e| signal_error(e, format!("unable to install sticker pack {pack}")))
+    }
 }
 
 /// The largest attachment Signal's apps accept.

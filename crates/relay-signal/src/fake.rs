@@ -300,6 +300,15 @@ impl SignalBackend for FakeSignal {
             bytes: format!("{pack}/{sticker_id}").into_bytes(),
         }))
     }
+
+    async fn install_sticker_pack(
+        &self,
+        pack: StickerPackId,
+        _key: [u8; 32],
+    ) -> anyhow::Result<()> {
+        self.state().sticker_packs.entry(pack).or_default();
+        Ok(())
+    }
 }
 
 fn tokio_stream_from<T: Send + 'static>(

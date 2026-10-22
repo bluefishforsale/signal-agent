@@ -922,6 +922,9 @@ pub(crate) mod tests {
         ) -> anyhow::Result<Option<relay_signal::StickerImage>> {
             anyhow::bail!("offline")
         }
+        async fn install_sticker_pack(&self, _: StickerPackId, _: [u8; 32]) -> anyhow::Result<()> {
+            anyhow::bail!("offline")
+        }
     }
 
     /// An agent that fails after its store opened must still close the store,
