@@ -2,7 +2,7 @@
 //! without a live token, and the token's scope picks which agent connection
 //! serves it, so a read-only token meets the registry's read-only gate.
 
-use std::{convert::Infallible, net::SocketAddr, sync::Arc};
+use std::{convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Context, bail};
 use bytes::Bytes;
@@ -51,6 +51,10 @@ impl Listener {
     }
 }
 
+/// How long to pause after a transient accept error, so a full descriptor
+/// table drains instead of spinning the CPU.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+
 type Body = BoxBody<Bytes, Infallible>;
 
 struct Gate {
@@ -68,7 +72,15 @@ pub async fn serve(listener: Listener, tokens: Tokens, agent: String) -> anyhow:
         read_only: mcp_service(Proxy::new(agent, AccessMode::ReadOnly)),
     });
     loop {
-        let (tcp, peer) = listener.tcp.accept().await?;
+        let (tcp, peer) = match listener.tcp.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) if transient(&e) => {
+                tracing::warn!("accepting an HTTP connection failed, retrying: {e}");
+                tokio::time::sleep(ACCEPT_BACKOFF).await;
+                continue;
+            }
+            Err(e) => return Err(e).context("the HTTP endpoint stopped accepting"),
+        };
         let gate = gate.clone();
         let tls = listener.tls.clone();
         tokio::spawn(async move {
@@ -97,6 +109,25 @@ where
     hyper::server::conn::http1::Builder::new()
         .serve_connection(TokioIo::new(stream), service)
         .await
+}
+
+/// Whether accepting failed because of load or one misbehaving client, so the
+/// endpoint should pause and carry on rather than stop.
+fn transient(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::*;
+    if matches!(
+        e.kind(),
+        ConnectionAborted | ConnectionReset | Interrupted | WouldBlock
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    let exhausted = [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM];
+    // WSAEMFILE and WSAENOBUFS.
+    #[cfg(windows)]
+    let exhausted = [10024, 10055];
+    e.raw_os_error()
+        .is_some_and(|code| exhausted.contains(&code))
 }
 
 fn mcp_service(proxy: Proxy) -> StreamableHttpService<Proxy, NeverSessionManager> {
@@ -430,5 +461,25 @@ mod tests {
             .expect("a refusal is a result");
         assert_eq!(result.is_error, Some(true), "full token wrote: {result:?}");
         assert!(signal.sent().is_empty(), "a full token lifted read-only");
+    }
+
+    /// Running out of file descriptors or a client resetting mid-accept must
+    /// not stop the endpoint; only a listener that is really broken may.
+    #[test]
+    fn accept_errors_from_load_or_one_client_are_transient() {
+        use std::io::{Error, ErrorKind};
+        for kind in [ErrorKind::ConnectionAborted, ErrorKind::ConnectionReset] {
+            assert!(
+                transient(&Error::from(kind)),
+                "{kind:?} stopped the endpoint"
+            );
+        }
+        #[cfg(unix)]
+        for errno in [libc::EMFILE, libc::ENFILE] {
+            let e = Error::from_raw_os_error(errno);
+            assert!(transient(&e), "{e} stopped the endpoint");
+        }
+        let fatal = Error::from(ErrorKind::InvalidInput);
+        assert!(!transient(&fatal), "kept accepting on {fatal}");
     }
 }
