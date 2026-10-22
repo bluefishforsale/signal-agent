@@ -70,14 +70,13 @@ fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     written.with_context(|| format!("unable to write \"{}\"", path.display()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
     /// Token and settings files replace the old copy whole: a crash mid-save
     /// must never leave a truncated file, and the result is the user's alone
     /// even when the old copy was readable by others.
-    #[cfg(unix)]
     #[test]
     fn a_private_write_replaces_the_file_whole_and_user_only() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
