@@ -2,6 +2,7 @@
 //! deletes. Signal names the target by author and send timestamp, and the local
 //! store follows only once Signal has accepted the change.
 
+use anyhow::Context;
 use async_trait::async_trait;
 use relay_core::prelude::*;
 use relay_signal::Outgoing;
@@ -121,6 +122,67 @@ impl Tool for ReactToMessage {
     }
 }
 
+pub struct EditMessage;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EditInput {
+    recipient: String,
+    target_timestamp: Timestamp,
+    message: String,
+}
+
+#[async_trait]
+impl Tool for EditMessage {
+    fn name(&self) -> &'static str {
+        "edit_message"
+    }
+    fn description(&self) -> &'static str {
+        "Replace the text of a message you sent, in a DM or group; recipients see it marked \
+         edited. recipient is the conversation (group ids included); target_timestamp names \
+         your message, as get_conversation or a send result returns it; message is the new \
+         full text. Only your own messages can be edited. Sends to Signal, then overwrites the \
+         stored body (the old text isn't kept)."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "recipient": recipient_schema(),
+                "target_timestamp": Timestamp::schema("Your message to edit"),
+                "message": {"type": "string", "description": "The new full text"},
+            },
+            "required": ["recipient", "target_timestamp", "message"],
+            "additionalProperties": false,
+        })
+    }
+    fn writes(&self) -> bool {
+        true
+    }
+    async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
+        let input: EditInput = parse(input)?;
+        let body = non_blank("message", input.message)?;
+        let to = recipient(ctx, &input.recipient).await?;
+        // NOTE: the target is always this account's own message. Taking an
+        // author from the caller would let an edit aim at someone else's message.
+        let me = ctx.signal.account().await?.service_id;
+        let target = MessageId {
+            author: me,
+            sent_at_ms: input.target_timestamp.0,
+        };
+        let edit = Outgoing::Edit {
+            target,
+            body: body.clone(),
+        };
+        ctx.signal.send(to, edit).await?;
+        ctx.store
+            .apply_edit(target, me, &body)
+            .await
+            .context("Signal accepted the edit, but the stored copy wasn't updated")?;
+        Ok(json!({ "status": "edited", "target_timestamp": target.sent_at_ms }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use relay_signal::Outgoing;
@@ -162,5 +224,57 @@ mod tests {
                 }
             )]
         );
+    }
+
+    /// A message this account sent into `conversation` at `sent_at_ms`.
+    fn mine(conversation: Recipient, sent_at_ms: u64, body: &str) -> Message {
+        Message {
+            id: MessageId {
+                author: sid(ME),
+                sent_at_ms,
+            },
+            conversation,
+            sender: sid(ME),
+            from_me: true,
+            ..incoming(ME, sent_at_ms, body)
+        }
+    }
+
+    /// The edit goes to Signal as this account's own message, and only then
+    /// replaces the stored body and flags it edited.
+    #[tokio::test]
+    async fn edit_message_sends_the_edit_then_updates_the_stored_copy() {
+        let (ctx, signal) = ctx(AccessMode::Full, ProfileKind::Linked);
+        let dm = Recipient::Contact(sid(2));
+        ctx.store.insert(&mine(dm, 42, "teh cat")).await.unwrap();
+        Registry::standard()
+            .call(
+                &ctx,
+                "edit_message",
+                json!({
+                    "recipient": sid(2).to_string(),
+                    "target_timestamp": 42,
+                    "message": "the cat",
+                }),
+            )
+            .await
+            .unwrap();
+        let target = MessageId {
+            author: sid(ME),
+            sent_at_ms: 42,
+        };
+        assert_eq!(
+            signal.sent(),
+            [(
+                dm,
+                Outgoing::Edit {
+                    target,
+                    body: "the cat".into(),
+                }
+            )]
+        );
+        let stored = ctx.store.history(dm, None, 10).await.unwrap();
+        assert_eq!(stored[0].body.as_deref(), Some("the cat"), "{stored:?}");
+        assert!(stored[0].edited, "edit not flagged: {stored:?}");
     }
 }

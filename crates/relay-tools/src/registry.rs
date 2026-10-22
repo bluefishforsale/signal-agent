@@ -25,6 +25,7 @@ impl Registry {
             .with(read::GetConversation)
             .with(read::SearchMessages)
             .with(mutate::ReactToMessage)
+            .with(mutate::EditMessage)
     }
 
     pub fn with(mut self, tool: impl Tool + 'static) -> Self {
