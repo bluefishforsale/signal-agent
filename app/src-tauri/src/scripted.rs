@@ -11,7 +11,7 @@ use relay_setup::prelude::*;
 use crate::session::{Setup, Show};
 
 /// The events a command produces, each after a pause.
-pub type Script = fn(&Command) -> Vec<(Duration, SetupEvent)>;
+type Script = Box<dyn Fn(&Command) -> Vec<(Duration, SetupEvent)> + Send + Sync>;
 
 pub struct Scripted {
     state: SetupState,
@@ -19,8 +19,14 @@ pub struct Scripted {
 }
 
 impl Scripted {
-    pub fn new(state: SetupState, script: Script) -> Self {
-        Self { state, script }
+    pub fn new(
+        state: SetupState,
+        script: impl Fn(&Command) -> Vec<(Duration, SetupEvent)> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            state,
+            script: Box::new(script),
+        }
     }
 
     fn apply(&mut self, event: SetupEvent, show: Show<'_>) -> Vec<Command> {

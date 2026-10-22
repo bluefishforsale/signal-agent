@@ -8,6 +8,8 @@ mod input;
 mod mock;
 #[cfg(target_os = "macos")]
 mod placement;
+#[cfg_attr(feature = "mock-driver", allow(dead_code))]
+mod real;
 mod scripted;
 mod session;
 mod view;
@@ -34,25 +36,31 @@ mod placement {
     }
 }
 
-/// Who carries setup forward. Swap this for relay-setup's driver.
+/// Who carries setup forward: relay-setup's driver, or the scripted
+/// walk-through in development builds.
+#[cfg(not(feature = "mock-driver"))]
 fn setup() -> Box<dyn Setup> {
-    #[cfg(feature = "mock-driver")]
-    let script = mock::script;
-    #[cfg(not(feature = "mock-driver"))]
-    let script = not_ready;
-    Box::new(Scripted::new(start_state(), script))
+    let start = start_state();
+    real::setup(start.clone()).unwrap_or_else(|e| Box::new(Scripted::new(start, unavailable(e))))
 }
 
-/// Stands in until relay-setup's driver is wired in, failing each step
-/// plainly instead of pretending setup worked.
+#[cfg(feature = "mock-driver")]
+fn setup() -> Box<dyn Setup> {
+    Box::new(Scripted::new(start_state(), mock::script))
+}
+
+/// Fails each step with why setup couldn't start, instead of pretending.
 #[cfg_attr(feature = "mock-driver", allow(dead_code))]
-fn not_ready(_command: &Command) -> Vec<(Duration, SetupEvent)> {
-    vec![(
-        Duration::ZERO,
-        SetupEvent::CommandFailed {
-            message: "This test build can't finish setup yet.".into(),
-        },
-    )]
+fn unavailable(why: anyhow::Error) -> impl Fn(&Command) -> Vec<(Duration, SetupEvent)> {
+    let message = format!("Setup can't start on this computer: {why:#}");
+    move |_| {
+        vec![(
+            Duration::ZERO,
+            SetupEvent::CommandFailed {
+                message: message.clone(),
+            },
+        )]
+    }
 }
 
 fn start_state() -> SetupState {

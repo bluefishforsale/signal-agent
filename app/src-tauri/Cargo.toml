@@ -16,9 +16,17 @@ anyhow.workspace = true
 async-trait.workspace = true
 dirs.workspace = true
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
+relay-agent.workspace = true
 relay-core.workspace = true
+relay-secrets.workspace = true
 relay-setup.workspace = true
+relay-signal.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tauri = { version = "2.12.5", features = [] }
 tokio.workspace = true
+
+[dev-dependencies]
+futures.workspace = true
+tempfile = "3.27.0"
+uuid.workspace = true
