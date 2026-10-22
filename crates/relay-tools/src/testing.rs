@@ -39,6 +39,7 @@ pub fn ctx_with(
         signal: signal.clone(),
         access,
         kind,
+        send_roots: Arc::default(),
     };
     (ctx, signal)
 }

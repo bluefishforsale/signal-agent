@@ -316,6 +316,7 @@ mod tests {
             signal: Arc::new(signal(fake)),
             access: AccessMode::ReadOnly,
             kind: ProfileKind::Linked,
+            send_roots: Arc::default(),
         }
     }
 

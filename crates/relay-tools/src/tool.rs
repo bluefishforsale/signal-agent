@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use relay_core::prelude::*;
-use relay_signal::SignalBackend;
+use relay_signal::{SendRoots, SignalBackend};
 use relay_store::MessageStore;
 use serde_json::Value;
 
@@ -15,6 +15,8 @@ pub struct ToolContext {
     pub signal: Arc<dyn SignalBackend>,
     pub access: AccessMode,
     pub kind: ProfileKind,
+    /// The folders a tool may send files from.
+    pub send_roots: Arc<SendRoots>,
 }
 
 /// Why a tool call failed, in the categories an MCP client needs to tell apart.

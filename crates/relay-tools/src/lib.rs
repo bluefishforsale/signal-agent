@@ -10,12 +10,14 @@ mod mutate;
 mod read;
 mod registry;
 mod send;
+mod settings;
 #[cfg(test)]
 mod testing;
 mod tool;
 
 pub use limits::{Clock, LimitExceeded, Limiter, Limits, SystemClock, begin_provisioning};
 pub use registry::Registry;
+pub use settings::Settings;
 pub use tool::{Tool, ToolContext, ToolError};
 
 pub mod prelude {

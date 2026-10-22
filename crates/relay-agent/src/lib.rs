@@ -7,6 +7,7 @@ pub mod endpoint;
 pub mod login;
 mod mcp;
 mod startup;
+mod supervisor;
 
 use std::sync::Arc;
 
@@ -17,6 +18,8 @@ use relay_store::MessageStore;
 use relay_tools::{Clock, Limiter, Limits, Registry, SystemClock, ToolContext};
 use rmcp::ServiceExt;
 use tokio::task::JoinSet;
+
+pub use supervisor::{Supervisor, SupervisorAction};
 
 /// What the agent needs to start.
 #[derive(Clone, Debug)]
@@ -100,6 +103,7 @@ async fn serve_until(
             signal: signal.clone(),
             access,
             kind,
+            send_roots: Arc::default(),
         },
         registry,
     };
@@ -252,6 +256,7 @@ pub(crate) mod tests {
             signal: signal.clone(),
             access: AccessMode::Full,
             kind: ProfileKind::Linked,
+            send_roots: Arc::default(),
         };
         let dm = |n: u128| {
             let to = ServiceId::new(Uuid::from_u128(n)).to_string();
@@ -299,6 +304,7 @@ pub(crate) mod tests {
             signal: signal.clone(),
             access: AccessMode::Full,
             kind: ProfileKind::Linked,
+            send_roots: Arc::default(),
         };
         let registry = registry(&paths, Arc::new(FakeClock(0.into())));
         let stats = registry

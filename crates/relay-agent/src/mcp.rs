@@ -134,6 +134,7 @@ pub(crate) mod tests {
             signal: signal.clone(),
             access,
             kind: ProfileKind::Linked,
+            send_roots: Arc::default(),
         };
         let registry = Arc::new(Registry::default().with(ProbeSend));
         (Handler { ctx, registry }, signal)

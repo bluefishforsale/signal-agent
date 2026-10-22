@@ -519,6 +519,7 @@ mod tests {
             signal: signal.clone(),
             access: AccessMode::Full,
             kind: ProfileKind::Linked,
+            send_roots: Arc::default(),
         };
         (ctx, signal)
     }
