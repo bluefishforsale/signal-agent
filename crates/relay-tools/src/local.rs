@@ -305,11 +305,20 @@ fn csv(messages: &[Message]) -> String {
     out
 }
 
-/// RFC 4180: a field holding a separator, quote or line break is quoted, with
-/// inner quotes doubled.
+/// A free-text field, made safe for a spreadsheet then quoted per RFC 4180:
+/// a field holding a separator, quote or line break is quoted, with inner
+/// quotes doubled.
+// NOTE: bodies come from other people. Excel and Sheets run a cell starting
+// with = + - @ tab or CR as a formula, so without the leading quote a stranger's
+// message could run on whoever opens the export.
 fn csv_field(s: &str) -> String {
+    let s = if s.starts_with(['=', '+', '-', '@', '\t', '\r']) {
+        format!("'{s}")
+    } else {
+        s.to_owned()
+    };
     if !s.contains([',', '"', '\n', '\r']) {
-        return s.to_owned();
+        return s;
     }
     format!("\"{}\"", s.replace('"', "\"\""))
 }
@@ -498,5 +507,49 @@ mod tests {
         let left = ctx.store.export(None, None).await.unwrap();
         assert_eq!(left.len(), 1, "{left:?}");
         assert_eq!(left[0].body.as_deref(), Some("yesterday"), "{left:?}");
+    }
+
+    /// Bodies come from other people, and a spreadsheet runs a cell starting
+    /// with a formula character, so an exported message starting with one
+    /// can't run as a formula: it gets a leading quote. An ordinary
+    /// "- item" body takes the same prefix and stays readable.
+    #[tokio::test]
+    async fn an_exported_message_starting_with_a_formula_character_cant_run_as_a_formula() {
+        let (ctx, _) = ctx(AccessMode::ReadOnly, ProfileKind::Linked);
+        let bodies = [
+            "=HYPERLINK(\"http://evil\",\"x\")",
+            "+1+1",
+            "- buy milk",
+            "@SUM(A1)",
+            "\t=1",
+            "\r=1",
+        ];
+        for (t, body) in bodies.iter().enumerate() {
+            ctx.store
+                .insert(&incoming(2, 1000 + t as u64, body))
+                .await
+                .unwrap();
+        }
+        let out = Registry::standard()
+            .call(&ctx, "export_messages", json!({"format": "csv"}))
+            .await
+            .unwrap();
+        let data = out["data"].as_str().unwrap();
+        for (body, cell) in [
+            (
+                "=HYPERLINK",
+                "\"'=HYPERLINK(\"\"http://evil\"\",\"\"x\"\")\"",
+            ),
+            ("+1+1", ",'+1+1,"),
+            ("- buy milk", ",'- buy milk,"),
+            ("@SUM", ",'@SUM(A1),"),
+            ("tab", ",'\t=1,"),
+            ("CR", ",\"'\r=1\","),
+        ] {
+            assert!(
+                data.contains(cell),
+                "{body} not neutralized as {cell:?}: {data:?}"
+            );
+        }
     }
 }
