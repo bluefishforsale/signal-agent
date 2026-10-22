@@ -9,6 +9,11 @@ use std::{
 };
 
 use anyhow::{Context, anyhow, bail};
+use presage::{
+    libsignal_service::configuration::{Endpoint, ServiceConfiguration, SignalServers},
+    manager::RegistrationData,
+};
+use relay_core::LinkAndSyncKey;
 use reqwest::{
     StatusCode,
     header::{RANGE, RETRY_AFTER},
@@ -16,12 +21,6 @@ use reqwest::{
 use serde::Deserialize;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use url::Url;
-
-use presage::{
-    libsignal_service::configuration::{Endpoint, ServiceConfiguration, SignalServers},
-    manager::RegistrationData,
-};
-use relay_core::LinkAndSyncKey;
 
 use crate::{HistoryTransfer, RateLimited};
 
@@ -104,6 +103,12 @@ struct Patience {
     download_attempts: u32,
     /// How long to wait before resuming a broken download.
     retry_delay: Duration,
+}
+
+/// How one request for the archive went.
+enum Fetched {
+    Complete,
+    BrokeOff(anyhow::Error),
 }
 
 #[derive(Deserialize)]
@@ -227,9 +232,9 @@ impl ArchiveSource {
         let mut written = 0u64;
         let mut attempt = 1;
         loop {
-            let broke = match self.fetch_from(&url, &mut file, &mut written).await? {
-                None => return Ok(()),
-                Some(broke) => broke,
+            let Fetched::BrokeOff(broke) = self.fetch_from(&url, &mut file, &mut written).await?
+            else {
+                return Ok(());
             };
             if attempt >= self.patience.download_attempts {
                 return Err(broke.context("the history archive download kept breaking off"));
@@ -239,28 +244,32 @@ impl ArchiveSource {
         }
     }
 
-    /// Fetches `url` from byte `written` on into `file`. The outer error is
-    /// Signal's refusal; the inner one a connection that broke, worth resuming.
+    /// Fetches `url` from byte `written` on into `file`. Fails when Signal
+    /// refuses; a broken connection is worth resuming, so it isn't a failure.
     async fn fetch_from(
         &self,
         url: &Url,
         file: &mut tokio::fs::File,
         written: &mut u64,
-    ) -> anyhow::Result<Option<anyhow::Error>> {
+    ) -> anyhow::Result<Fetched> {
         let mut request = self.http.get(url.clone());
         if *written > 0 {
             request = request.header(RANGE, format!("bytes={written}-"));
         }
         let mut response = match request.send().await {
             Ok(response) => response,
-            Err(e) => return Ok(Some(anyhow!(e))),
+            Err(e) => return Ok(Fetched::BrokeOff(e.into())),
         };
         match response.status() {
             StatusCode::PARTIAL_CONTENT => {}
             StatusCode::OK => {
                 // The CDN ignored the range and sent everything again.
-                file.set_len(0).await?;
-                file.seek(SeekFrom::Start(0)).await?;
+                file.set_len(0)
+                    .await
+                    .context("unable to restart the history archive")?;
+                file.seek(SeekFrom::Start(0))
+                    .await
+                    .context("unable to restart the history archive")?;
                 *written = 0;
             }
             _ => return Err(refused(&response, "the history archive download")),
@@ -269,7 +278,7 @@ impl ArchiveSource {
             let chunk = match response.chunk().await {
                 Ok(Some(chunk)) => chunk,
                 Ok(None) => break,
-                Err(e) => return Ok(Some(anyhow!(e))),
+                Err(e) => return Ok(Fetched::BrokeOff(e.into())),
             };
             file.write_all(&chunk)
                 .await
@@ -279,7 +288,7 @@ impl ArchiveSource {
         file.flush()
             .await
             .context("unable to write the history archive")?;
-        Ok(None)
+        Ok(Fetched::Complete)
     }
 
     /// Long-polls until the phone says where the archive is.

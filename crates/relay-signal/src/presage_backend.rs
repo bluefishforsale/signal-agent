@@ -45,8 +45,9 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
 use crate::{
-    Account, Contact, Device, DiscoveryUnsupported, Group, Identity, Incoming, LinkEvent, Outgoing,
-    Provisioner, RateLimited, RegistrationStep, SendableFile, SignalBackend, Trust, convert,
+    Account, Contact, Device, DiscoveryUnsupported, Group, HistoryTransfer, Identity, Incoming,
+    LinkEvent, Outgoing, Provisioner, RateLimited, RegistrationStep, SendableFile, SignalBackend,
+    Trust, convert, transfer::PendingTransfer,
 };
 
 type Job = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()>>> + Send>;
@@ -446,7 +447,11 @@ pub struct PresageProvisioner {
     store: SqliteStore,
     servers: SignalServers,
     pending: Mutex<Option<Manager<SqliteStore, Confirmation>>>,
+    history: OfferedHistory,
 }
+
+/// The history transfer the last link was offered, until it is fetched.
+type OfferedHistory = Arc<Mutex<Option<anyhow::Result<PendingTransfer>>>>;
 
 impl PresageProvisioner {
     /// Opens (creating if needed) the store at `path`, encrypted with `key`,
@@ -461,6 +466,7 @@ impl PresageProvisioner {
                 Servers::Staging => SignalServers::Staging,
             },
             pending: Mutex::new(None),
+            history: OfferedHistory::default(),
         })
     }
 }
@@ -470,10 +476,11 @@ impl Provisioner for PresageProvisioner {
     fn link(&self, device_name: String) -> BoxStream<'static, anyhow::Result<LinkEvent>> {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (worker, store, servers) = (self.worker.clone(), self.store.clone(), self.servers);
+        let history = self.history.clone();
         let start = async move {
             let started = worker
                 .run(move || async move {
-                    tokio::task::spawn_local(link(store, servers, device_name, tx));
+                    tokio::task::spawn_local(link(store, servers, device_name, history, tx));
                 })
                 .await;
             match started {
@@ -521,6 +528,14 @@ impl Provisioner for PresageProvisioner {
         }
     }
 
+    async fn transfer_history(&self, dir: &Path) -> anyhow::Result<HistoryTransfer> {
+        let offered = self.history.lock().expect("offered history lock").take();
+        match offered {
+            None => Ok(HistoryTransfer::NotOffered),
+            Some(pending) => pending?.fetch(dir).await,
+        }
+    }
+
     async fn verify_code(&self, code: &str) -> anyhow::Result<RegistrationStep> {
         // Cloned, not taken: a mistyped code can be retried on the same session.
         let Some(confirmation) = self
@@ -553,6 +568,7 @@ async fn link(
     store: SqliteStore,
     servers: SignalServers,
     device_name: String,
+    history: OfferedHistory,
     tx: mpsc::UnboundedSender<anyhow::Result<LinkEvent>>,
 ) {
     if store.is_registered().await {
@@ -580,9 +596,16 @@ async fn link(
         )
         .await;
         let event = match linked {
-            Ok(manager) => Ok(LinkEvent::Linked {
-                account: convert::account(manager.registration_data(), manager.registration_type()),
-            }),
+            Ok(manager) => {
+                *history.lock().expect("offered history lock") =
+                    PendingTransfer::after_link(manager.registration_data());
+                Ok(LinkEvent::Linked {
+                    account: convert::account(
+                        manager.registration_data(),
+                        manager.registration_type(),
+                    ),
+                })
+            }
             // The provisioning socket closed with no scan: the URI expired.
             // NOTE: only this loops. Any other failure, a rate limit above all,
             // ends the link; looping on it would re-ask Signal unattended.
@@ -1037,7 +1060,6 @@ async fn open_store(path: &Path, key: &[u8; 32]) -> anyhow::Result<SqliteStore> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::HistoryTransfer;
     use presage::{
         libsignal_service::{
             content::{ContentBody, Metadata},

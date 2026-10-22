@@ -95,7 +95,7 @@ Mapping into relay-core:
 
 ## What L1 needs to provide
 
-Tracked as an issue for lane L1:
+Implemented in `relay-signal` as `Provisioner::transfer_history` (`crates/relay-signal/src/transfer.rs`), except step 5, which setup drives:
 
 1. `capabilities=backup5` on the provisioning URL (plus `nopni2`, which Android also checks and Desktop sends).
 2. Read `ephemeral_backup_key()` right after linking; if it's `Some`, hold it in memory only, and don't start the receive loop's store writes for history until the import has run (Desktop holds message processing until the import finishes, `AccountManager.preload.ts:1337-1350`, **verified**).
