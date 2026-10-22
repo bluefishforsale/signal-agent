@@ -39,6 +39,7 @@ impl Registry {
             .with(mutate::DeleteMessage)
             .with(mutate::DeleteGroupMessage)
             .with(directory::ListContacts)
+            .with(directory::FindContact)
             .with(directory::ListGroups)
             .with(directory::ListAttachments)
             .with(directory::GetAttachment)
