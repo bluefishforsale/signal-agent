@@ -35,6 +35,18 @@ impl WebhookUrl {
     pub fn as_url(&self) -> &Url {
         &self.0
     }
+
+    /// Scheme, host, port and path only: safe to log, since a token in the
+    /// query or the userinfo would otherwise land in the log file.
+    pub fn redacted(&self) -> String {
+        let mut url = self.0.clone();
+        url.set_query(None);
+        url.set_fragment(None);
+        // Infallible for http and https, the only schemes `parse` admits.
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+        url.into()
+    }
 }
 
 fn is_loopback(url: &Url) -> bool {
@@ -132,6 +144,16 @@ mod tests {
         ] {
             assert!(WebhookUrl::parse(bad).is_err(), "accepted {bad:?}");
         }
+    }
+
+    /// Webhook URLs often carry a token, in the query or as a password, so
+    /// the form that goes into logs keeps only where the request went.
+    #[test]
+    fn the_redacted_form_drops_credentials_and_query() {
+        let url =
+            WebhookUrl::parse("https://user:SECRET@hooks.example.com:8443/in/x?token=SECRET#frag")
+                .expect("url");
+        assert_eq!(url.redacted(), "https://hooks.example.com:8443/in/x");
     }
 
     /// A stored value must be revalidated on the way back in, so a hand-edited

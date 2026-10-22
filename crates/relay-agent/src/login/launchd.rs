@@ -1,6 +1,6 @@
 //! The macOS login agent, registered through SMAppService from a plist inside
-//! the app bundle. A bundle plist is fixed at build time, so it runs the
-//! default profile only.
+//! the app bundle. A bundle plist is fixed at build time, which is why it runs
+//! the supervisor rather than any one profile.
 
 use std::path::Path;
 
@@ -12,17 +12,27 @@ use objc2::rc::Retained;
 use objc2_foundation::NSString;
 #[cfg(target_os = "macos")]
 use objc2_service_management::{SMAppService, SMAppServiceStatus};
-#[cfg(target_os = "macos")]
-use relay_core::ProfileName;
 
 /// The plist's file name in `Contents/Library/LaunchAgents`.
 pub(super) const PLIST_NAME: &str = "com.bluefishforsale.signalagent.agent.plist";
 
+/// Written beside the profiles once the job runs the supervisor.
 #[cfg(target_os = "macos")]
-pub(super) fn register(profile: &ProfileName) -> anyhow::Result<()> {
-    let service = service_for(profile)?;
+const MIGRATED_MARKER: &str = "login-item-supervisor";
+
+#[cfg(target_os = "macos")]
+pub(super) fn register(data_dir: &Path) -> anyhow::Result<()> {
+    let service = service()?;
+    let marker = data_dir.join(MIGRATED_MARKER);
+    // NOTE: an install from before the supervisor has this same job running
+    // `--profile personal`, and launchd keeps the definition it loaded until
+    // the job is registered again. Re-register once, not on every call, since
+    // each time restarts every agent.
     // SAFETY: SMAppService methods are callable from any thread on macOS 13+,
     // which the app's minimum system version guarantees.
+    if unsafe { service.status() } == SMAppServiceStatus::Enabled && !marker.exists() {
+        unregister_service(&service)?;
+    }
     if unsafe { service.status() } != SMAppServiceStatus::Enabled {
         unsafe { service.registerAndReturnError() }.map_err(|e| {
             anyhow!(
@@ -32,7 +42,7 @@ pub(super) fn register(profile: &ProfileName) -> anyhow::Result<()> {
         })?;
     }
     match unsafe { service.status() } {
-        SMAppServiceStatus::Enabled => Ok(()),
+        SMAppServiceStatus::Enabled => {}
         SMAppServiceStatus::RequiresApproval => bail!(
             "the agent needs approval: System Settings > General > Login Items, allow MCP Relay for Signal"
         ),
@@ -41,11 +51,25 @@ pub(super) fn register(profile: &ProfileName) -> anyhow::Result<()> {
             other.0
         ),
     }
+    std::fs::create_dir_all(data_dir)
+        .and_then(|()| std::fs::write(&marker, b""))
+        .with_context(|| format!("unable to write \"{}\"", marker.display()))
 }
 
 #[cfg(target_os = "macos")]
-pub(super) fn unregister(profile: &ProfileName) -> anyhow::Result<()> {
-    let service = service_for(profile)?;
+pub(super) fn unregister(data_dir: &Path) -> anyhow::Result<()> {
+    let service = service()?;
+    unregister_service(&service)?;
+    match std::fs::remove_file(data_dir.join(MIGRATED_MARKER)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            Err(e).context("unable to remove the login item marker")
+        }
+        _ => Ok(()),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn unregister_service(service: &SMAppService) -> anyhow::Result<()> {
     // SAFETY: as in `register`.
     if unsafe { service.status() } == SMAppServiceStatus::NotRegistered {
         return Ok(());
@@ -59,13 +83,7 @@ pub(super) fn unregister(profile: &ProfileName) -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn service_for(profile: &ProfileName) -> anyhow::Result<Retained<SMAppService>> {
-    if *profile != ProfileName::default_profile() {
-        bail!(
-            "the macOS login agent runs the \"{}\" profile only; \"{profile}\" needs its own bundled plist",
-            ProfileName::default_profile()
-        );
-    }
+fn service() -> anyhow::Result<Retained<SMAppService>> {
     let exe = std::env::current_exe().context("unable to locate this executable")?;
     // NOTE: no launchctl fallback for dev builds. A raw LaunchAgent would
     // outlive the app, escape SMAppService's user approval, and leave a
@@ -73,7 +91,7 @@ fn service_for(profile: &ProfileName) -> anyhow::Result<Retained<SMAppService>> 
     if app_bundle(&exe).is_none() {
         bail!(
             "\"{}\" is not inside an app bundle, so it can't register a login agent; \
-             run `signal-agent agent` by hand for a dev build",
+             run `signal-agent agent --all-profiles` by hand for a dev build",
             exe.display()
         );
     }
@@ -97,8 +115,8 @@ mod tests {
     use super::*;
 
     /// SMAppService finds the plist by PLIST_NAME and launchd runs what it
-    /// says, so the shipped file must agree with this code on the name, the
-    /// bundled binary, and the profile it runs.
+    /// says, so the shipped file must agree with this code on the name and
+    /// the bundled binary, and run the supervisor.
     #[test]
     fn the_shipped_plist_matches_what_registration_expects() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -109,11 +127,10 @@ mod tests {
             .expect("plist next to the crate")
             .replace("\r\n", "\n");
         let label = PLIST_NAME.trim_end_matches(".plist");
-        let default = relay_core::ProfileName::default_profile();
         for expected in [
             format!("<key>Label</key>\n\t<string>{label}</string>"),
             "<key>BundleProgram</key>\n\t<string>Contents/MacOS/signal-agent</string>".into(),
-            format!("<string>--profile</string>\n\t\t<string>{default}</string>"),
+            "<string>agent</string>\n\t\t<string>--all-profiles</string>\n\t</array>".into(),
         ] {
             assert!(
                 plist.contains(&expected),

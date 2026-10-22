@@ -4884,7 +4884,9 @@ dependencies = [
  "relay-signal",
  "relay-store",
  "relay-tools",
+ "reqwest",
  "rmcp",
+ "rustls",
  "serde_json",
  "tempfile",
  "tokio",
@@ -5006,6 +5008,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
  "url",
  "uuid",
 ]
