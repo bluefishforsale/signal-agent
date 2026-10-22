@@ -8,8 +8,8 @@ mod fake;
 mod presage_backend;
 
 pub use backend::{
-    Account, Contact, Group, Incoming, LinkEvent, Outgoing, Provisioner, RegistrationStep,
-    SignalBackend,
+    Account, Contact, Group, Incoming, LinkEvent, Outgoing, Provisioner, RateLimited,
+    RegistrationStep, SignalBackend,
 };
 pub use fake::FakeSignal;
 pub use presage_backend::{PresageProvisioner, PresageSignal, Servers};
@@ -17,6 +17,6 @@ pub use presage_backend::{PresageProvisioner, PresageSignal, Servers};
 pub mod prelude {
     pub use crate::{
         Account, Contact, FakeSignal, Group, Incoming, LinkEvent, Outgoing, Provisioner,
-        RegistrationStep, SignalBackend,
+        RateLimited, RegistrationStep, SignalBackend,
     };
 }

@@ -4,6 +4,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
+    fmt::Display,
     future::Future,
     path::Path,
     pin::Pin,
@@ -21,7 +22,8 @@ use futures::{StreamExt, stream::BoxStream};
 use presage::{
     Manager,
     libsignal_service::{
-        configuration::SignalServers, prelude::phonenumber::PhoneNumber,
+        configuration::SignalServers,
+        prelude::{MessageSenderError, ServiceError, phonenumber::PhoneNumber},
         provisioning::ProvisioningError,
     },
     libsignal_service::{
@@ -41,8 +43,8 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
 use crate::{
-    Account, Contact, Group, Incoming, LinkEvent, Outgoing, Provisioner, RegistrationStep,
-    SignalBackend, convert,
+    Account, Contact, Group, Incoming, LinkEvent, Outgoing, Provisioner, RateLimited,
+    RegistrationStep, SignalBackend, convert,
 };
 
 type Job = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()>>> + Send>;
@@ -245,7 +247,7 @@ impl SignalBackend for PresageSignal {
         self.worker
             .run(move || async move { manager.get_attachment(&pointer).await })
             .await?
-            .context("unable to download attachment")
+            .map_err(|e| signal_error(e, "unable to download attachment"))
     }
 
     fn incoming(&self) -> BoxStream<'static, anyhow::Result<Incoming>> {
@@ -363,7 +365,7 @@ impl Provisioner for PresageProvisioner {
                 Ok(RegistrationStep::CodeSent)
             }
             Err(presage::Error::CaptchaRequired) => Ok(RegistrationStep::CaptchaRequired),
-            Err(e) => Err(anyhow!(e).context("unable to request a verification code")),
+            Err(e) => Err(signal_error(e, "unable to request a verification code")),
         }
     }
 
@@ -382,7 +384,7 @@ impl Provisioner for PresageProvisioner {
             .worker
             .run(move || async move { confirmation.confirm_verification_code(code).await })
             .await?
-            .context("Signal did not accept the verification code")?;
+            .map_err(|e| signal_error(e, "Signal did not accept the verification code"))?;
         self.pending
             .lock()
             .expect("pending registration lock")
@@ -430,8 +432,10 @@ async fn link(
                 account: convert::account(manager.registration_data(), manager.registration_type()),
             }),
             // The provisioning socket closed with no scan: the URI expired.
+            // NOTE: only this loops. Any other failure, a rate limit above all,
+            // ends the link; looping on it would re-ask Signal unattended.
             Err(presage::Error::ProvisioningError(ProvisioningError::MissingMessage)) => continue,
-            Err(e) => Err(anyhow!(e).context("linking failed")),
+            Err(e) => Err(signal_error(e, "linking failed")),
         };
         let _ = tx.send(event);
         return;
@@ -455,7 +459,9 @@ async fn send(
             manager
                 .send_message(convert::aci(author), body, sent_at_ms)
                 .await
-                .with_context(|| format!("unable to send read receipts to {author}"))?;
+                .map_err(|e| {
+                    signal_error(e, format!("unable to send read receipts to {author}"))
+                })?;
         }
         return Ok(());
     }
@@ -465,7 +471,7 @@ async fn send(
             manager
                 .send_message(convert::aci(contact), body, sent_at_ms)
                 .await
-                .with_context(|| format!("unable to send to {contact}"))
+                .map_err(|e| signal_error(e, format!("unable to send to {contact}")))
         }
         Recipient::Group(id) => {
             let (master_key, group) = group_by_id(manager.store(), id).await?;
@@ -478,7 +484,7 @@ async fn send(
             manager
                 .send_message_to_group(&master_key, body, sent_at_ms)
                 .await
-                .with_context(|| format!("unable to send to group {id}"))
+                .map_err(|e| signal_error(e, format!("unable to send to group {id}")))
         }
     }
 }
@@ -612,6 +618,8 @@ impl IdentityWatch {
 
 /// Receives from Signal for as long as anyone holds the other end of `tx`,
 /// reconnecting with backoff whenever the connection drops.
+// NOTE: reconnecting only reopens the receive socket; nothing a caller asked to
+// send is ever resent from here.
 async fn receive(
     mut manager: Manager<SqliteStore, Registered>,
     me: ServiceId,
@@ -620,6 +628,7 @@ async fn receive(
     let mut identities = IdentityWatch::primed(manager.store()).await;
     let mut delay = MIN_RECONNECT_DELAY;
     while !tx.is_closed() {
+        let mut wait = delay;
         match manager.receive_messages().await {
             Ok(messages) => {
                 delay = MIN_RECONNECT_DELAY;
@@ -647,19 +656,114 @@ async fn receive(
                 }
             }
             Err(e) => {
-                let e = anyhow!(e).context("unable to receive from Signal");
+                wait = reconnect_wait(delay, rate_limited(&e).as_ref());
+                let e = signal_error(e, "unable to receive from Signal");
                 if tx.send(Err(e)).is_err() {
                     return;
                 }
             }
         }
-        tokio::time::sleep(delay).await;
+        tokio::time::sleep(wait).await;
         delay = (delay * 2).min(MAX_RECONNECT_DELAY);
     }
 }
 
 const MIN_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(300);
+
+/// How long to wait before reconnecting: the backoff `delay`, unless Signal
+/// refused the connection as rate-limited.
+fn reconnect_wait(delay: Duration, limited: Option<&RateLimited>) -> Duration {
+    let Some(limited) = limited else {
+        return delay;
+    };
+    limited
+        .retry_after
+        .unwrap_or_default()
+        .max(MAX_RECONNECT_DELAY)
+}
+
+/// `error` as the typed `RateLimited` when Signal rate-limited the request,
+/// so callers can match on it and show its wait; otherwise under `context`.
+fn signal_error<S>(
+    error: presage::Error<S>,
+    context: impl Display + Send + Sync + 'static,
+) -> anyhow::Error
+where
+    S: std::error::Error + Send + Sync + 'static,
+{
+    match rate_limited(&error) {
+        Some(limited) => limited.into(),
+        None => anyhow!(error).context(context),
+    }
+}
+
+/// The rate limit or proof request behind `error`, if Signal refused with one.
+fn rate_limited<S: std::error::Error>(error: &presage::Error<S>) -> Option<RateLimited> {
+    match error {
+        presage::Error::ServiceError(service)
+        | presage::Error::ProvisioningError(ProvisioningError::ServiceError(service)) => {
+            service_rate_limited(service)
+        }
+        presage::Error::MessageSenderError(sender) => match sender.as_ref() {
+            MessageSenderError::ServiceError(service) => service_rate_limited(service),
+            MessageSenderError::ProofRequired { options, .. } => Some(proof_required(options)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn service_rate_limited(error: &ServiceError) -> Option<RateLimited> {
+    match error {
+        ServiceError::RateLimitExceeded { retry_after } => Some(RateLimited {
+            message: error.to_string(),
+            retry_after: retry_after.and_then(|wait| wait.to_std().ok()),
+        }),
+        ServiceError::ProofRequiredError(proof) => Some(proof_required(&proof.options)),
+        ServiceError::WsError(ws) => match ws.as_ref() {
+            reqwest_websocket::Error::Handshake(
+                reqwest_websocket::HandshakeError::UnexpectedStatusCode(status),
+            ) if status.as_u16() == 429 => Some(RateLimited {
+                message: format!("websocket connection refused: {status}"),
+                retry_after: None,
+            }),
+            _ => None,
+        },
+        // The session's Debug form carries its id; only the waits are Signal's
+        // message here.
+        ServiceError::VerificationSessionRateLimited {
+            session,
+            retry_after,
+        } => {
+            let waits = [
+                ("next SMS", session.next_sms),
+                ("next call", session.next_call),
+                ("next code check", session.next_verification_attempt),
+            ];
+            let mut message = String::from("verification session rate limited");
+            for (what, seconds) in waits {
+                if let Some(seconds) = seconds {
+                    message.push_str(&format!("; {what} in {seconds}s"));
+                }
+            }
+            Some(RateLimited {
+                message,
+                retry_after: retry_after.and_then(|wait| wait.to_std().ok()),
+            })
+        }
+        _ => None,
+    }
+}
+
+// NOTE: the challenge token stays out of the message; it would otherwise reach
+// whatever MCP client asked for the send.
+fn proof_required(options: &[String]) -> RateLimited {
+    RateLimited {
+        message: format!("proof required: {}", options.join(", ")),
+        retry_after: None,
+    }
+}
 
 /// Opens (creating if needed) presage's store at `path`, encrypted with `key`.
 // NOTE: the key goes in as a raw SQLCipher key (x'..'), not a passphrase. It's
@@ -681,7 +785,10 @@ async fn open_store(path: &Path, key: &[u8; 32]) -> anyhow::Result<SqliteStore> 
 mod tests {
     use super::*;
     use presage::{
-        libsignal_service::content::{ContentBody, Metadata},
+        libsignal_service::{
+            content::{ContentBody, Metadata},
+            websocket::registration::RegistrationSessionMetadataResponse,
+        },
         manager::RegistrationData,
     };
 
@@ -1119,6 +1226,137 @@ mod tests {
             );
         })
         .await;
+    }
+
+    type TestError = presage::Error<std::io::Error>;
+
+    /// Signal's 429 on a send must come back as the typed RateLimited with its
+    /// Retry-After, so callers tell the user when to try again instead of
+    /// sending again.
+    #[test]
+    fn a_rate_limited_send_carries_signals_retry_after() {
+        let error = TestError::from(MessageSenderError::ServiceError(
+            ServiceError::RateLimitExceeded {
+                retry_after: Some(chrono::Duration::seconds(30)),
+            },
+        ));
+        let limited = rate_limited(&error).expect("a 429 went unrecognized");
+        assert_eq!(
+            limited.retry_after,
+            Some(Duration::from_secs(30)),
+            "{limited:?}"
+        );
+    }
+
+    /// Signal's 428 "proof required" on a send is its rate-limit challenge: it
+    /// must surface as RateLimited too, naming the proof Signal wants but not
+    /// the challenge token, which is no business of the agent's client.
+    #[test]
+    fn a_proof_required_send_is_rate_limited_without_its_token() {
+        let error = TestError::from(MessageSenderError::ProofRequired {
+            token: "secret-challenge-token".into(),
+            options: vec!["captcha".into()],
+        });
+        let limited = rate_limited(&error).expect("a 428 went unrecognized");
+        assert!(
+            limited.message.contains("captcha") && !limited.message.contains("secret"),
+            "{limited:?}"
+        );
+    }
+
+    /// Requesting or verifying a code too often gets a 429 on the verification
+    /// session. It must surface as RateLimited with Signal's wait, or setup
+    /// would show a generic failure and invite an immediate retry.
+    #[test]
+    fn a_rate_limited_verification_session_carries_signals_retry_after() {
+        let session = RegistrationSessionMetadataResponse {
+            id: "session".into(),
+            next_sms: Some(120),
+            next_call: None,
+            next_verification_attempt: None,
+            allowed_to_request_code: false,
+            requested_information: Vec::new(),
+            verified: false,
+        };
+        let error = TestError::ServiceError(ServiceError::VerificationSessionRateLimited {
+            session,
+            retry_after: Some(chrono::Duration::seconds(120)),
+        });
+        let limited = rate_limited(&error).expect("a session 429 went unrecognized");
+        assert_eq!(
+            limited.retry_after,
+            Some(Duration::from_secs(120)),
+            "{limited:?}"
+        );
+    }
+
+    /// Linking reaches Signal through the provisioning layer, which wraps the
+    /// service error once more; a 429 there must not hide as a link failure
+    /// the user would just retry.
+    #[test]
+    fn a_rate_limited_link_is_recognized_through_provisioning() {
+        let error = TestError::ProvisioningError(ProvisioningError::ServiceError(
+            ServiceError::RateLimitExceeded { retry_after: None },
+        ));
+        let limited = rate_limited(&error).expect("a link 429 went unrecognized");
+        assert_eq!(limited.retry_after, None, "{limited:?}");
+    }
+
+    /// Every send, link and code request first opens a websocket, and a 429
+    /// on that upgrade arrives as a handshake error with no Retry-After. It is
+    /// still Signal rate-limiting the account and must be recognized as such.
+    #[test]
+    fn a_rate_limited_websocket_upgrade_is_recognized() {
+        let handshake = reqwest_websocket::HandshakeError::UnexpectedStatusCode(
+            http::StatusCode::TOO_MANY_REQUESTS,
+        );
+        let error = TestError::ServiceError(ServiceError::WsError(Box::new(handshake.into())));
+        let limited = rate_limited(&error).expect("a websocket 429 went unrecognized");
+        assert_eq!(limited.retry_after, None, "{limited:?}");
+    }
+
+    /// Tools and setup show an error's outermost message. A rate limit must be
+    /// that message and downcast to RateLimited, not sit under "unable to send"
+    /// where the wait never reaches the user.
+    #[test]
+    fn a_rate_limit_is_the_outermost_error_callers_see() {
+        let error = TestError::from(MessageSenderError::ServiceError(
+            ServiceError::RateLimitExceeded {
+                retry_after: Some(chrono::Duration::seconds(30)),
+            },
+        ));
+        let error = signal_error(error, "unable to send to alice");
+        assert!(
+            error.downcast_ref::<RateLimited>().is_some(),
+            "not typed: {error:#}"
+        );
+        assert!(error.to_string().contains("30s"), "wait hidden: {error}");
+    }
+
+    /// Reconnecting to receive after a drop is fine, but reconnecting a second
+    /// after Signal refused the connection as rate-limited is hammering it. A
+    /// rate-limited reconnect waits the longest backoff, or Signal's own
+    /// Retry-After when that is longer.
+    #[test]
+    fn a_rate_limited_reconnect_waits_at_least_the_longest_backoff() {
+        let limited = |retry_after| RateLimited {
+            message: "429".into(),
+            retry_after,
+        };
+        let long = MAX_RECONNECT_DELAY * 4;
+        let cases = [
+            (None, MIN_RECONNECT_DELAY),
+            (Some(limited(None)), MAX_RECONNECT_DELAY),
+            (
+                Some(limited(Some(Duration::from_secs(1)))),
+                MAX_RECONNECT_DELAY,
+            ),
+            (Some(limited(Some(long))), long),
+        ];
+        for (limit, expected) in cases {
+            let wait = reconnect_wait(MIN_RECONNECT_DELAY, limit.as_ref());
+            assert_eq!(wait, expected, "after {limit:?}");
+        }
     }
 
     /// The store must be unreadable without its key. If the SQLCipher build

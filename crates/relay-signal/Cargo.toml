@@ -11,6 +11,7 @@ base64 = "0.22.1"
 futures.workspace = true
 relay-core.workspace = true
 serde.workspace = true
+thiserror.workspace = true
 uuid.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -20,6 +21,9 @@ url = "2.5.8"
 # [patch.crates-io], which must move with this rev.
 presage = { git = "https://github.com/whisperfish/presage", rev = "6f630791b2c7bf3d5b00c75f5a6c94131bf79c8c" }
 presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "6f630791b2c7bf3d5b00c75f5a6c94131bf79c8c" }
+# Only to recognize a 429 on a websocket upgrade inside libsignal-service's
+# ServiceError::WsError; keep it at the version libsignal-service uses.
+reqwest-websocket = "0.6.0"
 
 # NOTE: SQLCipher's crypto comes from RustCrypto, not OpenSSL or CommonCrypto.
 # The default links the system libcrypto on Linux and panics on Windows without
@@ -49,6 +53,7 @@ libsqlite3-sys = { version = "0.36.0", features = ["bundled-sqlcipher-vendored-o
 [dev-dependencies]
 chrono = "0.4.45"
 getrandom.workspace = true
+http = "1.5.0"
 proptest.workspace = true
 serde_json.workspace = true
 tempfile = "3.27.0"
