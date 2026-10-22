@@ -64,6 +64,36 @@ impl Tool for GetOwnNumber {
     }
 }
 
+pub struct ListAccounts;
+
+#[async_trait]
+impl Tool for ListAccounts {
+    fn name(&self) -> &'static str {
+        "list_accounts"
+    }
+    fn description(&self) -> &'static str {
+        "List the Signal account this server speaks for: number (E.164, null if Signal hasn't \
+         shared it with this device), service_id, kind (linked or primary) and device_name. \
+         Each account on this machine is its own MCP server, so there is always exactly one. \
+         Takes no parameters; no network call."
+    }
+    fn input_schema(&self) -> Value {
+        json!({"type": "object", "properties": {}, "additionalProperties": false})
+    }
+    fn writes(&self) -> bool {
+        false
+    }
+    async fn call(&self, ctx: &ToolContext, _input: Value) -> Result<Value, ToolError> {
+        let account = ctx.signal.account().await?;
+        Ok(json!({"accounts": [{
+            "number": account.phone_number,
+            "service_id": account.service_id.to_string(),
+            "kind": account.kind,
+            "device_name": account.device_name,
+        }]}))
+    }
+}
+
 pub struct StoreStats;
 
 #[async_trait]
@@ -298,6 +328,27 @@ mod tests {
         assert_eq!(
             out,
             json!({"number": "+15550000001", "service_id": sid(ME).to_string()})
+        );
+    }
+
+    /// Each profile is its own MCP server, and a client scoped to one profile
+    /// must not learn the other accounts on the machine, so list_accounts
+    /// reports exactly this profile's account.
+    #[tokio::test]
+    async fn list_accounts_reports_only_this_profiles_account() {
+        let (ctx, _) = ctx(AccessMode::ReadOnly, ProfileKind::Linked);
+        let out = Registry::standard()
+            .call(&ctx, "list_accounts", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            json!({"accounts": [{
+                "number": "+15550000001",
+                "service_id": sid(ME).to_string(),
+                "kind": "linked",
+                "device_name": "test",
+            }]})
         );
     }
 

@@ -25,6 +25,7 @@ impl Registry {
             .with_limiter(Limiter::default())
             .with(read::ListConversations)
             .with(read::GetOwnNumber)
+            .with(read::ListAccounts)
             .with(read::StoreStats)
             .with(read::GetUnread)
             .with(read::GetConversation)
