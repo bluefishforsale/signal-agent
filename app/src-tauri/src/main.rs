@@ -13,6 +13,7 @@ mod placement;
 mod real;
 mod scripted;
 mod session;
+mod updater;
 mod view;
 
 use std::time::Duration;
@@ -122,6 +123,47 @@ fn open_captcha(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn update_offer(offered: State<'_, updater::Offered>) -> Option<updater::Offer> {
+    offered.get()
+}
+
+#[tauri::command]
+async fn install_update(app: AppHandle) -> Result<(), String> {
+    updater::install(&app).await.map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn uninstall(delete_data: bool) -> Result<Vec<StepOutcome>, String> {
+    run_uninstall(delete_data)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[cfg(not(feature = "mock-driver"))]
+async fn run_uninstall(delete_data: bool) -> anyhow::Result<Vec<StepOutcome>> {
+    let agent = real::agent()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        relay_setup::uninstall(&agent, relay_agent::login::unregister, delete_data)
+    })
+    .await?
+}
+
+// NOTE: development builds run on the developer's own machine, so their
+// Uninstall button must never remove the developer's real setup.
+#[cfg(feature = "mock-driver")]
+async fn run_uninstall(_delete_data: bool) -> anyhow::Result<Vec<StepOutcome>> {
+    Ok(vec![StepOutcome {
+        name: "Nothing removed: this is a development build".into(),
+        result: Ok(()),
+    }])
+}
+
+#[tauri::command]
+fn quit(app: AppHandle) {
+    app.exit(0);
+}
+
+#[tauri::command]
 fn needs_move() -> bool {
     placement::misplaced_bundle().is_some()
 }
@@ -137,7 +179,16 @@ fn move_to_applications(app: AppHandle) -> Result<(), String> {
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--check-for-update") {
+        if let Err(e) = updater::check_in_background() {
+            eprintln!("unable to look for an update: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let result = tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(updater::Offered::default())
         .setup(|app| {
             let handle = app.handle().clone();
             let redraw = move |view: &View| {
@@ -148,6 +199,7 @@ fn main() {
             let (session, run) = Session::new(setup(), redraw);
             app.manage(session);
             tauri::async_runtime::spawn(run);
+            tauri::async_runtime::spawn(updater::watch(app.handle().clone()));
             // Screenshot mode for development builds: a fixed theme, kept on top.
             #[cfg(feature = "mock-driver")]
             if let (Ok(theme), Some(window)) = (
@@ -169,11 +221,30 @@ fn main() {
             send,
             open_captcha,
             needs_move,
-            move_to_applications
+            move_to_applications,
+            update_offer,
+            install_update,
+            uninstall,
+            quit
         ])
         .run(tauri::generate_context!());
     if let Err(e) = result {
         eprintln!("MCP Relay for Signal failed to start: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The box that deletes messages and keys must say exactly that, in the
+    /// words the acceptance checklist tells the tester to look for.
+    #[test]
+    fn the_delete_data_box_carries_the_checklist_label() {
+        let page = include_str!("../../ui/index.html");
+        let label = format!(
+            "<input type=\"checkbox\" name=\"delete_data\">\n        <span><strong>{}</strong>",
+            relay_setup::DELETE_DATA_LABEL
+        );
+        assert!(page.contains(&label), "index.html lacks {label:?}");
     }
 }

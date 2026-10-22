@@ -15,7 +15,9 @@ use crate::{
     claude::{ClaudeClient, Clients, Platform, Runner, ServerEntry, SystemRunner},
 };
 
-pub use footprint::{DELETE_DATA_LABEL, Footprint, Leftover, Roots, checklist};
+pub use footprint::{
+    APP_ID, DELETE_DATA_LABEL, Footprint, LAUNCHD_LABEL, Leftover, Roots, checklist,
+};
 
 /// One named piece of cleanup.
 pub struct Step<'a> {

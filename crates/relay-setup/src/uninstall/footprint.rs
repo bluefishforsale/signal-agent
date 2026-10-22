@@ -10,10 +10,10 @@ use crate::claude::{ClaudeClient, Platform};
 
 /// The bundle identifier in `app/src-tauri/tauri.conf.json`, which names the
 /// app's own WebView and cache folders.
-pub(crate) const APP_ID: &str = "com.bluefishforsale.signalagent";
+pub const APP_ID: &str = "com.bluefishforsale.signalagent";
 
 /// The launchd label in the app bundle's login agent plist.
-pub(crate) const LAUNCHD_LABEL: &str = "com.bluefishforsale.signalagent.agent";
+pub const LAUNCHD_LABEL: &str = "com.bluefishforsale.signalagent.agent";
 
 /// The words on the checkbox that deletes messages, account data and keys.
 pub const DELETE_DATA_LABEL: &str =
