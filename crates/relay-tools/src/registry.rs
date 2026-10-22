@@ -6,8 +6,8 @@ use relay_core::prelude::*;
 use serde_json::Value;
 
 use crate::{
-    Limiter, Tool, ToolContext, ToolError, directory, limits, local, lookup, media, mutate, read,
-    send,
+    Limiter, Tool, ToolContext, ToolError, admin, directory, limits, local, lookup, media, mutate,
+    pins, polls, read, schedule, send, webhook,
 };
 
 /// The set of tools a profile serves.
@@ -46,6 +46,18 @@ impl Registry {
             .with(local::MarkAsUnread)
             .with(local::ClearLocalStore)
             .with(local::PruneStore)
+            .with(local::DeleteLocalMessages)
+            .with(pins::PinMessage)
+            .with(pins::UnpinMessage)
+            .with(polls::CreatePoll)
+            .with(polls::VotePoll)
+            .with(polls::TerminatePoll)
+            .with(admin::AdminDeleteMessage)
+            .with(webhook::GetWebhook)
+            .with(schedule::ScheduleMessage)
+            .with(schedule::ListScheduledMessages)
+            .with(schedule::CancelScheduledMessage)
+            .with(schedule::RunScheduledMessages)
             .with(lookup::ListDevices)
             .with(lookup::ListIdentities)
             .with(lookup::GetAvatar)
@@ -236,7 +248,10 @@ mod tests {
                 Some("string") => json!("x"),
                 Some("integer") => prop["minimum"].clone(),
                 Some("boolean") => json!(true),
-                Some("array") => json!([sample(&format!("{name}[]"), &prop["items"])]),
+                Some("array") => {
+                    let min = prop["minItems"].as_u64().unwrap_or(1) as usize;
+                    json!(vec![sample(&format!("{name}[]"), &prop["items"]); min])
+                }
                 Some("object") => Value::Object(object_probes(name, prop).0),
                 other => panic!("{name}: no sample for type {other:?}; add one here"),
             },
@@ -326,19 +341,25 @@ mod tests {
             Some("boolean") => bad.extend([json!("true"), json!(1)]),
             // An empty array is already refused above, so arrays must not be empty.
             Some("array") => {
-                let (Some(1..), Some(max)) = (prop["minItems"].as_u64(), prop["maxItems"].as_u64())
+                let (Some(min @ 1..), Some(max)) =
+                    (prop["minItems"].as_u64(), prop["maxItems"].as_u64())
                 else {
                     panic!(
                         "{name}: array properties must declare minItems >= 1 and maxItems: {prop}"
                     );
                 };
                 let item = sample(&format!("{name}[]"), &prop["items"]);
-                let too_many = vec![item; max as usize + 1];
+                let too_few = vec![item.clone(); min as usize - 1];
+                let too_many = vec![item.clone(); max as usize + 1];
                 bad.extend([json!("x"), json!(1), json!(true), json!(too_many)]);
+                if !too_few.is_empty() {
+                    bad.push(json!(too_few.clone()));
+                }
+                // One bad item among valid ones, so the item itself is what's refused.
                 bad.extend(
                     bad_values(&format!("{name}[]"), &prop["items"])
                         .into_iter()
-                        .map(|v| json!([v])),
+                        .map(|v| json!([vec![v], too_few.clone()].concat())),
                 );
             }
             Some("object") => {

@@ -264,7 +264,7 @@ async fn delete_own(
 // NOTE: recipient and target arrive as separate inputs. Without this check a
 // call could name a message from one chat and send the change to another,
 // leaking the edit's text there and rewriting the wrong stored message.
-async fn check_target(
+pub(crate) async fn check_target(
     ctx: &ToolContext,
     conversation: Recipient,
     target: MessageId,
