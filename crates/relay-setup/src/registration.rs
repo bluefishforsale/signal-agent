@@ -5,7 +5,8 @@
 /// captcha page navigates to when solved.
 pub fn captcha_token(url: &str) -> Option<String> {
     let token = url.trim().strip_prefix("signalcaptcha://")?;
-    Some(token.trim_end_matches('/').to_owned())
+    let token = token.trim_end_matches('/');
+    (!token.is_empty()).then(|| token.to_owned())
 }
 
 #[cfg(test)]
@@ -32,6 +33,24 @@ mod tests {
                     "link {link:?}"
                 );
             }
+        }
+    }
+
+    /// Every other navigation the captcha page makes (its own pages, the
+    /// captcha provider's frames) must pass through untouched, and an empty
+    /// result must never be sent to Signal as a token.
+    #[test]
+    fn other_navigations_yield_no_token() {
+        for url in [
+            "https://signalcaptchas.org/registration/generate.html",
+            "https://newassets.hcaptcha.com/captcha/v1/abc/static/hcaptcha.html#frame=checkbox",
+            "about:blank",
+            "signalcaptcha://",
+            "signalcaptcha:///",
+            "sgnl://linkdevice?uuid=abc",
+            "https://evil.example/?next=signalcaptcha://signal-hcaptcha.x",
+        ] {
+            assert_eq!(captcha_token(url), None, "token from {url:?}");
         }
     }
 }
