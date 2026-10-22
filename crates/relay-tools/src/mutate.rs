@@ -310,4 +310,32 @@ mod tests {
             "foreign message flagged edited: {stored:?}"
         );
     }
+
+    /// If Signal refuses the edit, the stored copy must keep the old text, or
+    /// the local history shows an edit nobody else ever saw.
+    #[tokio::test]
+    async fn edit_message_leaves_the_store_alone_when_signal_refuses() {
+        let (ctx, signal) = ctx(AccessMode::Full, ProfileKind::Linked);
+        let left = Recipient::Group(GroupId::new([7; 32]));
+        ctx.store.insert(&mine(left, 42, "teh cat")).await.unwrap();
+        let result = Registry::standard()
+            .call(
+                &ctx,
+                "edit_message",
+                json!({
+                    "recipient": GroupId::new([7; 32]).to_string(),
+                    "target_timestamp": 42,
+                    "message": "the cat",
+                }),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "edit to a group we left succeeded: {result:?}"
+        );
+        assert!(signal.sent().is_empty(), "refused send recorded");
+        let stored = ctx.store.history(left, None, 10).await.unwrap();
+        assert_eq!(stored[0].body.as_deref(), Some("teh cat"), "{stored:?}");
+        assert!(!stored[0].edited, "refused edit flagged: {stored:?}");
+    }
 }
