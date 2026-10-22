@@ -2,6 +2,7 @@
 //! Claude clients launch, and the terminal setup flow, in one binary so every
 //! platform ships a single signed executable.
 
+mod http_cli;
 mod setup_tty;
 
 use anyhow::{Context, bail};
@@ -40,6 +41,9 @@ enum Cmd {
         #[arg(long)]
         delete_data: bool,
     },
+    /// The HTTP endpoint for remote MCP clients (Advanced).
+    #[command(subcommand)]
+    Http(http_cli::HttpCmd),
 }
 
 #[tokio::main]
@@ -61,6 +65,14 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let paths = ProfilePaths::for_profile(&profile)?;
             let access = startup_access(&paths);
+            let (http_profile, http_paths) = (profile.clone(), paths.clone());
+            // NOTE: the endpoint failing must never stop the agent, which is
+            // also what captures messages.
+            tokio::spawn(async move {
+                if let Err(e) = relay_mcp::run_http(&http_profile, &http_paths).await {
+                    tracing::error!("the HTTP endpoint stopped: {e:#}");
+                }
+            });
             relay_agent::run(relay_agent::AgentConfig {
                 profile,
                 paths,
@@ -72,6 +84,10 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Setup => setup_tty::run(profile).await,
         Cmd::Doctor => bail!("doctor is not implemented yet (lane L5)"),
         Cmd::Uninstall { delete_data } => uninstall(delete_data),
+        Cmd::Http(cmd) => {
+            let paths = ProfilePaths::for_profile(&profile)?;
+            http_cli::run(cmd, &paths, &mut std::io::stdout())
+        }
     }
 }
 

@@ -1,0 +1,39 @@
+# presage's libsignal-service generates its protobufs with prost-build, which
+# needs protoc. arduino/setup-protoc resolves even a pinned version by paging
+# through every protobuf release on the GitHub API, and every job failed at once
+# when that walk broke, so this fetches one pinned, checksummed release instead.
+name: setup-protoc
+description: Install a pinned, checksum-verified protoc and export PROTOC.
+runs:
+  using: composite
+  steps:
+    - if: runner.os != 'Windows'
+      shell: bash
+      run: |
+        set -euo pipefail
+        case "${RUNNER_OS}-${RUNNER_ARCH}" in
+          Linux-X64)   asset=linux-x86_64;        sum=0502f286ac9ed860b629a7965a14527b1f2dd131e4283fa23c2d7f184672aa9a ;;
+          Linux-ARM64) asset=linux-aarch_64;      sum=1c7750b6e038305b5a7fc3d0cda1ebefdf106a4f30a787bf826ed2fc47c3967d ;;
+          macOS-*)     asset=osx-universal_binary; sum=123d184419b1b83b36e463bc7ee8345b4376e691af0865b4e43c7d8ac459f972 ;;
+          *) echo "no protoc for ${RUNNER_OS}-${RUNNER_ARCH}" >&2; exit 1 ;;
+        esac
+        zip="${RUNNER_TEMP}/protoc.zip"
+        dir="${RUNNER_TEMP}/protoc"
+        curl -sSfL --retry 5 -o "$zip" "https://github.com/protocolbuffers/protobuf/releases/download/v23.4/protoc-23.4-${asset}.zip"
+        echo "${sum}  ${zip}" | shasum -a 256 -c -
+        unzip -q -o "$zip" -d "$dir"
+        echo "${dir}/bin" >> "$GITHUB_PATH"
+        echo "PROTOC=${dir}/bin/protoc" >> "$GITHUB_ENV"
+    # Windows on ARM runs the x64 protoc under emulation; protobuf ships no ARM64 build.
+    - if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $zip = Join-Path $env:RUNNER_TEMP 'protoc.zip'
+        $dir = Join-Path $env:RUNNER_TEMP 'protoc'
+        Invoke-WebRequest -Uri 'https://github.com/protocolbuffers/protobuf/releases/download/v23.4/protoc-23.4-win64.zip' -OutFile $zip -MaximumRetryCount 5
+        $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+        if ($hash -ne 'a309c39442fb75f0db343cb22c111a00f91cdf0767f332e170644b9378e2bcc6') { throw "protoc checksum mismatch: $hash" }
+        Expand-Archive -Path $zip -DestinationPath $dir -Force
+        Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $dir 'bin')
+        Add-Content -Path $env:GITHUB_ENV -Value "PROTOC=$(Join-Path $dir 'bin\protoc.exe')"
