@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use crate::{
     Tool, ToolContext, ToolError,
-    input::{group, group_schema, non_blank, parse},
+    input::{Limit, Offset, group, group_schema, non_blank, parse},
 };
 
 pub struct ListContacts;
@@ -135,6 +135,15 @@ impl Tool for ListGroups {
 
 pub struct ListAttachments;
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListAttachmentsInput {
+    #[serde(default)]
+    limit: Limit,
+    #[serde(default)]
+    offset: Offset,
+}
+
 #[async_trait]
 impl Tool for ListAttachments {
     fn name(&self) -> &'static str {
@@ -143,18 +152,31 @@ impl Tool for ListAttachments {
     fn description(&self) -> &'static str {
         "List the attachments in stored message history, newest first: id, content_type, \
          file_name, size (bytes), the message (author, sent_at_ms) and conversation it came \
-         in. Pass an id to get_attachment for the file itself. Local only; nothing is \
-         downloaded."
+         in. limit is the page size; offset skips the newest N to page back; has_more says \
+         whether older ones remain. Pass an id to get_attachment for the file itself. Local \
+         only; nothing is downloaded."
     }
     fn input_schema(&self) -> Value {
-        json!({"type": "object", "properties": {}, "additionalProperties": false})
+        json!({
+            "type": "object",
+            "properties": {"limit": Limit::schema(), "offset": Offset::schema()},
+            "additionalProperties": false,
+        })
     }
     fn writes(&self) -> bool {
         false
     }
-    async fn call(&self, ctx: &ToolContext, _input: Value) -> Result<Value, ToolError> {
-        let attachments: Vec<_> = stored_attachments(ctx)
+    async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
+        let ListAttachmentsInput { limit, offset } = parse(input)?;
+        let limit = limit.get() as usize;
+        let mut page: Vec<_> = stored_attachments(ctx)
             .await?
+            .skip(offset.get() as usize)
+            .take(limit + 1)
+            .collect();
+        let has_more = page.len() > limit;
+        page.truncate(limit);
+        let attachments: Vec<_> = page
             .into_iter()
             .map(|s| {
                 json!({
@@ -167,7 +189,7 @@ impl Tool for ListAttachments {
                 })
             })
             .collect();
-        Ok(json!({ "attachments": attachments }))
+        Ok(json!({ "attachments": attachments, "has_more": has_more }))
     }
 }
 
@@ -216,7 +238,6 @@ impl Tool for GetAttachment {
         let id = non_blank("filename", filename)?;
         let attachment = stored_attachments(ctx)
             .await?
-            .into_iter()
             .map(|s| s.attachment)
             .find(|a| a.id == id)
             .with_context(|| {
@@ -253,13 +274,13 @@ struct Stored {
 
 /// Every attachment in stored history, newest message first, leaving out
 /// messages deleted for everyone.
-// NOTE: scans the whole store, since MessageStore has no attachment index.
-// Fine at personal-history sizes; an index belongs in the store if it isn't.
-async fn stored_attachments(ctx: &ToolContext) -> anyhow::Result<Vec<Stored>> {
-    let mut messages = ctx.store.export(None, None).await?;
-    messages.reverse();
+// NOTE: loads the whole store, since MessageStore has no attachment query.
+// Fine at personal-history sizes; a paged store query should replace it.
+async fn stored_attachments(ctx: &ToolContext) -> anyhow::Result<impl Iterator<Item = Stored>> {
+    let messages = ctx.store.export(None, None).await?;
     Ok(messages
         .into_iter()
+        .rev()
         .filter(|m| !m.deleted)
         .flat_map(|m| {
             m.attachments.into_iter().map(move |attachment| Stored {
@@ -267,8 +288,7 @@ async fn stored_attachments(ctx: &ToolContext) -> anyhow::Result<Vec<Stored>> {
                 message: m.id,
                 conversation: m.conversation,
             })
-        })
-        .collect())
+        }))
 }
 
 #[cfg(test)]
@@ -539,5 +559,35 @@ mod tests {
             matches!(result, Err(ToolError::InvalidInput(_))),
             "got {result:?}"
         );
+    }
+
+    /// An unbounded list over a long history would be one enormous MCP
+    /// response, so the list pages like get_conversation: exactly limit items,
+    /// offset skipping the newest, and has_more while older ones remain.
+    #[tokio::test]
+    async fn list_attachments_pages_with_limit_offset_and_has_more() {
+        let ctx = ctx_of(|s| s);
+        for (t, id) in [(100, "a"), (200, "b"), (300, "c"), (400, "d")] {
+            ctx.store
+                .insert(&with_attachments(2, t, &[id]))
+                .await
+                .unwrap();
+        }
+        let registry = Registry::standard();
+        let page = |input| registry.call(&ctx, "list_attachments", input);
+        let ids = |out: &serde_json::Value| -> Vec<String> {
+            out["attachments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| a["id"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        let first = page(json!({"limit": 2})).await.unwrap();
+        assert_eq!(ids(&first), ["d", "c"], "{first}");
+        assert_eq!(first["has_more"], json!(true), "{first}");
+        let last = page(json!({"limit": 2, "offset": 2})).await.unwrap();
+        assert_eq!(ids(&last), ["b", "a"], "{last}");
+        assert_eq!(last["has_more"], json!(false), "{last}");
     }
 }
