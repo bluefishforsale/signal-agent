@@ -25,15 +25,25 @@ pub fn ctx_with(
     kind: ProfileKind,
     contacts: Vec<Contact>,
 ) -> (ToolContext, Arc<FakeSignal>) {
-    let signal = Arc::new(
-        FakeSignal::new(Account {
-            service_id: sid(ME),
-            phone_number: Some("+15550000001".into()),
-            kind,
-            device_name: "test".into(),
-        })
-        .with_contacts(contacts),
-    );
+    ctx_seeded(access, kind, |s| s.with_contacts(contacts))
+}
+
+/// A full-access primary profile whose fake account `seed` sets up.
+pub fn ctx_of(seed: impl FnOnce(FakeSignal) -> FakeSignal) -> (ToolContext, Arc<FakeSignal>) {
+    ctx_seeded(AccessMode::Full, ProfileKind::Primary, seed)
+}
+
+fn ctx_seeded(
+    access: AccessMode,
+    kind: ProfileKind,
+    seed: impl FnOnce(FakeSignal) -> FakeSignal,
+) -> (ToolContext, Arc<FakeSignal>) {
+    let signal = Arc::new(seed(FakeSignal::new(Account {
+        service_id: sid(ME),
+        phone_number: Some("+15550000001".into()),
+        kind,
+        device_name: "test".into(),
+    })));
     let ctx = ToolContext {
         store: Arc::new(MemoryStore::default()),
         signal: signal.clone(),

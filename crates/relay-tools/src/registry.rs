@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use crate::{
     Limiter, Tool, ToolContext, ToolError, admin, directory, limits, local, lookup, media, mutate,
-    pins, polls, read, schedule, send, webhook,
+    pins, polls, read, schedule, send, stickers, webhook,
 };
 
 /// The set of tools a profile serves.
@@ -36,6 +36,7 @@ impl Registry {
             .with(send::SendGroupMessage)
             .with(send::SendNoteToSelf)
             .with(send::SetTyping)
+            .with(send::SetExpirationTimer)
             .with(send::SendReadReceipt)
             .with(mutate::ReactToMessage)
             .with(mutate::EditMessage)
@@ -69,6 +70,8 @@ impl Registry {
             .with(media::SendGroupAttachment)
             .with(media::SendSticker)
             .with(media::SendGroupSticker)
+            .with(stickers::ListStickerPacks)
+            .with(stickers::GetSticker)
             .with(lookup::GetProfile)
             .with(lookup::GetUserStatus)
     }
