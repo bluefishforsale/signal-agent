@@ -149,6 +149,9 @@ impl FakeSignal {
             Outgoing::AdminDelete { .. } if matches!(to, Recipient::Contact(_)) => {
                 bail!("an admin delete only goes to a group");
             }
+            Outgoing::ExpirationTimer { .. } if matches!(to, Recipient::Group(_)) => {
+                bail!("a timer update only goes to a contact");
+            }
             // The wire form names only the poll's timestamp, so it can only
             // ever close one of this account's own polls.
             Outgoing::PollTerminate { poll } if poll.author != self.account.service_id => {
@@ -415,6 +418,25 @@ mod tests {
             .send(alice, Outgoing::PollTerminate { poll: mid(1, 5) })
             .await
             .expect("own poll");
+        assert_eq!(signal.sent().len(), 1);
+    }
+
+    /// The real backend can't put a timer update in a group message, so the
+    /// fake must refuse it too, or a tool could pass on a group timer.
+    #[tokio::test]
+    async fn a_timer_update_to_a_group_fails() {
+        let group = GroupId::new([3; 32]);
+        let signal = fake().with_groups(vec![Group {
+            id: group,
+            title: "g".into(),
+            members: vec![],
+            admins: vec![],
+        }]);
+        let timer = Outgoing::ExpirationTimer { seconds: 60 };
+        let result = signal.send(Recipient::Group(group), timer.clone()).await;
+        assert!(result.is_err(), "sent a group timer update");
+        let alice = Recipient::Contact(ServiceId::new(Uuid::from_u128(2)));
+        signal.send(alice, timer).await.expect("a DM timer update");
         assert_eq!(signal.sent().len(), 1);
     }
 

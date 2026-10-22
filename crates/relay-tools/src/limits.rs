@@ -535,7 +535,8 @@ fn counts(message: &Outgoing) -> bool {
         | Outgoing::PollCreate { .. }
         | Outgoing::PollVote { .. }
         | Outgoing::PollTerminate { .. }
-        | Outgoing::AdminDelete { .. } => true,
+        | Outgoing::AdminDelete { .. }
+        | Outgoing::ExpirationTimer { .. } => true,
         Outgoing::Typing { .. } | Outgoing::ReadReceipt { .. } => false,
     }
 }
@@ -691,7 +692,8 @@ mod tests {
 
     /// Everything a person sees in the conversation must spend the message
     /// budget, whichever tool sends it: with the budget spent, a sticker,
-    /// pin, unpin, poll or admin delete must be refused before Signal.
+    /// pin, unpin, poll, admin delete or timer change must be refused before
+    /// Signal.
     #[tokio::test]
     async fn every_visible_variant_spends_the_message_budget() {
         let one = NonZeroU32::new(1).expect("nonzero literal");
@@ -746,6 +748,7 @@ mod tests {
             },
             Outgoing::PollTerminate { poll: target },
             Outgoing::AdminDelete { target },
+            Outgoing::ExpirationTimer { seconds: 60 },
         ] {
             let result = guarded.send(group, visible.clone()).await;
             let refused = result

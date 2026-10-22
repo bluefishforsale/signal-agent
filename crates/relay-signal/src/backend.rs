@@ -142,6 +142,12 @@ pub enum Outgoing {
     AdminDelete {
         target: MessageId,
     },
+    /// Sets a direct conversation's disappearing-messages timer for both
+    /// sides; 0 turns it off. Only sendable to a contact: a group's timer is
+    /// a group change.
+    ExpirationTimer {
+        seconds: u32,
+    },
 }
 
 /// Something that arrived, from another person or synced from the account's

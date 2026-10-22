@@ -337,6 +337,14 @@ pub(crate) fn content_body(
         Outgoing::Sticker { .. } => {
             bail!("a sticker goes out through sticker_body, once its pack is looked up")
         }
+        Outgoing::ExpirationTimer { .. } if group.is_some() => {
+            bail!("a timer update only goes to a contact; a group's timer is a group change")
+        }
+        Outgoing::ExpirationTimer { seconds } => ContentBody::DataMessage(data(DataMessage {
+            expire_timer: Some(*seconds),
+            flags: Some(data_message::Flags::ExpirationTimerUpdate as u32),
+            ..Default::default()
+        })),
     })
 }
 
@@ -1048,6 +1056,34 @@ mod tests {
             };
             prop_assert_eq!(pin.pin_duration, Some(expected));
         }
+    }
+
+    proptest! {
+        /// Signal's apps change a chat's timer only on a message flagged as a
+        /// timer update; without the flag the seconds are just the timer the
+        /// message itself expires under, and the chat setting stays put.
+        #[test]
+        fn a_timer_update_carries_the_seconds_and_the_update_flag(seconds in any::<u32>()) {
+            let update = data_of(&Outgoing::ExpirationTimer { seconds });
+            prop_assert_eq!(update.expire_timer, Some(seconds));
+            prop_assert_eq!(
+                update.flags,
+                Some(data_message::Flags::ExpirationTimerUpdate as u32)
+            );
+        }
+    }
+
+    /// A group's timer lives in the group's state, so a timer update sent as
+    /// a group message would be ignored by every member's app.
+    #[test]
+    fn a_timer_update_never_goes_to_a_group() {
+        let group = GroupContextV2 {
+            master_key: Some(vec![5; 32]),
+            revision: Some(1),
+            group_change: None,
+        };
+        let result = content_body(&Outgoing::ExpirationTimer { seconds: 60 }, 9, Some(&group));
+        assert!(result.is_err(), "group timer update converted: {result:?}");
     }
 
     proptest! {
