@@ -66,6 +66,15 @@ impl Profiles {
         self.add(registry, profile)
     }
 
+    /// Lists `profile` if it isn't already.
+    pub(crate) fn ensure(&self, profile: &ProfileName) -> anyhow::Result<()> {
+        let registry = self.load()?;
+        if registry.profiles.contains(profile) {
+            return Ok(());
+        }
+        self.add(registry, profile.clone()).map(drop)
+    }
+
     /// Where `profile`'s files live.
     pub fn paths(&self, profile: &ProfileName) -> ProfilePaths {
         ProfilePaths::under(self.base.clone(), profile)

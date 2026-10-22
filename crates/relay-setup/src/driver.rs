@@ -14,12 +14,14 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use relay_core::{LinkAndSyncKey, prelude::*};
 use relay_secrets::{SecretStore, StoreKey};
-use relay_signal::{HistoryTransfer, LinkEvent, Provisioner, RateLimited, RegistrationStep};
+use relay_signal::{
+    HISTORY_ARCHIVE_FILE, HistoryTransfer, LinkEvent, Provisioner, RateLimited, RegistrationStep,
+};
 use relay_tools::{Clock, Limits, Settings, SystemClock};
 use tokio::sync::watch;
 
 use crate::{
-    Command, HistoryGap, SetupEvent, SetupState,
+    Command, HistoryGap, Profiles, SetupEvent, SetupState,
     claude::{Clients, ServerEntry},
     transition,
 };
@@ -308,7 +310,7 @@ impl Driver {
                 skip.0.send_replace(Import::Idle);
                 match outcome {
                     None => {
-                        drop(Downloaded(paths.root.join(PARTIAL_ARCHIVE)));
+                        drop(Downloaded(paths.root.join(HISTORY_ARCHIVE_FILE)));
                         SetupEvent::SkipHistory
                     }
                     Some(outcome) => match outcome? {
@@ -352,6 +354,7 @@ impl Driver {
         let provisioner = match self.provisioner.take() {
             Some(provisioner) => provisioner,
             None => {
+                self.list_profile()?;
                 let key = self.store_key()?;
                 fs::create_dir_all(&self.paths.root).with_context(|| {
                     format!("unable to create \"{}\"", self.paths.root.display())
@@ -394,6 +397,20 @@ impl Driver {
         self.provisioner = None;
     }
 
+    /// Lists the profile beside the others before it gets a key or a store,
+    /// so uninstall finds its key and, once its access choice is saved, the
+    /// login item runs its agent.
+    // NOTE: listed is not set up. Everything that starts an agent (supervisor,
+    // shim, startup re-registration) waits for access.json, which SaveAccess
+    // writes only after the link's store is closed.
+    fn list_profile(&self) -> anyhow::Result<()> {
+        let root = &self.paths.root;
+        let base = root
+            .parent()
+            .with_context(|| format!("profile directory \"{}\" has no parent", root.display()))?;
+        Profiles::under(base.to_path_buf()).ensure(&self.profile)
+    }
+
     /// The profile's saved key, or a new one saved before anything uses it:
     /// a store encrypted with a key that was never saved is lost.
     fn store_key(&self) -> anyhow::Result<StoreKey> {
@@ -406,11 +423,6 @@ impl Driver {
         Ok(key)
     }
 }
-
-// NOTE: where relay-signal's transfer_history downloads the archive. A Skip
-// mid-download leaves part of it here; if relay-signal renames it, skipped
-// downloads pile up in the profile directory.
-const PARTIAL_ARCHIVE: &str = "link-and-sync.archive";
 
 /// A downloaded history archive, deleted once setup is done with it, however
 /// the import ends.
@@ -478,7 +490,7 @@ mod tests {
         Stalls,
     }
 
-    const ARCHIVE: &str = "link-and-sync.archive";
+    const ARCHIVE: &str = HISTORY_ARCHIVE_FILE;
 
     /// The fakes' shared state: what Signal and the OS will do, and everything
     /// every fake did, in order. Clones share it, so two setup runs can see one
@@ -1206,6 +1218,24 @@ mod tests {
             !world.paths().root.join(ARCHIVE).exists(),
             "a failed archive was left behind"
         );
+    }
+
+    /// The login item runs only the profiles in the registry, so a profile
+    /// setup links but never lists has no agent until a Claude app happens to
+    /// start one, and captures nothing in between.
+    #[tokio::test]
+    async fn a_profile_set_up_is_listed_for_the_supervisor() {
+        let world = World::new().link(vec![linked()]);
+        let mut h = Harness::new(&world);
+        h.send(LINK).await;
+        h.send(SetupEvent::AccessChosen {
+            access: AccessMode::ReadOnly,
+        })
+        .await;
+        let listed = crate::Profiles::under(world.dir.path().to_path_buf())
+            .list()
+            .expect("registry");
+        assert_eq!(listed, [ProfileName::default_profile()]);
     }
 
     const NUMBER: &str = "+15555550100";

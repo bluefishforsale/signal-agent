@@ -133,8 +133,14 @@ mod tests {
             let store = DpapiFileStore::under(dir.path().to_owned());
             out.push(("dpapi file", Box::new(store), Some(dir)));
         }
-        // NOTE: CI's Linux runner has no D-Bus session, so this store is
-        // skipped there with the reason printed; desktop Linux runs it.
+        // NOTE: the OS keyring is the developer's own login keychain, so a plain
+        // `cargo test` on a laptop must not write to it; CI opts in.
+        if std::env::var_os("SIGNAL_AGENT_TEST_OS_KEYRING").is_none() {
+            eprintln!("skipping the OS keyring store: set SIGNAL_AGENT_TEST_OS_KEYRING=1");
+            return out;
+        }
+        // CI's Linux runner has no D-Bus session, so this store is skipped
+        // there with the reason printed.
         #[cfg(target_os = "linux")]
         match SecretServiceStore::connect("signal-agent-test") {
             Ok(store) => out.push(("secret service", Box::new(store), None)),
