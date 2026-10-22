@@ -69,6 +69,7 @@ impl Registry {
             .with(media::SendGroupSticker)
             .with(stickers::ListStickerPacks)
             .with(stickers::GetSticker)
+            .with(stickers::AddStickerPack)
             .with(lookup::GetProfile)
             .with(lookup::GetUserStatus)
             .with(account::UpdateProfile)
@@ -284,6 +285,10 @@ mod tests {
             Some("signal-recipient" | "signal-service-id") => json!(sid(2).to_string()),
             Some("signal-group-id") => json!("ab".repeat(32)),
             Some("signal-sticker-pack") => json!("ab".repeat(16)),
+            Some("signal-sticker-key") => json!("ab".repeat(32)),
+            // The same pack and key as the samples above, so a tool given
+            // both forms sees them agree.
+            Some("signal-sticker-link") => json!(sticker_link(&"ab".repeat(16), &"ab".repeat(32))),
             Some("e164") => json!("+15550000002"),
             Some("iso-datetime") => json!("2024-01-01T00:00:00Z"),
             Some(other) => panic!("{name}: no sample for format \"{other}\"; add one here"),
@@ -355,6 +360,41 @@ mod tests {
                         json!("ab".repeat(32)),
                         json!(sid(2).to_string()),
                     ]),
+                    Some("signal-sticker-key") => bad.extend([
+                        json!("g".repeat(64)),
+                        json!("ab".repeat(31)),
+                        json!("ab".repeat(33)),
+                        json!("é".repeat(32)),
+                        json!(sid(2).to_string()),
+                    ]),
+                    // Anything but Signal's own https link carrying exactly a
+                    // well-formed pack id and key.
+                    Some("signal-sticker-link") => {
+                        let (id, key) = ("ab".repeat(16), "ab".repeat(32));
+                        let good = sticker_link(&id, &key);
+                        bad.extend(
+                            [
+                                good.replace("https://", "http://"),
+                                good.replace("signal.art", "signal.art.example"),
+                                good.replace("signal.art", "evil.example"),
+                                good.replace("signal.art", "signal.art:8443"),
+                                good.replace("signal.art", "user@signal.art"),
+                                good.replace("/addstickers/", "/addstickers"),
+                                good.replace("/addstickers/", "/addstickers/x"),
+                                good.replace("/#", "/?x=1#"),
+                                good.replace('#', "?"),
+                                good.replace(&format!("&pack_key={key}"), ""),
+                                good.replace(&format!("pack_id={id}&"), ""),
+                                format!("{good}&pack_id={id}"),
+                                format!("{good}&extra=1"),
+                                sticker_link(&"g".repeat(32), &key),
+                                sticker_link(&id, &"ab".repeat(31)),
+                                "https://signal.art/addstickers/".into(),
+                                "not a url".into(),
+                            ]
+                            .map(|s| json!(s)),
+                        );
+                    }
                     Some("iso-datetime") => bad.extend([
                         json!("yesterday"),
                         json!("2024-13-01"),
@@ -416,6 +456,10 @@ mod tests {
             other => panic!("{name}: no bad values for type {other:?}; add some here"),
         }
         bad
+    }
+
+    fn sticker_link(id: &str, key: &str) -> String {
+        format!("https://signal.art/addstickers/#pack_id={id}&pack_key={key}")
     }
 
     type Object = serde_json::Map<String, Value>;
