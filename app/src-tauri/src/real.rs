@@ -13,8 +13,8 @@ use relay_core::prelude::*;
 use relay_secrets::StoreKey;
 use relay_setup::{
     claude::{Clients, ServerEntry},
-    driver::{Driver, HistoryImport, HistorySkip, LoginItem, OpenProvisioner, Services},
-    history::{ProfileStore, SignalDesktop},
+    driver::{Driver, HistorySkip, LoginItem, OpenProvisioner, Services},
+    history::{LinkAndSync, ProfileStore, SignalDesktop},
     prelude::*,
 };
 use relay_signal::{PresageProvisioner, Provisioner, Servers};
@@ -41,12 +41,18 @@ pub fn setup(start: SetupState) -> anyhow::Result<Box<dyn Setup>> {
     let profile = ProfileName::default_profile();
     let server = ServerEntry::for_profile(&profile, &agent()?, ["mcp", "--profile", &profile])?;
     let paths = ProfilePaths::for_profile(&profile)?;
-    let store = ProfileStore::new(&profile, &paths, relay_secrets::platform_store()?);
+    let store = || -> anyhow::Result<ProfileStore> {
+        Ok(ProfileStore::new(
+            &profile,
+            &paths,
+            relay_secrets::platform_store()?,
+        ))
+    };
     let services = Services {
         signal: Box::new(Presage),
         secrets: relay_secrets::platform_store()?,
-        history: Box::new(NoHistoryYet),
-        desktop: Box::new(SignalDesktop::usual_place(store)),
+        history: Box::new(LinkAndSync::new(store()?)),
+        desktop: Box::new(SignalDesktop::usual_place(store()?)),
         login: Box::new(AgentAtLogin),
         clients: Clients::system(),
     };
@@ -77,20 +83,6 @@ impl OpenProvisioner for Presage {
     }
 }
 
-// Integration seam: link-and-sync import (lane L7) needs the archive and key
-// from linking, which the Provisioner contract doesn't carry yet (issue #34).
-struct NoHistoryYet;
-
-#[async_trait]
-impl HistoryImport for NoHistoryYet {
-    async fn import(
-        &self,
-        _: &mut (dyn FnMut(u64, Option<u64>) + Send),
-    ) -> anyhow::Result<Option<HistoryGap>> {
-        Ok(None)
-    }
-}
-
 struct AgentAtLogin;
 
 impl LoginItem for AgentAtLogin {
@@ -104,12 +96,17 @@ mod tests {
     use std::{sync::mpsc, time::Duration};
 
     use futures::stream::BoxStream;
-    use relay_signal::{Account, LinkEvent, RegistrationStep};
+    use relay_signal::{Account, HistoryTransfer, LinkEvent, RegistrationStep};
 
     use super::*;
     use crate::{session::Session, view::View};
 
-    struct Phone;
+    /// A phone that links at once, and then either offers no history or
+    /// never answers the history long-poll.
+    #[derive(Clone, Copy)]
+    struct Phone {
+        stalls_history: bool,
+    }
 
     #[async_trait]
     impl Provisioner for Phone {
@@ -140,12 +137,19 @@ mod tests {
         async fn verify_code(&self, _: &str) -> anyhow::Result<RegistrationStep> {
             bail!("not scripted")
         }
+
+        async fn transfer_history(&self, _: &Path) -> anyhow::Result<HistoryTransfer> {
+            if self.stalls_history {
+                futures::future::pending::<()>().await;
+            }
+            Ok(HistoryTransfer::NotOffered)
+        }
     }
 
     #[async_trait]
     impl OpenProvisioner for Phone {
         async fn open(&self, _: &Path, _: &StoreKey) -> anyhow::Result<Box<dyn Provisioner>> {
-            Ok(Box::new(Phone))
+            Ok(Box::new(*self))
         }
     }
 
@@ -165,39 +169,31 @@ mod tests {
         }
     }
 
-    /// A phone that never answers the history long-poll.
-    struct PhoneNeverSends;
-
-    #[async_trait]
-    impl HistoryImport for PhoneNeverSends {
-        async fn import(
-            &self,
-            _: &mut (dyn FnMut(u64, Option<u64>) + Send),
-        ) -> anyhow::Result<Option<HistoryGap>> {
-            futures::future::pending().await
-        }
-    }
-
     fn faked(dir: &Path) -> Box<dyn Setup> {
-        faked_with(dir, Box::new(NoHistoryYet))
+        faked_with(
+            dir,
+            Phone {
+                stalls_history: false,
+            },
+        )
     }
 
-    fn faked_with(dir: &Path, history: Box<dyn HistoryImport>) -> Box<dyn Setup> {
+    fn faked_with(dir: &Path, phone: Phone) -> Box<dyn Setup> {
         let profile = ProfileName::default_profile();
         let server = ServerEntry::for_profile(&profile, &dir.join("signal-agent"), ["mcp"])
             .expect("server entry");
+        let store = || {
+            ProfileStore::new(
+                &profile,
+                &ProfilePaths::under(dir.to_path_buf(), &profile),
+                Box::new(relay_secrets::MemorySecretStore::default()),
+            )
+        };
         let services = Services {
-            signal: Box::new(Phone),
+            signal: Box::new(phone),
             secrets: Box::new(relay_secrets::MemorySecretStore::default()),
-            history,
-            desktop: Box::new(SignalDesktop::new(
-                None,
-                ProfileStore::new(
-                    &profile,
-                    &ProfilePaths::under(dir.to_path_buf(), &profile),
-                    Box::new(relay_secrets::MemorySecretStore::default()),
-                ),
-            )),
+            history: Box::new(LinkAndSync::new(store())),
+            desktop: Box::new(SignalDesktop::new(None, store())),
             login: Box::new(NoLogin),
             clients: Clients::new(
                 relay_setup::claude::Platform::current(),
@@ -262,7 +258,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let (tx, rx) = mpsc::channel();
         let (session, run) = Session::new(
-            faked_with(dir.path(), Box::new(PhoneNeverSends)),
+            faked_with(
+                dir.path(),
+                Phone {
+                    stalls_history: true,
+                },
+            ),
             move |view: &View| {
                 tx.send(view.clone()).unwrap();
             },

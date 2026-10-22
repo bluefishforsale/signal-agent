@@ -1,15 +1,15 @@
 //! Where earlier messages come from on a real computer, and the profile's
 //! message store they go into, shared by setup and the history commands.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use async_trait::async_trait;
-use relay_core::prelude::*;
+use relay_core::{LinkAndSyncKey, prelude::*};
 use relay_secrets::SecretStore;
 use relay_store::SqlCipherStore;
 
-use crate::driver::DesktopHistory;
+use crate::driver::{DesktopHistory, HistoryImport};
 
 /// A profile's message store, opened when an import needs it.
 pub struct ProfileStore {
@@ -36,6 +36,38 @@ impl ProfileStore {
             )
         })?;
         SqlCipherStore::open(&self.path, &key).await
+    }
+}
+
+/// The phone's link-and-sync archive, imported into a profile's store.
+pub struct LinkAndSync {
+    store: ProfileStore,
+}
+
+impl LinkAndSync {
+    pub fn new(store: ProfileStore) -> Self {
+        Self { store }
+    }
+}
+
+#[async_trait]
+impl HistoryImport for LinkAndSync {
+    async fn import(
+        &self,
+        archive: &Path,
+        key: &LinkAndSyncKey,
+        our_aci: ServiceId,
+        progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
+    ) -> anyhow::Result<()> {
+        let bytes = tokio::fs::read(archive)
+            .await
+            .with_context(|| format!("unable to read \"{}\"", archive.display()))?;
+        let store = self.store.open().await?;
+        relay_history::import_link_and_sync(&bytes, key, our_aci, &store, &mut |p| {
+            progress(p.imported, p.total)
+        })
+        .await?;
+        Ok(())
     }
 }
 
@@ -107,6 +139,32 @@ mod tests {
         let store = ProfileStore::new(&profile, &paths, Box::new(secrets));
         store.open().await.expect("open with the saved key");
         assert!(paths.message_store.exists());
+    }
+
+    /// The window and the terminal hand the importer the downloaded file as
+    /// it is; one that isn't an archive for this key and account must fail
+    /// without writing anything.
+    #[tokio::test]
+    async fn a_file_that_is_not_the_phones_archive_fails_to_import() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let profile = ProfileName::default_profile();
+        let paths = ProfilePaths::under(dir.path().to_path_buf(), &profile);
+        std::fs::create_dir_all(&paths.root).expect("profile dir");
+        let secrets = MemorySecretStore::default();
+        secrets
+            .set(&profile, &StoreKey::generate().expect("key"))
+            .expect("save key");
+        let archive = paths.root.join("history.archive");
+        std::fs::write(&archive, b"not an archive").expect("archive");
+        let history = LinkAndSync::new(ProfileStore::new(&profile, &paths, Box::new(secrets)));
+        let aci = ServiceId::new(uuid::Uuid::from_u128(7));
+        let Err(e) = history
+            .import(&archive, &LinkAndSyncKey::new([7; 32]), aci, &mut |_, _| {})
+            .await
+        else {
+            panic!("imported a file that isn't an archive");
+        };
+        assert!(format!("{e:#}").contains("authenticate"), "{e:#}");
     }
 
     /// No Desktop folder on this OS, or one without Desktop's data, must

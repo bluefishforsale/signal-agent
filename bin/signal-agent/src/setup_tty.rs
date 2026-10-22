@@ -14,8 +14,8 @@ use relay_core::prelude::*;
 use relay_secrets::StoreKey;
 use relay_setup::{
     claude::{ClaudeClient, Clients, ServerEntry},
-    driver::{Driver, HistoryImport, LoginItem, OpenProvisioner, Services},
-    history::{ProfileStore, SignalDesktop},
+    driver::{Driver, LoginItem, OpenProvisioner, Services},
+    history::{LinkAndSync, ProfileStore, SignalDesktop},
     prelude::*,
 };
 use relay_signal::{PresageProvisioner, Provisioner, Servers};
@@ -25,12 +25,18 @@ pub async fn run(profile: ProfileName) -> anyhow::Result<()> {
     let exe = std::env::current_exe().context("unable to locate this executable")?;
     let server = ServerEntry::for_profile(&profile, &exe, ["mcp", "--profile", &profile])?;
     let paths = ProfilePaths::for_profile(&profile)?;
-    let store = ProfileStore::new(&profile, &paths, relay_secrets::platform_store()?);
+    let store = || -> anyhow::Result<ProfileStore> {
+        Ok(ProfileStore::new(
+            &profile,
+            &paths,
+            relay_secrets::platform_store()?,
+        ))
+    };
     let services = Services {
         signal: Box::new(Presage),
         secrets: relay_secrets::platform_store()?,
-        history: Box::new(NoHistoryYet),
-        desktop: Box::new(SignalDesktop::usual_place(store)),
+        history: Box::new(LinkAndSync::new(store()?)),
+        desktop: Box::new(SignalDesktop::usual_place(store()?)),
         login: Box::new(AgentAtLogin),
         clients: Clients::system(),
     };
@@ -459,21 +465,6 @@ impl OpenProvisioner for Presage {
     }
 }
 
-// Integration seam: link-and-sync import (lane L7) needs the archive and key
-// from linking, which the Provisioner contract doesn't carry yet (issue #34).
-// Until then a linked device starts with an empty history.
-struct NoHistoryYet;
-
-#[async_trait]
-impl HistoryImport for NoHistoryYet {
-    async fn import(
-        &self,
-        _: &mut (dyn FnMut(u64, Option<u64>) + Send),
-    ) -> anyhow::Result<Option<HistoryGap>> {
-        Ok(None)
-    }
-}
-
 struct AgentAtLogin;
 
 impl LoginItem for AgentAtLogin {
@@ -820,7 +811,11 @@ mod tests {
         let services = Services {
             signal: Box::new(Phone),
             secrets: Box::new(KeyFile::default()),
-            history: Box::new(NoHistoryYet),
+            history: Box::new(LinkAndSync::new(ProfileStore::new(
+                &profile,
+                &ProfilePaths::under(dir.to_path_buf(), &profile),
+                Box::new(KeyFile::default()),
+            ))),
             desktop: Box::new(NoDesktop),
             login: Box::new(Agent),
             clients,
@@ -837,7 +832,8 @@ mod tests {
 
     /// A headless box over SSH, start to finish from typed answers: the key
     /// file caveat comes before anything is stored, the QR code is drawn, the
-    /// access question defaults to yes, and done says no Claude app was found.
+    /// access question defaults to yes, a phone that sent no history says so,
+    /// and done says no Claude app was found.
     #[tokio::test]
     async fn a_headless_link_runs_from_typed_answers_to_done() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -847,7 +843,7 @@ mod tests {
             None,
             None,
         );
-        let (driver, out) = run_scripted(dir.path(), clients, "\n\n").await;
+        let (driver, out) = run_scripted(dir.path(), clients, "\n\n\n").await;
         assert!(
             out.starts_with("Note: no keyring here"),
             "caveat not shown first: {out}"
@@ -855,6 +851,10 @@ mod tests {
         assert!(!scan(&out).is_empty(), "no QR code drawn: {out}");
         assert!(
             out.contains("Let Claude send messages as you? [Y/n]"),
+            "{out}"
+        );
+        assert!(
+            out.contains("Your phone didn't send any earlier messages."),
             "{out}"
         );
         assert!(out.contains("No Claude app was found"), "{out}");
@@ -902,7 +902,7 @@ mod tests {
             None,
             Some(desktop),
         );
-        let (_, out) = run_scripted(dir.path(), clients, "\n\n\n\n\n").await;
+        let (_, out) = run_scripted(dir.path(), clients, "\n\n\n\n\n\n").await;
         assert_eq!(
             out.matches("Restart Claude Desktop now").count(),
             2,
