@@ -52,6 +52,7 @@ impl Registry {
             .with(media::SendAttachment)
             .with(media::SendGroupAttachment)
             .with(media::SendSticker)
+            .with(media::SendGroupSticker)
     }
 
     /// Applies account-safety limits to every send a tool makes.

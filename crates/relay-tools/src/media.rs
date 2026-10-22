@@ -186,6 +186,53 @@ impl Tool for SendSticker {
     }
 }
 
+pub struct SendGroupSticker;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SendGroupStickerInput {
+    group_id: String,
+    pack_id: String,
+    sticker_id: u32,
+}
+
+#[async_trait]
+impl Tool for SendGroupSticker {
+    fn name(&self) -> &'static str {
+        "send_group_sticker"
+    }
+    fn description(&self) -> &'static str {
+        "Send one sticker from a sticker pack installed on this account to a Signal group you \
+         belong to; it shows as a sticker, not a file. Use send_sticker for one contact and \
+         send_group_attachment for ordinary images. group_id comes from list_groups. pack_id \
+         is the pack's id (32 hex characters) and sticker_id the sticker's number within it; a \
+         pack that isn't installed, or a sticker it doesn't hold, is an error. Not idempotent: \
+         repeating sends a duplicate. Saved to the local store as \
+         [sticker pack_id:sticker_id]. Returns the new message's id."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "group_id": group_schema(),
+                "pack_id": sticker_pack_schema(),
+                "sticker_id": sticker_id_schema(),
+            },
+            "required": ["group_id", "pack_id", "sticker_id"],
+            "additionalProperties": false,
+        })
+    }
+    fn writes(&self) -> bool {
+        true
+    }
+    async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
+        let input: SendGroupStickerInput = parse(input)?;
+        let to = Recipient::Group(group(&input.group_id)?);
+        let pack = sticker_pack(&input.pack_id)?;
+        send_sticker(ctx, to, pack, input.sticker_id).await
+    }
+}
+
 fn sticker_id_schema() -> Value {
     json!({
         "type": "integer",
@@ -576,6 +623,57 @@ mod tests {
                 Outgoing::Sticker {
                     pack,
                     sticker_id: 5
+                }
+            )]
+        );
+    }
+
+    /// A group sticker goes to the group, and a pack that isn't installed is
+    /// refused rather than sent as something Signal's apps can't render.
+    #[tokio::test]
+    async fn send_group_sticker_sends_to_the_group_and_refuses_an_uninstalled_pack() {
+        let (pack, group) = (StickerPackId::new([0xab; 16]), GroupId::new([7; 32]));
+        let signal = Arc::new(
+            FakeSignal::new(Account {
+                service_id: sid(ME),
+                phone_number: Some("+15550000001".into()),
+                kind: ProfileKind::Primary,
+                device_name: "test".into(),
+            })
+            .with_sticker_pack(pack, vec![1])
+            .with_groups(vec![Group {
+                id: group,
+                title: "band".into(),
+                members: vec![sid(ME), sid(2)],
+                admins: vec![],
+            }]),
+        );
+        let (ctx, _) = ctx_with_roots(&[]);
+        let ctx = ToolContext {
+            signal: signal.clone(),
+            ..ctx
+        };
+        let registry = Registry::standard();
+        let send = |pack: StickerPackId| {
+            registry.call(
+                &ctx,
+                "send_group_sticker",
+                json!({"group_id": group.to_string(), "pack_id": pack.to_string(), "sticker_id": 1}),
+            )
+        };
+        let missing = send(StickerPackId::new([0xcd; 16])).await;
+        assert!(
+            missing.is_err(),
+            "sent from an uninstalled pack: {missing:?}"
+        );
+        send(pack).await.unwrap();
+        assert_eq!(
+            signal.sent(),
+            [(
+                Recipient::Group(group),
+                Outgoing::Sticker {
+                    pack,
+                    sticker_id: 1
                 }
             )]
         );
