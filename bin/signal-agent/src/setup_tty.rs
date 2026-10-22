@@ -150,7 +150,8 @@ fn render(state: &SetupState, out: &mut impl Write) -> io::Result<()> {
             ..
         } => writeln!(
             out,
-            "\nImporting your recent messages. Signal sends about the last 45 days."
+            "\nImporting your earlier messages. {}",
+            relay_setup::HISTORY_NOTE
         ),
         SetupState::ImportingHistory {
             imported, total, ..
@@ -478,6 +479,19 @@ mod tests {
         let (a, b) = (rendered(&state("sgnl://a")), rendered(&state("sgnl://b")));
         assert!(a.starts_with("\x1b[2J\x1b[H"), "screen not cleared: {a:?}");
         assert_ne!(scan(&a), scan(&b), "the refreshed code was not redrawn");
+    }
+
+    /// The terminal once claimed Signal sends about 45 days of messages, which
+    /// is its limit for media only; it must show the note the window shows.
+    #[test]
+    fn importing_history_shows_the_shared_history_note() {
+        let text = rendered(&SetupState::ImportingHistory {
+            imported: 0,
+            total: None,
+            access: AccessMode::Full,
+        });
+        assert!(text.contains(relay_setup::HISTORY_NOTE), "{text}");
+        assert!(!text.contains("45 days"), "{text}");
     }
 
     /// Enter takes the recommended answer at every question with one: linking,

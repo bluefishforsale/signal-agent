@@ -17,11 +17,34 @@ pub use uninstall::{
     StepOutcome, checklist, removal_steps, run_steps, stop_agents, uninstall, uninstall_steps,
 };
 
+/// What every front end tells the user while a linked device imports history.
+pub const HISTORY_NOTE: &str = "Your phone sends all the messages it has. Photos and files \
+                                aren't brought over. Keep your phone on and connected until \
+                                this finishes.";
+
 pub mod prelude {
     pub use crate::{
-        AccountChoice, CAPTCHA_PAGE, ClientOutcome, Command, Profiles, SetupEvent, SetupState,
-        Step, StepOutcome, captcha_navigation_allowed, captcha_token,
+        AccountChoice, CAPTCHA_PAGE, ClientOutcome, Command, HISTORY_NOTE, Profiles, SetupEvent,
+        SetupState, Step, StepOutcome, captcha_navigation_allowed, captcha_token,
         claude::{ClaudeClient, ClientReport, ClientStatus, Clients, ServerEntry},
         pasted_captcha_token, run_steps, transition, uninstall_steps,
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The 45-day limit on a phone's history transfer covers photos and files,
+    /// not messages (docs/link-and-sync.md), and setup imports no attachments,
+    /// so the note must not promise a window of messages or any media.
+    #[test]
+    fn the_history_note_promises_no_45_day_window_or_media() {
+        assert!(!HISTORY_NOTE.contains("45"), "{HISTORY_NOTE}");
+        assert!(
+            HISTORY_NOTE.contains("all the messages")
+                && HISTORY_NOTE.contains("aren't brought over"),
+            "{HISTORY_NOTE}"
+        );
+    }
 }

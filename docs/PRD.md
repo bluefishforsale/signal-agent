@@ -22,7 +22,7 @@ The primary user is non-technical: they can download a file, double-click it, an
    - History import via link-and-sync.
    - Claude registration for Claude Code and Claude Desktop, ending with a "Restart Claude Desktop" button.
    - The app moves itself to Applications before setup on macOS, so client configs never point into a translocated path.
-4. **History.** Signal's link-and-sync history transfer, implemented by us on libsignal's `message-backup` crate and offered upstream to presage. Signal caps this at roughly 45 days; that ceiling is accepted and stated in the UI. Signal Desktop import is an opt-in extra, offered only when Desktop is detected, never required or suggested.
+4. **History.** Signal's link-and-sync history transfer, implemented by us on libsignal's `message-backup` crate and offered upstream to presage. It carries every text message the phone holds; Signal's 45-day limit applies to media only, and we import no media yet (docs/link-and-sync.md). The UI says so plainly. Signal Desktop import is an opt-in extra, offered only when Desktop is detected, never required or suggested.
 5. **Process model.** One always-on background agent per user per profile (macOS `SMAppService`, Windows logon task, Linux systemd user unit). It is the only process that talks to Signal, captures continuously, and serves a user-only local socket (Unix socket, or a named pipe on Windows). `signal-agent mcp` is a thin stdio front end that starts the agent if needed. At startup the agent re-adds any missing Claude registrations.
 6. **MCP tools.** Parity with upstream signal-mcp's 81 tools is the v2 end state. v2.0 ships every tool presage can back, plus those we build on `send_message`. Tools that need a primary device are hidden on linked profiles.
 7. **Encryption at rest.** SQLCipher for presage's store and the message store (with FTS5 search). The key lives in the Keychain, DPAPI, or the Secret Service; on headless Linux a 0600 key file, and setup says so.
@@ -67,7 +67,7 @@ The primary user is non-technical: they can download a file, double-click it, an
 ## Open questions and risks
 
 - Claude Desktop's custom connectors may require OAuth rather than a static bearer token, which would limit the HTTP endpoint to Claude Code and other clients. Answered in [http-endpoint.md](http-endpoint.md#claude-desktop-connectors): static headers are an Owner-only beta, and connectors call from Anthropic's servers, so they can't reach a loopback or LAN endpoint anyway.
-- Link-and-sync is new protocol work presage lacks ([whisperfish/presage#396](https://github.com/whisperfish/presage/issues/396)); the ~45-day cap is unverified against Signal's docs. Riskiest slice; it goes first.
+- Link-and-sync is new protocol work presage lacks ([whisperfish/presage#396](https://github.com/whisperfish/presage/issues/396)); the 45-day cap turned out to apply to media only (docs/link-and-sync.md). Riskiest slice; it goes first.
 - Windows ARM64 depends on BoringSSL building for that target. If it doesn't, ARM64 slips to v2.1 rather than blocking v2.0.
 - Signal server changes break unofficial clients without notice; the nightly staging test is the early warning.
 
