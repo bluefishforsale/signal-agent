@@ -42,8 +42,26 @@ pub fn captcha_navigation_allowed(url: &str) -> bool {
 /// captcha page navigates to when solved.
 pub fn captcha_token(url: &str) -> Option<String> {
     let token = url.trim().strip_prefix("signalcaptcha://")?;
-    let token = token.trim_end_matches('/');
-    (!token.is_empty()).then(|| token.to_owned())
+    valid_token(token.trim_end_matches('/'))
+}
+
+/// The token in what a user pasted: the whole `signalcaptcha://` link, or the
+/// bare token copied out of it.
+pub fn pasted_captcha_token(text: &str) -> Option<String> {
+    let text = text.trim();
+    if text.starts_with("signalcaptcha://") {
+        return captcha_token(text);
+    }
+    // Every Signal captcha token names its provider first, e.g. signal-hcaptcha.
+    text.starts_with("signal-").then(|| valid_token(text))?
+}
+
+// NOTE: every malformed token sent to Signal spends a registration attempt
+// against its anti-abuse limits, so anything outside the token alphabet (a
+// line-wrapped paste, a stray quote) is refused here, before Signal sees it.
+fn valid_token(token: &str) -> Option<String> {
+    let alphabet = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_');
+    (!token.is_empty() && token.chars().all(alphabet)).then(|| token.to_owned())
 }
 
 #[cfg(test)]
@@ -88,6 +106,48 @@ mod tests {
             "https://evil.example/?next=signalcaptcha://signal-hcaptcha.x",
         ] {
             assert_eq!(captcha_token(url), None, "token from {url:?}");
+        }
+    }
+
+    /// A link wrapped across lines when pasted over SSH, or carrying any
+    /// character Signal tokens never contain, must be refused before it spends
+    /// a registration attempt at Signal.
+    #[test]
+    fn a_line_wrapped_or_malformed_token_is_refused() {
+        let (head, tail) = HCAPTCHA.split_at(40);
+        for bad in [
+            format!("signalcaptcha://{head}\n{tail}"),
+            format!("signalcaptcha://{head} {tail}"),
+            format!("signalcaptcha://{HCAPTCHA}\""),
+            format!("signalcaptcha://{HCAPTCHA}?x=1"),
+            format!("signalcaptcha://{head}/{tail}"),
+        ] {
+            assert_eq!(captcha_token(&bad), None, "accepted {bad:?}");
+            assert_eq!(pasted_captcha_token(&bad), None, "accepted {bad:?}");
+        }
+    }
+
+    /// People paste either the whole link or just the token copied out of it;
+    /// both yield the token, under the same checks.
+    #[test]
+    fn a_pasted_link_or_bare_token_yields_the_token() {
+        for token in [HCAPTCHA, RECAPTCHA] {
+            for pasted in [format!("signalcaptcha://{token}"), format!(" {token}\n")] {
+                assert_eq!(
+                    pasted_captcha_token(&pasted).as_deref(),
+                    Some(token),
+                    "pasted {pasted:?}"
+                );
+            }
+        }
+        let (head, tail) = RECAPTCHA.split_at(30);
+        for bad in [
+            format!("{head} {tail}"),
+            "+15555550100".to_owned(),
+            "hcaptcha.5fad".to_owned(),
+            String::new(),
+        ] {
+            assert_eq!(pasted_captcha_token(&bad), None, "accepted {bad:?}");
         }
     }
 
