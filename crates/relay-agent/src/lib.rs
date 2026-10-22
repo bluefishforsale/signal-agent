@@ -2,10 +2,12 @@
 //! else (stdio shims, the HTTP front end, setup) reaches Signal through it,
 //! because two processes driving one Signal device corrupt its sessions.
 
+mod all_profiles;
 mod capture;
 pub mod endpoint;
 pub mod login;
 mod mcp;
+mod scheduler;
 mod startup;
 mod supervisor;
 
@@ -13,12 +15,15 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use relay_core::prelude::*;
-use relay_signal::SignalBackend;
+use relay_signal::{SendRoots, SignalBackend};
 use relay_store::MessageStore;
-use relay_tools::{Clock, Limiter, Limits, Registry, SystemClock, ToolContext};
+use relay_tools::{
+    Clock, Limiter, Limits, Registry, Settings, SystemClock, ToolContext, WebhookUrl,
+};
 use rmcp::ServiceExt;
 use tokio::task::JoinSet;
 
+pub use all_profiles::run_all_profiles;
 pub use supervisor::{Supervisor, SupervisorAction};
 
 /// What the agent needs to start.
@@ -35,6 +40,8 @@ pub struct Agent {
     store: Arc<dyn MessageStore>,
     registry: Arc<Registry>,
     access: AccessMode,
+    send_roots: Arc<SendRoots>,
+    webhook: Option<capture::Webhook>,
 }
 
 impl Agent {
@@ -49,7 +56,25 @@ impl Agent {
             store,
             registry: Arc::new(registry),
             access,
+            send_roots: Arc::default(),
+            webhook: None,
         }
+    }
+
+    /// Lets tools send files from inside `roots`.
+    pub fn with_send_roots(mut self, roots: SendRoots) -> Self {
+        self.send_roots = Arc::new(roots);
+        self
+    }
+
+    /// Posts every newly captured message for `profile` to `url`. Without a
+    /// working HTTP client it logs why and captures without posting.
+    pub fn with_webhook(mut self, profile: ProfileName, url: WebhookUrl) -> Self {
+        match capture::Webhook::new(profile, url) {
+            Ok(webhook) => self.webhook = Some(webhook),
+            Err(e) => tracing::warn!("no webhook: {e:#}"),
+        }
+        self
     }
 
     /// Captures everything Signal delivers into the store and serves MCP to
@@ -61,21 +86,8 @@ impl Agent {
         listener: endpoint::Listener,
         shutdown: impl Future<Output = ()>,
     ) -> anyhow::Result<()> {
-        let Agent {
-            signal,
-            store,
-            registry,
-            access,
-        } = self;
-        let served = serve_until(
-            signal.clone(),
-            store.clone(),
-            registry,
-            access,
-            listener,
-            shutdown,
-        )
-        .await;
+        let (signal, store) = (self.signal.clone(), self.store.clone());
+        let served = self.serve_until(listener, shutdown).await;
         // NOTE: every task holding the store has been joined by now, so nothing
         // touches it after close. Dropping SQLCipher unclosed crashed the
         // process at exit; dropping the backend lets presage close its store.
@@ -86,57 +98,61 @@ impl Agent {
         drop(signal);
         served.and(closed)
     }
-}
 
-async fn serve_until(
-    signal: Arc<dyn SignalBackend>,
-    store: Arc<dyn MessageStore>,
-    registry: Arc<Registry>,
-    access: AccessMode,
-    mut listener: endpoint::Listener,
-    shutdown: impl Future<Output = ()>,
-) -> anyhow::Result<()> {
-    let kind = signal.account().await?.kind;
-    let handler = mcp::Handler {
-        ctx: ToolContext {
-            store: store.clone(),
-            signal: signal.clone(),
-            access,
-            kind,
-            send_roots: Arc::default(),
-            webhook: None,
-        },
-        registry,
-    };
-    let capture = tokio::spawn(capture::run(signal, store));
-    let mut sessions = JoinSet::new();
-    tokio::pin!(shutdown);
-    let result = loop {
-        let stream = tokio::select! {
-            () = &mut shutdown => break Ok(()),
-            accepted = listener.accept() => match accepted {
-                Ok(stream) => stream,
-                Err(e) => break Err(e),
+    async fn serve_until(
+        self,
+        mut listener: endpoint::Listener,
+        shutdown: impl Future<Output = ()>,
+    ) -> anyhow::Result<()> {
+        let kind = self.signal.account().await?.kind;
+        let handler = mcp::Handler {
+            ctx: ToolContext {
+                store: self.store.clone(),
+                signal: self.signal.clone(),
+                access: self.access,
+                kind,
+                send_roots: self.send_roots,
+                webhook: self.webhook.as_ref().map(|w| w.url.clone()),
             },
+            registry: self.registry,
         };
-        let handler = handler.clone();
-        sessions.spawn(async move {
-            let session = match handler.serve(stream).await {
-                Ok(session) => session,
-                Err(e) => return tracing::warn!("client failed to initialize: {e}"),
+        let scheduler = tokio::spawn(scheduler::run(
+            handler.registry.clone(),
+            handler.ctx.clone(),
+            Arc::new(SystemClock),
+        ));
+        let capture = tokio::spawn(capture::run(self.signal, self.store, self.webhook));
+        let mut sessions = JoinSet::new();
+        tokio::pin!(shutdown);
+        let result = loop {
+            let stream = tokio::select! {
+                () = &mut shutdown => break Ok(()),
+                accepted = listener.accept() => match accepted {
+                    Ok(stream) => stream,
+                    Err(e) => break Err(e),
+                },
             };
-            if let Err(e) = session.waiting().await {
-                tracing::warn!("client session ended with an error: {e}");
-            }
-        });
-        // Reap finished sessions so a long-lived agent doesn't accumulate them.
-        while sessions.try_join_next().is_some() {}
-    };
-    sessions.shutdown().await;
-    capture.abort();
-    // An aborted task reports cancellation; all that matters is that it ended.
-    let _ = capture.await;
-    result
+            let handler = handler.clone();
+            sessions.spawn(async move {
+                let session = match handler.serve(stream).await {
+                    Ok(session) => session,
+                    Err(e) => return tracing::warn!("client failed to initialize: {e}"),
+                };
+                if let Err(e) = session.waiting().await {
+                    tracing::warn!("client session ended with an error: {e}");
+                }
+            });
+            // Reap finished sessions so a long-lived agent doesn't accumulate them.
+            while sessions.try_join_next().is_some() {}
+        };
+        sessions.shutdown().await;
+        capture.abort();
+        scheduler.abort();
+        // An aborted task reports cancellation; all that matters is that it ended.
+        let _ = capture.await;
+        let _ = scheduler.await;
+        result
+    }
 }
 
 /// Runs the agent until it is told to stop: receives continuously into the
@@ -152,18 +168,47 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
     // start capturing whether or not that works.
     tokio::task::spawn_blocking(move || startup::reregister_claude_entries(&profile));
     let (signal, store) = open_backend_and_store(&config).await?;
-    let registry = registry(&config.paths, Arc::new(SystemClock));
-    Agent::new(signal, store, registry, config.access)
-        .serve(listener, stop_requested())
-        .await
+    let settings = configured(&config.paths);
+    let registry = registry(&config.paths, settings.limits, Arc::new(SystemClock));
+    let mut agent =
+        Agent::new(signal, store, registry, config.access).with_send_roots(settings.send_roots);
+    if let Some(url) = settings.webhook {
+        agent = agent.with_webhook(config.profile, url);
+    }
+    agent.serve(listener, stop_requested()).await
 }
 
-/// The shipped tools under limits kept in the profile directory, so
-/// restarting the agent doesn't reset them.
-// NOTE: the default limits apply until they're read from settings (#72).
-fn registry(paths: &ProfilePaths, clock: Arc<dyn Clock>) -> Registry {
-    let limiter = Limiter::new(Limits::default(), clock).persisted(paths.root.join("limits.json"));
+/// The shipped tools under `limits`, with what they've spent kept in the
+/// profile directory, so restarting the agent doesn't reset them.
+fn registry(paths: &ProfilePaths, limits: Limits, clock: Arc<dyn Clock>) -> Registry {
+    let limiter = Limiter::new(limits, clock).persisted(paths.limits.clone());
     Registry::standard().with_limiter(limiter)
+}
+
+/// What the agent runs with from the profile's Advanced settings.
+struct Configured {
+    limits: Limits,
+    send_roots: SendRoots,
+    webhook: Option<WebhookUrl>,
+}
+
+/// The profile's saved settings, or the defaults for whatever can't be used.
+// NOTE: never fail here. The agent is also what captures messages, so a
+// settings mistake that stopped it would silently lose history.
+fn configured(paths: &ProfilePaths) -> Configured {
+    let settings = Settings::load(&paths.settings).unwrap_or_else(|e| {
+        tracing::warn!("using default settings: {e:#}");
+        Settings::default()
+    });
+    let send_roots = SendRoots::new(settings.send_roots).unwrap_or_else(|e| {
+        tracing::warn!("no file can be sent until the send folders are fixed: {e:#}");
+        SendRoots::default()
+    });
+    Configured {
+        limits: settings.limits,
+        send_roots,
+        webhook: settings.webhook,
+    }
 }
 
 /// Resolves when the OS asks the agent to stop: Ctrl-C anywhere, and SIGTERM
@@ -264,7 +309,7 @@ pub(crate) mod tests {
             let to = ServiceId::new(Uuid::from_u128(n)).to_string();
             serde_json::json!({"recipient": to, "message": "hi"})
         };
-        let agent = registry(&paths, clock.clone());
+        let agent = registry(&paths, Limits::default(), clock.clone());
         for n in 10..30 {
             let result = agent.call(&ctx, "send_message", dm(n)).await;
             assert!(
@@ -273,7 +318,7 @@ pub(crate) mod tests {
             );
             clock.advance(3_000);
         }
-        let restarted = registry(&paths, clock.clone());
+        let restarted = registry(&paths, Limits::default(), clock.clone());
         let result = restarted.call(&ctx, "send_message", dm(30)).await;
         let Err(relay_tools::ToolError::Internal(e)) = &result else {
             panic!("21st new recipient after a restart was not refused: {result:?}");
@@ -287,6 +332,166 @@ pub(crate) mod tests {
             signal.sent().len(),
             20,
             "a refused first contact reached Signal"
+        );
+    }
+
+    fn test_paths(tmp: &tempfile::TempDir) -> ProfilePaths {
+        let profile = ProfileName::new("default").expect("valid profile");
+        let paths = ProfilePaths::under(tmp.path().to_owned(), &profile);
+        std::fs::create_dir_all(&paths.root).expect("profile dir");
+        paths
+    }
+
+    /// Limits the user tightened under Advanced must be the ones the agent
+    /// enforces, not the defaults.
+    #[tokio::test]
+    async fn the_limits_saved_in_settings_are_the_ones_enforced() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(&tmp);
+        std::fs::write(
+            &paths.settings,
+            br#"{"limits": {"new_recipients_per_day": 1}}"#,
+        )
+        .expect("settings");
+        let signal = fake_signal();
+        let ctx = ToolContext {
+            store: Arc::new(MemoryStore::default()),
+            signal: signal.clone(),
+            access: AccessMode::Full,
+            kind: ProfileKind::Linked,
+            send_roots: Arc::default(),
+            webhook: None,
+        };
+        let settings = configured(&paths);
+        let registry = registry(&paths, settings.limits, Arc::new(FakeClock(0.into())));
+        for n in [10, 11] {
+            let to = ServiceId::new(Uuid::from_u128(n)).to_string();
+            let _ = registry
+                .call(
+                    &ctx,
+                    "send_message",
+                    serde_json::json!({"recipient": to, "message": "hi"}),
+                )
+                .await;
+        }
+        assert_eq!(
+            signal.sent().len(),
+            1,
+            "a second first contact got past a cap of one a day"
+        );
+    }
+
+    /// Settings name a send folder the agent can use, and a deleted one
+    /// closes sending files without throwing away the rest of the settings.
+    #[test]
+    fn a_missing_send_folder_allows_no_files_and_keeps_the_other_settings() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(&tmp);
+        let folder = tmp.path().join("outbox");
+        std::fs::create_dir(&folder).expect("outbox");
+        std::fs::write(folder.join("a.txt"), b"a").expect("file");
+        let settings = serde_json::json!({
+            "limits": {"per_hour": 7},
+            "send_roots": [folder],
+            "webhook": "https://example.com/hook",
+        });
+        std::fs::write(&paths.settings, settings.to_string()).expect("settings");
+        let loaded = configured(&paths);
+        assert!(
+            loaded.send_roots.admit(&folder.join("a.txt")).is_ok(),
+            "a file in the chosen send folder was refused"
+        );
+        std::fs::remove_dir_all(&folder).expect("delete outbox");
+        let loaded = configured(&paths);
+        assert_eq!(
+            loaded.send_roots,
+            SendRoots::default(),
+            "send roots survived"
+        );
+        assert_eq!(loaded.limits.per_hour.get(), 7, "limits lost");
+        assert!(loaded.webhook.is_some(), "webhook lost");
+    }
+
+    /// A damaged settings file must not stop the agent, which would also stop
+    /// capture: it runs on default limits, no send folders and no webhook.
+    #[test]
+    fn a_damaged_settings_file_runs_on_defaults() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(&tmp);
+        std::fs::write(&paths.settings, b"{\"limits\": garbage").expect("damage");
+        let loaded = configured(&paths);
+        assert_eq!(loaded.limits, Limits::default());
+        assert_eq!(loaded.send_roots, SendRoots::default());
+        assert!(loaded.webhook.is_none(), "webhook from a damaged file");
+    }
+
+    /// Reports what a tool sees of the agent's settings.
+    struct ProbeContext;
+
+    #[async_trait::async_trait]
+    impl relay_tools::Tool for ProbeContext {
+        fn name(&self) -> &'static str {
+            "probe_context"
+        }
+        fn description(&self) -> &'static str {
+            "test-only read tool"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}}})
+        }
+        fn writes(&self) -> bool {
+            false
+        }
+        async fn call(
+            &self,
+            ctx: &ToolContext,
+            input: serde_json::Value,
+        ) -> Result<serde_json::Value, relay_tools::ToolError> {
+            let path = input["path"].as_str().unwrap_or_default();
+            Ok(serde_json::json!({
+                "webhook": ctx.webhook.as_ref().map(ToString::to_string),
+                "admitted": ctx.send_roots.admit(std::path::Path::new(path)).is_ok(),
+            }))
+        }
+    }
+
+    /// The send folders and webhook the user saved must be what every tool
+    /// call sees, or send_attachment and get_webhook would answer from
+    /// defaults while the settings say otherwise.
+    #[tokio::test]
+    async fn the_send_folders_and_webhook_from_settings_reach_every_tool() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let name = test_endpoint(tmp.path());
+        let folder = tmp.path().join("outbox");
+        std::fs::create_dir(&folder).expect("outbox");
+        let file = folder.join("a.txt");
+        std::fs::write(&file, b"a").expect("file");
+        let hook = WebhookUrl::parse("https://example.com/hook").expect("url");
+        let agent = Agent::new(
+            fake_signal(),
+            Arc::new(MemoryStore::default()),
+            Registry::default().with(ProbeContext),
+            AccessMode::Full,
+        )
+        .with_send_roots(SendRoots::new([folder]).expect("roots"))
+        .with_webhook(ProfileName::default_profile(), hook.clone());
+        let listener = endpoint::Listener::bind(&name).await.expect("bind");
+        let served = tokio::spawn(agent.serve(listener, std::future::pending()));
+        let stream = endpoint::connect(&name).await.expect("connect");
+        let client = ().serve(stream).await.expect("initialize");
+        let serde_json::Value::Object(args) = serde_json::json!({"path": file}) else {
+            unreachable!()
+        };
+        let result = client
+            .peer()
+            .call_tool(CallToolRequestParams::new("probe_context").with_arguments(args))
+            .await
+            .expect("tools/call");
+        served.abort();
+        assert_eq!(
+            result.structured_content,
+            Some(serde_json::json!({"webhook": hook.to_string(), "admitted": true})),
+            "tool saw other settings"
         );
     }
 
@@ -309,7 +514,7 @@ pub(crate) mod tests {
             send_roots: Arc::default(),
             webhook: None,
         };
-        let registry = registry(&paths, Arc::new(FakeClock(0.into())));
+        let registry = registry(&paths, Limits::default(), Arc::new(FakeClock(0.into())));
         let stats = registry
             .call(&ctx, "store_stats", serde_json::json!({}))
             .await;

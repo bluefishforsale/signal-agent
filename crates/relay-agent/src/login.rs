@@ -1,5 +1,6 @@
-//! Starting the agent at login: SMAppService on macOS, a logon task on
-//! Windows, a systemd user unit on Linux.
+//! Starting the agents at login: one item per user on every OS (SMAppService
+//! on macOS, a logon task on Windows, a systemd user unit on Linux) running
+//! `signal-agent agent --all-profiles`, so uninstall has one item to remove.
 
 #[cfg(any(target_os = "macos", test))]
 mod launchd;
@@ -10,29 +11,55 @@ mod task;
 
 use relay_core::ProfileName;
 
-/// Makes the agent for `profile` start at every login, and starts it now.
+/// Makes sure `profile`'s agent starts at every login and runs now: the
+/// supervisor's login item exists and is running, and any per-profile item
+/// from before the supervisor is stopped and removed. The supervisor picks a
+/// newly set-up profile up within seconds.
 pub fn register(profile: &ProfileName) -> anyhow::Result<()> {
+    tracing::info!("ensuring the login item that runs \"{profile}\" among all profiles");
     #[cfg(target_os = "linux")]
-    return systemd::register(profile, &agent_executable()?);
+    return systemd::register(&agent_executable()?);
     #[cfg(windows)]
-    return task::register(profile, &agent_executable()?);
+    return task::register(&agent_executable()?, &known_profiles()?);
     #[cfg(target_os = "macos")]
-    return launchd::register(profile);
+    return launchd::register(&data_dir()?);
     #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
-    anyhow::bail!("no login registration for \"{profile}\" on this OS")
+    anyhow::bail!("no login registration on this OS")
 }
 
-/// Stops the agent for `profile` and removes its login registration. Removing
-/// one that isn't there succeeds.
-pub fn unregister(profile: &ProfileName) -> anyhow::Result<()> {
+/// Stops every profile's agent and removes the login item, including any
+/// per-profile item from before the supervisor. Removing one that isn't
+/// there succeeds.
+pub fn unregister() -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
-    return systemd::unregister(profile);
+    return systemd::unregister();
     #[cfg(windows)]
-    return task::unregister(profile);
+    return task::unregister(&known_profiles()?);
     #[cfg(target_os = "macos")]
-    return launchd::unregister(profile);
+    return launchd::unregister(&data_dir()?);
     #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
-    anyhow::bail!("no login registration for \"{profile}\" on this OS")
+    anyhow::bail!("no login registration on this OS")
+}
+
+/// Every profile that may have had its own logon task before the supervisor.
+#[cfg(windows)]
+fn known_profiles() -> anyhow::Result<Vec<ProfileName>> {
+    let mut profiles = relay_setup::Profiles::system()?.list()?;
+    let default = ProfileName::default_profile();
+    if !profiles.contains(&default) {
+        profiles.push(default);
+    }
+    Ok(profiles)
+}
+
+/// The directory that holds every profile's data.
+#[cfg(target_os = "macos")]
+fn data_dir() -> anyhow::Result<std::path::PathBuf> {
+    use anyhow::Context;
+    let root = relay_core::ProfilePaths::for_profile(&ProfileName::default_profile())?.root;
+    root.parent()
+        .map(ToOwned::to_owned)
+        .with_context(|| format!("profile directory \"{}\" has no parent", root.display()))
 }
 
 /// The `signal-agent` binary: this process if it is the CLI, otherwise the one

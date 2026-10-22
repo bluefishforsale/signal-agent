@@ -12,6 +12,7 @@ use crate::{
         Timestamp, contact, contact_schema, group, group_schema, non_blank, parse, recipient,
         recipient_schema,
     },
+    media,
 };
 
 pub struct SendMessage;
@@ -59,7 +60,7 @@ impl Tool for SendMessage {
         let to = Recipient::Contact(contact(ctx, &input.recipient).await?);
         let body = non_blank("message", input.message)?;
         let quote = quote(ctx, input.quote_author, input.quote_timestamp).await?;
-        send_text(ctx, to, body, quote).await
+        send_text(ctx, to, body, quote, vec![]).await
     }
 }
 
@@ -108,7 +109,7 @@ impl Tool for SendGroupMessage {
         let to = Recipient::Group(group(&input.group_id)?);
         let body = non_blank("message", input.message)?;
         let quote = quote(ctx, input.quote_author, input.quote_timestamp).await?;
-        send_text(ctx, to, body, quote).await
+        send_text(ctx, to, body, quote, vec![]).await
     }
 }
 
@@ -119,6 +120,7 @@ pub struct SendNoteToSelf;
 struct SendNoteToSelfInput {
     message: String,
     quote_timestamp: Option<Timestamp>,
+    attachments: Option<Vec<String>>,
 }
 
 #[async_trait]
@@ -130,7 +132,9 @@ impl Tool for SendNoteToSelf {
         "Send a message to your own Note to Self chat, which syncs to all your Signal \
          devices. Use for reminders, bookmarks or drafts; use send_message to message anyone \
          else. message is the text. To thread a follow-up under an earlier note, pass \
-         quote_timestamp (that note's sent_at_ms). Not idempotent. Saved to the local store. \
+         quote_timestamp (that note's sent_at_ms). attachments are local files to attach (at \
+         most 32), which must be inside a send folder the user chose under Advanced settings; \
+         with none chosen no file can be sent. Not idempotent. Saved to the local store. \
          Returns the new message's id."
     }
     fn input_schema(&self) -> Value {
@@ -139,6 +143,7 @@ impl Tool for SendNoteToSelf {
             "properties": {
                 "message": {"type": "string", "minLength": 1, "description": "Note text to save"},
                 "quote_timestamp": Timestamp::schema("Send time of the note being followed up on"),
+                "attachments": media::paths_schema(),
             },
             "required": ["message"],
             "additionalProperties": false,
@@ -155,7 +160,11 @@ impl Tool for SendNoteToSelf {
             author: me,
             sent_at_ms: t.ms(),
         });
-        send_text(ctx, Recipient::Contact(me), body, quote).await
+        let attachments = match input.attachments {
+            Some(paths) => media::upload(ctx, &media::files(None, Some(paths))?).await?,
+            None => vec![],
+        };
+        send_text(ctx, Recipient::Contact(me), body, quote, attachments).await
     }
 }
 
@@ -281,7 +290,7 @@ impl Tool for SendReadReceipt {
 
 /// The quoted message named by an author and send time, which must come
 /// together or not at all.
-async fn quote(
+pub(crate) async fn quote(
     ctx: &ToolContext,
     author: Option<String>,
     timestamp: Option<Timestamp>,
@@ -298,15 +307,16 @@ async fn quote(
     }
 }
 
-/// Sends `body` to `to` and records it in the local history as this
-/// account's own message.
+/// Sends `body` with `attachments` to `to` and records it in the local
+/// history as this account's own message.
 // NOTE: Signal doesn't echo a device's own sends back to it, so a send that
 // skips the store never shows up in get_conversation or search_messages.
-async fn send_text(
+pub(crate) async fn send_text(
     ctx: &ToolContext,
     to: Recipient,
     body: String,
     quote: Option<MessageId>,
+    attachments: Vec<AttachmentRef>,
 ) -> Result<Value, ToolError> {
     let id = ctx
         .signal
@@ -315,7 +325,7 @@ async fn send_text(
             Outgoing::Text {
                 body: body.clone(),
                 quote,
-                attachments: vec![],
+                attachments: attachments.clone(),
             },
         )
         .await?;
@@ -326,8 +336,8 @@ async fn send_text(
             sender: id.author,
             from_me: true,
             received_at_ms: id.sent_at_ms,
-            body: Some(body),
-            attachments: vec![],
+            body: (!body.is_empty()).then_some(body),
+            attachments,
             quote,
             edited: false,
             deleted: false,

@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use relay_core::prelude::*;
 use relay_secrets::{SecretStore, StoreKey};
-use relay_signal::{LinkEvent, Provisioner, RegistrationStep};
-use relay_tools::{Clock, Limits, SystemClock};
+use relay_signal::{LinkEvent, Provisioner, RateLimited, RegistrationStep};
+use relay_tools::{Clock, Limits, Settings, SystemClock};
 
 use crate::{
     Command, SetupEvent, SetupState,
@@ -111,13 +111,15 @@ impl Driver {
             let Err(e) = self.run(command, show, &mut pending).await else {
                 continue;
             };
+            let mut message = format!("{e:#}");
+            if let Some(Err(d)) = e.downcast_ref().map(|l| self.defer_provisioning(l)) {
+                message.push_str(&format!(" ({d:#}, so wait that long yourself)"));
+            }
             // NOTE: a failed command drops the rest of its batch. SaveAccess and
             // ConnectClients share one; connecting after a failed save would
             // hand clients a profile in the wrong access mode.
             pending.clear();
-            let failed = SetupEvent::CommandFailed {
-                message: format!("{e:#}"),
-            };
+            let failed = SetupEvent::CommandFailed { message };
             pending.extend(apply(&mut self.state, failed, show));
         }
     }
@@ -242,13 +244,24 @@ impl Driver {
 
     /// Refuses a link or registration too soon after the last one, before
     /// Signal hears of it.
-    // NOTE: the default limits apply until they're read from settings (#72).
     fn begin_provisioning(&self) -> anyhow::Result<()> {
         let root = &self.paths.root;
         fs::create_dir_all(root)
             .with_context(|| format!("unable to create \"{}\"", root.display()))?;
-        let path = root.join("provisioning.json");
-        relay_tools::begin_provisioning(&path, &Limits::default(), self.clock.now_ms())
+        // A damaged settings file must not block setup, which may be how the
+        // user gets back to Advanced to fix it; the defaults are conservative.
+        let limits = Settings::load(&self.paths.settings)
+            .map(|s| s.limits)
+            .unwrap_or_else(|e| {
+                tracing::warn!("using the default provisioning backoff: {e:#}");
+                Limits::default()
+            });
+        relay_tools::begin_provisioning(&self.paths.provisioning, &limits, self.clock.now_ms())
+    }
+
+    /// Holds the next link or registration back until Signal's wait is over.
+    fn defer_provisioning(&self, limited: &RateLimited) -> anyhow::Result<()> {
+        relay_tools::defer_provisioning(&self.paths.provisioning, limited, self.clock.now_ms())
     }
 
     // NOTE: the agent opens this same store once it starts, and two processes
@@ -980,6 +993,33 @@ mod tests {
         assert_eq!(links(world.log()), 2, "{:?}", world.log());
     }
 
+    /// A longer provisioning backoff saved under Advanced must hold setup back
+    /// too, not just the default five minutes.
+    #[tokio::test]
+    async fn the_provisioning_backoff_saved_in_settings_is_the_one_applied() {
+        let world = World::new()
+            .stopped_clock()
+            .link(vec![Err(anyhow::anyhow!("network down"))])
+            .link(vec![linked()]);
+        let paths = world.paths();
+        std::fs::create_dir_all(&paths.root).expect("profile dir");
+        std::fs::write(
+            &paths.settings,
+            br#"{"limits": {"provisioning_backoff_minutes": 30}}"#,
+        )
+        .expect("settings");
+        let mut h = Harness::new(&world);
+        assert_failed(&h.send(LINK).await, "link");
+        world.clock.advance(10 * 60 * 1_000);
+        assert_failed(&h.send(SetupEvent::Retry).await, "early retry");
+        let links = |log: Vec<String>| log.iter().filter(|e| e.starts_with("link as")).count();
+        assert_eq!(links(world.log()), 1, "{:?}", world.log());
+        assert!(
+            paths.provisioning.exists(),
+            "the attempt wasn't recorded at the profile's provisioning path"
+        );
+    }
+
     /// Sending the captcha Signal asked for finishes the same attempt, so the
     /// backoff must not refuse it.
     #[tokio::test]
@@ -1082,6 +1122,51 @@ mod tests {
             .filter(|e| e.starts_with("request code"))
             .count();
         assert_eq!(requests, 1, "{:?}", world.log());
+    }
+
+    /// When Signal rate-limits a code request for longer than our own
+    /// backoff, a fresh attempt must wait out Signal's time, refused before
+    /// Signal hears of it, and go through once that time has passed.
+    #[tokio::test]
+    async fn a_rate_limited_code_request_extends_the_backoff_to_signals_wait() {
+        let limited = relay_signal::RateLimited {
+            message: "slow down".into(),
+            retry_after: Some(std::time::Duration::from_secs(7200)),
+        };
+        let world = World::new()
+            .stopped_clock()
+            .code(Err(limited.into()))
+            .code(Ok(RegistrationStep::CodeSent));
+        let mut h = Harness::new(&world);
+        let number = SetupEvent::NumberEntered {
+            number: NUMBER.into(),
+        };
+        h.send(SetupEvent::AccountChosen {
+            choice: AccountChoice::OwnNumber,
+        })
+        .await;
+        h.send(number.clone()).await;
+        world.clock.advance(5 * 60 * 1_000 + 1_000);
+        h.send(SetupEvent::Retry).await;
+        let refused = h.send(number.clone()).await;
+        let SetupState::Failed { message, .. } = &refused else {
+            panic!("an attempt inside Signal's wait was not refused: {refused:?}");
+        };
+        assert!(message.contains("try again in 6899s"), "{message}");
+        world.clock.advance(6899 * 1_000);
+        h.send(SetupEvent::Retry).await;
+        let sent = h.send(number).await;
+        assert!(
+            matches!(sent, SetupState::EnterCode { .. }),
+            "{sent:?} {:?}",
+            world.log()
+        );
+        let requests = world
+            .log()
+            .into_iter()
+            .filter(|e| e.starts_with("request code"))
+            .count();
+        assert_eq!(requests, 2, "{:?}", world.log());
     }
 
     /// Every step of the own-number path that fails (requesting a code,

@@ -22,7 +22,12 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Run the background agent in the foreground.
-    Agent,
+    Agent {
+        /// Run every set-up profile's agent as a child process instead; this
+        /// is what the login item starts.
+        #[arg(long)]
+        all_profiles: bool,
+    },
     /// Serve MCP on stdin/stdout; this is what Claude clients launch.
     Mcp,
     /// Set up a profile in the terminal.
@@ -46,7 +51,10 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let profile = ProfileName::new(cli.profile)?;
     match cli.command {
-        Cmd::Agent => {
+        Cmd::Agent { all_profiles: true } => relay_agent::run_all_profiles().await,
+        Cmd::Agent {
+            all_profiles: false,
+        } => {
             let paths = ProfilePaths::for_profile(&profile)?;
             let access = startup_access(&paths);
             relay_agent::run(relay_agent::AgentConfig {
@@ -90,6 +98,17 @@ mod tests {
         assert_eq!(startup_access(&paths), AccessMode::ReadOnly);
         paths.save_access(AccessMode::Full).expect("save");
         assert_eq!(startup_access(&paths), AccessMode::Full);
+    }
+
+    /// Every OS's login item runs exactly this command line, so it must parse
+    /// as the supervisor, not as the default profile's agent.
+    #[test]
+    fn the_login_items_command_line_runs_the_supervisor() {
+        let cli = Cli::try_parse_from(["signal-agent", "agent", "--all-profiles"]).expect("parse");
+        assert!(
+            matches!(cli.command, Cmd::Agent { all_profiles: true }),
+            "parsed as a single profile's agent"
+        );
     }
 
     /// A missing or damaged choice must never grant write access.

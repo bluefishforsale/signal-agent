@@ -6,46 +6,62 @@ use std::path::Path;
 #[cfg(windows)]
 use anyhow::Context;
 use anyhow::bail;
+#[cfg(windows)]
 use relay_core::ProfileName;
 
+/// The supervisor's task. Per-profile tasks from before it were
+/// `signal-agent-<profile>`.
 #[cfg(windows)]
-pub(super) fn register(profile: &ProfileName, exe: &Path) -> anyhow::Result<()> {
+const TASK_NAME: &str = "signal-agent";
+
+#[cfg(windows)]
+pub(super) fn register(exe: &Path, profiles: &[ProfileName]) -> anyhow::Result<()> {
+    remove_legacy_tasks(profiles)?;
     let sid = crate::endpoint::current_user_sid()?;
-    let xml = render_task(exe, profile, &sid)?;
-    let file = std::env::temp_dir().join(format!("signal-agent-task-{profile}.xml"));
+    let xml = render_task(exe, &sid)?;
+    let file = std::env::temp_dir().join("signal-agent-task.xml");
     std::fs::write(&file, utf16_file(&xml))
         .with_context(|| format!("unable to write \"{}\"", file.display()))?;
-    let name = task_name(profile);
     let file_arg = file.display().to_string();
     let created = super::run(
         "schtasks",
-        &["/Create", "/TN", &name, "/XML", &file_arg, "/F"],
+        &["/Create", "/TN", TASK_NAME, "/XML", &file_arg, "/F"],
     );
     // The file is only input to schtasks; a leftover copy is harmless.
     let _ = std::fs::remove_file(&file);
     created?;
-    super::run("schtasks", &["/Run", "/TN", &name])
+    super::run("schtasks", &["/Run", "/TN", TASK_NAME])
 }
 
 #[cfg(windows)]
-pub(super) fn unregister(profile: &ProfileName) -> anyhow::Result<()> {
-    let name = task_name(profile);
-    if super::run("schtasks", &["/Query", "/TN", &name]).is_err() {
+pub(super) fn unregister(profiles: &[ProfileName]) -> anyhow::Result<()> {
+    remove_legacy_tasks(profiles)?;
+    remove_task(TASK_NAME)
+}
+
+/// Stops and removes each of `profiles`' own tasks, so the supervisor's
+/// children are the only agents.
+#[cfg(windows)]
+fn remove_legacy_tasks(profiles: &[ProfileName]) -> anyhow::Result<()> {
+    profiles
+        .iter()
+        .try_for_each(|p| remove_task(&format!("signal-agent-{p}")))
+}
+
+/// Ends and deletes task `name`. Removing one that isn't there succeeds.
+#[cfg(windows)]
+fn remove_task(name: &str) -> anyhow::Result<()> {
+    if super::run("schtasks", &["/Query", "/TN", name]).is_err() {
         return Ok(());
     }
     // Not running is fine; the delete below is what must succeed.
-    let _ = super::run("schtasks", &["/End", "/TN", &name]);
-    super::run("schtasks", &["/Delete", "/TN", &name, "/F"])
+    let _ = super::run("schtasks", &["/End", "/TN", name]);
+    super::run("schtasks", &["/Delete", "/TN", name, "/F"])
 }
 
-#[cfg(windows)]
-fn task_name(profile: &ProfileName) -> String {
-    format!("signal-agent-{profile}")
-}
-
-/// Task Scheduler XML that starts `exe agent --profile <profile>` when the
-/// user with `sid` logs on.
-pub(super) fn render_task(exe: &Path, profile: &ProfileName, sid: &str) -> anyhow::Result<String> {
+/// Task Scheduler XML that starts `exe agent --all-profiles` when the user
+/// with `sid` logs on.
+pub(super) fn render_task(exe: &Path, sid: &str) -> anyhow::Result<String> {
     let Some(exe) = exe.to_str() else {
         bail!("the agent path {exe:?} is not valid Unicode");
     };
@@ -53,7 +69,7 @@ pub(super) fn render_task(exe: &Path, profile: &ProfileName, sid: &str) -> anyho
     Ok(format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo><Description>MCP Relay for Signal agent ({profile})</Description></RegistrationInfo>
+  <RegistrationInfo><Description>MCP Relay for Signal agent</Description></RegistrationInfo>
   <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{sid}</UserId></LogonTrigger></Triggers>
   <Principals><Principal id="Author"><UserId>{sid}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
   <Settings>
@@ -64,7 +80,7 @@ pub(super) fn render_task(exe: &Path, profile: &ProfileName, sid: &str) -> anyho
     <AllowStartOnDemand>true</AllowStartOnDemand>
     <Hidden>true</Hidden>
   </Settings>
-  <Actions Context="Author"><Exec><Command>{exe}</Command><Arguments>agent --profile {profile}</Arguments></Exec></Actions>
+  <Actions Context="Author"><Exec><Command>{exe}</Command><Arguments>agent --all-profiles</Arguments></Exec></Actions>
 </Task>
 "#
     ))
@@ -97,9 +113,7 @@ mod tests {
     /// survive all three. An `&` in the install path must not break the XML.
     #[test]
     fn the_task_keeps_running_on_battery_and_forever_with_any_path() {
-        let profile = ProfileName::default_profile();
-        let xml =
-            render_task(Path::new(r"C:\Tom & Jerry\signal-agent.exe"), &profile, SID).expect("xml");
+        let xml = render_task(Path::new(r"C:\Tom & Jerry\signal-agent.exe"), SID).expect("xml");
         for setting in [
             "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>",
             "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>",
@@ -133,10 +147,8 @@ mod tests {
     /// the task needs admin rights (a trigger for any user) or runs it as
     /// someone else.
     #[test]
-    fn the_task_starts_this_profiles_agent_at_this_users_logon() {
-        let profile = ProfileName::new("work").expect("name");
-        let xml =
-            render_task(Path::new(r"C:\Users\a\signal-agent.exe"), &profile, SID).expect("xml");
+    fn the_task_starts_the_supervisor_at_this_users_logon() {
+        let xml = render_task(Path::new(r"C:\Users\a\signal-agent.exe"), SID).expect("xml");
         assert!(
             xml.contains(&format!(
                 "<LogonTrigger><Enabled>true</Enabled><UserId>{SID}</UserId></LogonTrigger>"
@@ -148,7 +160,7 @@ mod tests {
             "principal wrong:\n{xml}"
         );
         assert!(
-            xml.contains(r"<Command>C:\Users\a\signal-agent.exe</Command><Arguments>agent --profile work</Arguments>"),
+            xml.contains(r"<Command>C:\Users\a\signal-agent.exe</Command><Arguments>agent --all-profiles</Arguments>"),
             "wrong action:\n{xml}"
         );
     }

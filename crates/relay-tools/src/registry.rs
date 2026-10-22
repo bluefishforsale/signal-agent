@@ -5,7 +5,10 @@ use std::sync::Arc;
 use relay_core::prelude::*;
 use serde_json::Value;
 
-use crate::{Limiter, Tool, ToolContext, ToolError, directory, limits, local, mutate, read, send};
+use crate::{
+    Limiter, Tool, ToolContext, ToolError, admin, directory, limits, local, lookup, media, mutate,
+    pins, polls, read, schedule, send, webhook,
+};
 
 /// The set of tools a profile serves.
 #[derive(Clone, Default)]
@@ -43,6 +46,27 @@ impl Registry {
             .with(local::MarkAsUnread)
             .with(local::ClearLocalStore)
             .with(local::PruneStore)
+            .with(local::DeleteLocalMessages)
+            .with(pins::PinMessage)
+            .with(pins::UnpinMessage)
+            .with(polls::CreatePoll)
+            .with(polls::VotePoll)
+            .with(polls::TerminatePoll)
+            .with(admin::AdminDeleteMessage)
+            .with(webhook::GetWebhook)
+            .with(schedule::ScheduleMessage)
+            .with(schedule::ListScheduledMessages)
+            .with(schedule::CancelScheduledMessage)
+            .with(schedule::RunScheduledMessages)
+            .with(lookup::ListDevices)
+            .with(lookup::ListIdentities)
+            .with(lookup::GetAvatar)
+            .with(media::SendAttachment)
+            .with(media::SendGroupAttachment)
+            .with(media::SendSticker)
+            .with(media::SendGroupSticker)
+            .with(lookup::GetProfile)
+            .with(lookup::GetUserStatus)
     }
 
     /// Applies account-safety limits to every send a tool makes.
@@ -216,13 +240,18 @@ mod tests {
         match prop["format"].as_str() {
             Some("signal-recipient" | "signal-service-id") => json!(sid(2).to_string()),
             Some("signal-group-id") => json!("ab".repeat(32)),
+            Some("signal-sticker-pack") => json!("ab".repeat(16)),
+            Some("e164") => json!("+15550000002"),
             Some("iso-datetime") => json!("2024-01-01T00:00:00Z"),
             Some(other) => panic!("{name}: no sample for format \"{other}\"; add one here"),
             None => match prop["type"].as_str() {
                 Some("string") => json!("x"),
                 Some("integer") => prop["minimum"].clone(),
                 Some("boolean") => json!(true),
-                Some("array") => json!([sample(&format!("{name}[]"), &prop["items"])]),
+                Some("array") => {
+                    let min = prop["minItems"].as_u64().unwrap_or(1) as usize;
+                    json!(vec![sample(&format!("{name}[]"), &prop["items"]); min])
+                }
                 Some("object") => Value::Object(object_probes(name, prop).0),
                 other => panic!("{name}: no sample for type {other:?}; add one here"),
             },
@@ -266,6 +295,23 @@ mod tests {
                         bad.extend(malformed_ids);
                         bad.push(json!(sid(2).to_string()));
                     }
+                    // A well-formed stranger's number is valid here, unlike in
+                    // a contact field, so only malformed numbers are refused.
+                    Some("e164") => bad.extend([
+                        json!("not-an-id"),
+                        json!("+"),
+                        json!("+1"),
+                        json!("15550000002"),
+                        json!("+1555000000a"),
+                        json!("+1234567890123456"),
+                        json!(sid(2).to_string()),
+                    ]),
+                    Some("signal-sticker-pack") => bad.extend([
+                        json!("g".repeat(32)),
+                        json!("ab".repeat(15)),
+                        json!("ab".repeat(32)),
+                        json!(sid(2).to_string()),
+                    ]),
                     Some("iso-datetime") => bad.extend([
                         json!("yesterday"),
                         json!("2024-13-01"),
@@ -295,19 +341,25 @@ mod tests {
             Some("boolean") => bad.extend([json!("true"), json!(1)]),
             // An empty array is already refused above, so arrays must not be empty.
             Some("array") => {
-                let (Some(1..), Some(max)) = (prop["minItems"].as_u64(), prop["maxItems"].as_u64())
+                let (Some(min @ 1..), Some(max)) =
+                    (prop["minItems"].as_u64(), prop["maxItems"].as_u64())
                 else {
                     panic!(
                         "{name}: array properties must declare minItems >= 1 and maxItems: {prop}"
                     );
                 };
                 let item = sample(&format!("{name}[]"), &prop["items"]);
-                let too_many = vec![item; max as usize + 1];
+                let too_few = vec![item.clone(); min as usize - 1];
+                let too_many = vec![item.clone(); max as usize + 1];
                 bad.extend([json!("x"), json!(1), json!(true), json!(too_many)]);
+                if !too_few.is_empty() {
+                    bad.push(json!(too_few.clone()));
+                }
+                // One bad item among valid ones, so the item itself is what's refused.
                 bad.extend(
                     bad_values(&format!("{name}[]"), &prop["items"])
                         .into_iter()
-                        .map(|v| json!([v])),
+                        .map(|v| json!([vec![v], too_few.clone()].concat())),
                 );
             }
             Some("object") => {
