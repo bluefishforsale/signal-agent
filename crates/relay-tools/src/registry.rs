@@ -5,7 +5,7 @@ use std::sync::Arc;
 use relay_core::prelude::*;
 use serde_json::Value;
 
-use crate::{Tool, ToolContext, ToolError, mutate, read, send};
+use crate::{Tool, ToolContext, ToolError, directory, mutate, read, send};
 
 /// The set of tools a profile serves.
 #[derive(Clone, Default)]
@@ -33,6 +33,10 @@ impl Registry {
             .with(mutate::EditMessage)
             .with(mutate::DeleteMessage)
             .with(mutate::DeleteGroupMessage)
+            .with(directory::ListContacts)
+            .with(directory::ListGroups)
+            .with(directory::ListAttachments)
+            .with(directory::GetAttachment)
     }
 
     pub fn with(mut self, tool: impl Tool + 'static) -> Self {
@@ -103,15 +107,6 @@ mod tests {
 
     /// Tools the boundary sweep can't call meaningfully with probe inputs, and why.
     const EXCLUDED: &[&str] = &[];
-
-    /// Tools that act on a stored message and must refuse one the store doesn't
-    /// hold. The sweep's store is empty, so their sample input is refused too.
-    const NEEDS_STORED_TARGET: &[&str] = &[
-        "react_to_message",
-        "edit_message",
-        "delete_message",
-        "delete_group_message",
-    ];
 
     struct Sender;
 
@@ -294,14 +289,43 @@ mod tests {
         bad
     }
 
+    /// Stores the messages a tool's sample input can name, so tools that act
+    /// on a stored message (react, edit, delete) take their valid path on the
+    /// sample: one from this account and one from the sample contact, both at
+    /// the smallest timestamp, in the sample's conversation.
+    // NOTE: the conversation must follow the sample. This account's message at
+    // that timestamp can exist only once, and a group tool needs it in the
+    // group while a DM tool needs it in the DM.
+    async fn seed(ctx: &ToolContext, sample: &serde_json::Map<String, Value>) {
+        let conversation = match sample.get("group_id").and_then(Value::as_str) {
+            Some(g) => Recipient::Group(GroupId::parse(g).expect("sample group id")),
+            None => Recipient::Contact(sid(2)),
+        };
+        for (author, from_me) in [(sid(ME), true), (sid(2), false)] {
+            let message = Message {
+                id: MessageId {
+                    author,
+                    sent_at_ms: 1,
+                },
+                conversation,
+                sender: author,
+                from_me,
+                ..incoming(2, 1, "sample target")
+            };
+            ctx.store.insert(&message).await.expect("seed store");
+        }
+    }
+
     /// Calls `tool` on a fresh full-access primary profile in its own task, so
     /// a panic is reported against the tool and input that caused it.
     async fn probe(
         registry: &Registry,
         tool: &str,
+        sample: &serde_json::Map<String, Value>,
         input: Value,
     ) -> (Result<Value, ToolError>, usize) {
         let (ctx, signal) = ctx(AccessMode::Full, ProfileKind::Primary);
+        seed(&ctx, sample).await;
         let (registry, name, sent_input) = (registry.clone(), tool.to_owned(), input.clone());
         let task = tokio::spawn(async move { registry.call(&ctx, &name, sent_input).await });
         match task.await {
@@ -339,18 +363,11 @@ mod tests {
                 .map(|(k, p)| (k.clone(), sample(&format!("{name}.{k}"), p)))
                 .collect();
 
-            let (result, sent) = probe(&registry, name, Value::Object(valid.clone())).await;
-            if NEEDS_STORED_TARGET.contains(&name) {
-                assert!(
-                    matches!(result, Err(ToolError::InvalidInput(_))) && sent == 0,
-                    "{name} acted on a target the empty store doesn't hold: {result:?}, {sent} sent"
-                );
-            } else {
-                assert!(
-                    !matches!(result, Err(ToolError::InvalidInput(_))),
-                    "{name} refused its own schema's sample input {valid:?}: {result:?}"
-                );
-            }
+            let (result, _) = probe(&registry, name, &valid, Value::Object(valid.clone())).await;
+            assert!(
+                !matches!(result, Err(ToolError::InvalidInput(_))),
+                "{name} refused its own schema's sample input {valid:?}: {result:?}"
+            );
 
             let mut probes = vec![];
             let mut unknown = valid.clone();
@@ -373,7 +390,7 @@ mod tests {
             }
             for input in probes {
                 let input = Value::Object(input);
-                let (result, sent) = probe(&registry, name, input.clone()).await;
+                let (result, sent) = probe(&registry, name, &valid, input.clone()).await;
                 assert!(
                     matches!(result, Err(ToolError::InvalidInput(_))),
                     "{name} did not refuse {input} as invalid: {result:?}"

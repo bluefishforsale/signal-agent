@@ -1,11 +1,11 @@
 //! Where each profile's files live on each OS. Every crate resolves paths here,
 //! so the agent, the shim, setup and uninstall can never disagree about them.
 
-use std::path::PathBuf;
+use std::{fs, path::PathBuf};
 
 use anyhow::Context;
 
-use crate::ProfileName;
+use crate::{AccessMode, ProfileName};
 
 /// The on-disk locations for one profile.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -33,6 +33,28 @@ impl ProfilePaths {
             agent_log: root.join("agent.log"),
             root,
         }
+    }
+
+    /// Saves the user's access choice where the agent reads it at start.
+    pub fn save_access(&self, access: AccessMode) -> anyhow::Result<()> {
+        fs::create_dir_all(&self.root)
+            .with_context(|| format!("unable to create \"{}\"", self.root.display()))?;
+        let path = self.access_file();
+        let json = serde_json::to_string(&access)?;
+        fs::write(&path, json).with_context(|| format!("unable to save \"{}\"", path.display()))
+    }
+
+    /// The access choice setup saved.
+    pub fn load_access(&self) -> anyhow::Result<AccessMode> {
+        let path = self.access_file();
+        let json = fs::read_to_string(&path)
+            .with_context(|| format!("unable to read \"{}\"", path.display()))?;
+        serde_json::from_str(&json)
+            .with_context(|| format!("\"{}\" is not an access mode", path.display()))
+    }
+
+    fn access_file(&self) -> PathBuf {
+        self.root.join("access.json")
     }
 
     /// The agent's local endpoint: a Unix socket in the profile directory, or on

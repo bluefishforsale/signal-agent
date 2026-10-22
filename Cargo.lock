@@ -4707,12 +4707,18 @@ name = "relay-setup"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "dirs",
+ "futures",
  "proptest",
  "relay-core",
+ "relay-secrets",
+ "relay-signal",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -4757,6 +4763,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "relay-core",
  "relay-signal",
  "relay-store",
@@ -5379,12 +5386,21 @@ name = "signal-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
+ "futures",
+ "qrcode",
  "relay-agent",
  "relay-core",
  "relay-mcp",
+ "relay-secrets",
+ "relay-setup",
+ "relay-signal",
+ "tempfile",
  "tokio",
+ "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
