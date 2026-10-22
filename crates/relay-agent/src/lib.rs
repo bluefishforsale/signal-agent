@@ -64,9 +64,13 @@ impl Agent {
         self
     }
 
-    /// Posts every newly captured message for `profile` to `url`.
+    /// Posts every newly captured message for `profile` to `url`. Without a
+    /// working HTTP client it logs why and captures without posting.
     pub fn with_webhook(mut self, profile: ProfileName, url: WebhookUrl) -> Self {
-        self.webhook = Some(capture::Webhook::new(profile, url));
+        match capture::Webhook::new(profile, url) {
+            Ok(webhook) => self.webhook = Some(webhook),
+            Err(e) => tracing::warn!("no webhook: {e:#}"),
+        }
         self
     }
 

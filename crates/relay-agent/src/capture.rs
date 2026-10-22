@@ -1,24 +1,58 @@
 //! Continuous capture: everything Signal delivers lands in the store whether or
 //! not any Claude app is connected, so history is complete when one asks.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
-use anyhow::bail;
+use anyhow::{Context, bail};
 use futures::StreamExt;
-use relay_core::ProfileName;
+use relay_core::{Message, ProfileName};
 use relay_signal::{Incoming, SignalBackend};
 use relay_store::MessageStore;
 use relay_tools::WebhookUrl;
+use serde_json::json;
+
+/// How long a webhook POST may take before it's abandoned.
+const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Where newly captured messages are posted, for one profile.
 pub(crate) struct Webhook {
     profile: ProfileName,
     pub(crate) url: WebhookUrl,
+    client: reqwest::Client,
 }
 
 impl Webhook {
-    pub(crate) fn new(profile: ProfileName, url: WebhookUrl) -> Self {
-        Self { profile, url }
+    pub(crate) fn new(profile: ProfileName, url: WebhookUrl) -> anyhow::Result<Self> {
+        // reqwest is built without a bundled crypto provider, so the process
+        // needs one; an error here means one is already installed.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = reqwest::Client::builder()
+            .timeout(WEBHOOK_TIMEOUT)
+            .build()
+            .context("unable to build the webhook client")?;
+        Ok(Self {
+            profile,
+            url,
+            client,
+        })
+    }
+
+    /// Posts `message` in the background, best effort.
+    // NOTE: spawned, never awaited. A slow or dead receiver must not hold up
+    // capture, or messages would back up behind it and be lost at shutdown.
+    fn post(&self, message: &Message) {
+        let request = self.client.post(self.url.as_url().clone()).json(&json!({
+            "event": "message",
+            "profile": self.profile.to_string(),
+            "message": message,
+        }));
+        let url = self.url.clone();
+        tokio::spawn(async move {
+            let sent = request.send().await.and_then(|r| r.error_for_status());
+            if let Err(e) = sent {
+                tracing::warn!("webhook {url} missed a message: {e}");
+            }
+        });
     }
 }
 
@@ -31,7 +65,7 @@ pub(crate) async fn run(
     let mut events = signal.incoming();
     while let Some(event) = events.next().await {
         let result = match event {
-            Ok(event) => apply(signal.as_ref(), store.as_ref(), event).await,
+            Ok(event) => apply(signal.as_ref(), store.as_ref(), webhook.as_ref(), event).await,
             Err(e) => Err(e),
         };
         // NOTE: one bad event (a forged edit, a delete for a message we never saw)
@@ -45,6 +79,7 @@ pub(crate) async fn run(
 async fn apply(
     signal: &dyn SignalBackend,
     store: &dyn MessageStore,
+    webhook: Option<&Webhook>,
     event: Incoming,
 ) -> anyhow::Result<()> {
     match event {
@@ -58,7 +93,13 @@ async fn apply(
                     message.id.author
                 );
             }
-            store.insert(&message).await.map(|_| ())
+            // A webhook only hears of messages the store took, never a
+            // duplicate or one it refused.
+            let inserted = store.insert(&message).await?;
+            if let (true, Some(webhook)) = (inserted, webhook) {
+                webhook.post(&message);
+            }
+            Ok(())
         }
         Incoming::Edit {
             target, from, body, ..
@@ -393,6 +434,168 @@ mod tests {
         assert!(
             kept.is_some_and(|m| !m.deleted),
             "a non-admin's delete was applied"
+        );
+    }
+
+    /// A webhook receiver on loopback that hands each request body to the
+    /// test, and answers only when `answer` is true.
+    async fn receiver(answer: bool) -> (WebhookUrl, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}/hook", listener.local_addr().expect("addr"));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut conn, _)) = listener.accept().await else {
+                    return;
+                };
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let body = loop {
+                        let Ok(n) = conn.read(&mut chunk).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        let text = String::from_utf8_lossy(&buf).into_owned();
+                        let Some((head, body)) = text.split_once("\r\n\r\n") else {
+                            continue;
+                        };
+                        let length = head
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                k.eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        if body.len() >= length {
+                            break format!("{}\n{body}", head.lines().next().unwrap_or(""));
+                        }
+                    };
+                    let _ = tx.send(body);
+                    if !answer {
+                        std::future::pending::<()>().await;
+                    }
+                    let _ = conn
+                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                        .await;
+                });
+            }
+        });
+        (WebhookUrl::parse(&url).expect("loopback url"), rx)
+    }
+
+    /// Every message the store accepted is posted to the user's webhook,
+    /// named with its profile, in the shape the contract fixes.
+    #[tokio::test]
+    async fn a_captured_message_is_posted_to_the_webhook() {
+        let (url, mut posts) = receiver(true).await;
+        let signal = fake();
+        let store = Arc::new(MemoryStore::default());
+        let webhook = Webhook::new(ProfileName::default_profile(), url).expect("client");
+        let capture = tokio::spawn(run(signal.clone(), store.clone(), Some(webhook)));
+        let message = msg(2, 10, "hello hook");
+        signal.push(Incoming::Message(message.clone()));
+        let post = tokio::time::timeout(std::time::Duration::from_secs(5), posts.recv())
+            .await
+            .expect("no POST within 5 s")
+            .expect("receiver alive");
+        capture.abort();
+        let (request_line, body) = post.split_once('\n').expect("request line");
+        assert!(request_line.starts_with("POST /hook "), "{request_line}");
+        let body: serde_json::Value = serde_json::from_str(body).expect("json body");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "event": "message",
+                "profile": ProfileName::default_profile().to_string(),
+                "message": serde_json::to_value(&message).expect("message json"),
+            })
+        );
+    }
+
+    /// A webhook must never see a message the store refused: a redelivered
+    /// duplicate is posted once, and a forged one not at all.
+    #[tokio::test]
+    async fn a_message_the_store_refused_is_never_posted() {
+        let (url, mut posts) = receiver(true).await;
+        let signal = fake();
+        let store = Arc::new(MemoryStore::default());
+        let webhook = Webhook::new(ProfileName::default_profile(), url).expect("client");
+        let capture = tokio::spawn(run(signal.clone(), store.clone(), Some(webhook)));
+        let first = msg(2, 10, "once");
+        signal.push(Incoming::Message(first.clone()));
+        signal.push(Incoming::Message(first));
+        let mut forged = msg(2, 11, "forged");
+        forged.sender = ServiceId::new(Uuid::from_u128(666));
+        signal.push(Incoming::Message(forged));
+        signal.push(Incoming::Message(msg(2, 12, "marker")));
+        let mut bodies = vec![];
+        while bodies.len() < 2 {
+            let post = tokio::time::timeout(std::time::Duration::from_secs(5), posts.recv())
+                .await
+                .expect("posts stopped arriving")
+                .expect("receiver alive");
+            bodies.push(post);
+        }
+        // Anything still in flight had as long as the marker to arrive.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        while let Ok(post) = posts.try_recv() {
+            bodies.push(post);
+        }
+        capture.abort();
+        let texts: Vec<_> = bodies
+            .iter()
+            .map(|b| {
+                let json: serde_json::Value =
+                    serde_json::from_str(b.split_once('\n').expect("line").1).expect("json");
+                json["message"]["body"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect();
+        let mut sorted = texts.clone();
+        sorted.sort();
+        assert_eq!(sorted, ["marker", "once"], "posted: {texts:?}");
+    }
+
+    /// A receiver that never answers must not hold capture up: later
+    /// messages still land in the store right away.
+    #[tokio::test]
+    async fn a_webhook_that_never_answers_does_not_stall_capture() {
+        let (url, _posts) = receiver(false).await;
+        let signal = fake();
+        let store = Arc::new(MemoryStore::default());
+        let webhook = Webhook::new(ProfileName::default_profile(), url).expect("client");
+        let capture = tokio::spawn(run(signal.clone(), store.clone(), Some(webhook)));
+        for n in 0..5 {
+            signal.push(Incoming::Message(msg(2, 10 + n, "stuck")));
+        }
+        let stored = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let all = store
+                    .history(msg(2, 0, "").conversation, None, 10)
+                    .await
+                    .expect("history");
+                if all.len() == 5 {
+                    return all;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        capture.abort();
+        assert!(
+            stored.is_ok(),
+            "capture stalled behind an unanswered webhook"
         );
     }
 
