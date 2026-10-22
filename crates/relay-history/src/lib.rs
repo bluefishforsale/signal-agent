@@ -1,13 +1,14 @@
 //! Getting messages from before this device was linked into the store.
 //!
 //! Link-and-sync (the phone's history transfer at link time) is the primary
-//! source; its API is decided by the lane L7 spike and added here then.
-//! Signal Desktop import is an opt-in extra, never required.
+//! source. Signal Desktop import is an opt-in extra, never required.
 
-use std::path::Path;
+mod desktop;
+mod desktop_key;
+mod link_and_sync;
 
-use anyhow::bail;
-use relay_store::MessageStore;
+pub use desktop::import_signal_desktop;
+pub use link_and_sync::{LinkAndSyncKey, import_link_and_sync};
 
 /// How far an import has got.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -16,15 +17,16 @@ pub struct ImportProgress {
     pub total: Option<u64>,
 }
 
-/// Imports Signal Desktop's history from `signal_dir` into `store`, returning
-/// how many messages were new.
-pub fn import_signal_desktop(
-    signal_dir: &Path,
-    _store: &dyn MessageStore,
-    _progress: &mut dyn FnMut(ImportProgress),
-) -> anyhow::Result<u64> {
-    bail!(
-        "Signal Desktop import from {} is not implemented yet (lane L7)",
-        signal_dir.display()
-    )
+/// What an import wrote and what it had to leave out.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ImportSummary {
+    pub imported: u64,
+    pub skipped: u64,
+    pub already_stored: u64,
+}
+
+/// Given and family name joined, or None if both are empty.
+fn full_name(parts: [&str; 2]) -> Option<String> {
+    let parts: Vec<_> = parts.into_iter().filter(|p| !p.is_empty()).collect();
+    (!parts.is_empty()).then(|| parts.join(" "))
 }
