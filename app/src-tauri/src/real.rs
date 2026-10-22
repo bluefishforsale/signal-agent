@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use relay_core::prelude::*;
 use relay_secrets::StoreKey;
 use relay_setup::{
-    AgentKeys,
+    AgentKeys, SetupLock, StoreLock,
     claude::{Clients, ServerEntry},
     driver::{Driver, HistorySkip, LoginItem, OpenProvisioner, Services},
     history::{LinkAndSync, ProfileStore, SignalDesktop},
@@ -78,24 +78,25 @@ pub fn remove(profile: &ProfileName, delete_data: bool) -> anyhow::Result<Vec<St
     Ok(run_steps(steps))
 }
 
-/// How long an agent gets to stop once nothing may start it: the supervisor
-/// notices within ten seconds and gives it ten more to close its stores.
+/// How long an agent gets to stop: it checks for setup's lock every two
+/// seconds, then closes its stores.
 const AGENT_STOP_WAIT: Duration = Duration::from_secs(30);
 
-/// Waits up to `limit` for `profile`'s agent to stop answering on its
-/// endpoint. Call from a blocking thread of the async runtime.
+/// Waits up to `limit` for `profile`'s agent to let go of its stores,
+/// holding setup's lock meanwhile so the agent stops and nothing starts one.
+// NOTE: both locks are let go of before the profile folder is deleted, since
+// Windows can't delete a folder with an open file; the access choice is gone
+// by then, so nothing starts the agent again.
 fn agent_stopped(
     profile: &ProfileName,
     paths: &ProfilePaths,
     limit: Duration,
 ) -> anyhow::Result<()> {
-    let endpoint = relay_agent::endpoint::name(profile, paths)?;
-    let runtime = tokio::runtime::Handle::current();
+    let Some(_setup) = SetupLock::try_acquire(paths)? else {
+        bail!("setup is running on \"{profile}\"; finish or close it first");
+    };
     let deadline = Instant::now() + limit;
-    while runtime
-        .block_on(relay_agent::endpoint::connect(&endpoint))
-        .is_ok()
-    {
+    while StoreLock::try_acquire(paths)?.is_none() {
         if Instant::now() >= deadline {
             bail!(
                 "the agent for \"{profile}\" is still running after {} seconds",
@@ -265,28 +266,43 @@ mod tests {
     }
 
     /// Removing an account deletes its files only after its agent lets go of
-    /// them, so the wait must fail while the agent still answers and succeed
-    /// once it has gone.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn waiting_for_an_agent_fails_while_it_answers_and_ends_when_it_goes() {
+    /// them. Any agent, even one the stdio shim started outside the
+    /// supervisor, lets go when it sees setup's lock, so the wait must hold
+    /// that lock and return only once the store lock is free.
+    #[test]
+    fn waiting_for_an_agent_holds_the_setup_lock_until_the_agent_lets_go() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let profile = ProfileName::new(format!("removal-{}", std::process::id())).expect("name");
+        let profile = ProfileName::new("bot").expect("name");
         let paths = ProfilePaths::under(dir.path().to_path_buf(), &profile);
-        std::fs::create_dir_all(&paths.root).expect("profile dir");
-        let endpoint = relay_agent::endpoint::name(&profile, &paths).expect("endpoint");
-        let listener = relay_agent::endpoint::Listener::bind(&endpoint)
-            .await
-            .expect("bind");
+        let stores = relay_setup::StoreLock::try_acquire(&paths)
+            .expect("lock")
+            .expect("free");
+        let agent_paths = paths.clone();
+        let agent = std::thread::spawn(move || {
+            while !relay_setup::setup_running(&agent_paths) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            drop(stores);
+        });
 
-        let wait = |limit| {
-            let (profile, paths) = (profile.clone(), paths.clone());
-            tokio::task::spawn_blocking(move || agent_stopped(&profile, &paths, limit))
-        };
-        let running = wait(Duration::from_millis(600)).await.expect("join");
-        assert!(running.is_err(), "returned while the agent answered");
-        drop(listener);
-        let gone = wait(Duration::from_secs(5)).await.expect("join");
-        assert!(gone.is_ok(), "{gone:?}");
+        let waited = agent_stopped(&profile, &paths, Duration::from_secs(5));
+        assert!(waited.is_ok(), "{waited:?}");
+        agent.join().expect("stand-in agent");
+    }
+
+    /// An agent that never lets go must fail the wait, so removal stops
+    /// before deleting anything under it.
+    #[test]
+    fn waiting_for_an_agent_that_never_lets_go_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let profile = ProfileName::new("bot").expect("name");
+        let paths = ProfilePaths::under(dir.path().to_path_buf(), &profile);
+        let _stores = relay_setup::StoreLock::try_acquire(&paths)
+            .expect("lock")
+            .expect("free");
+
+        let waited = agent_stopped(&profile, &paths, Duration::from_millis(300));
+        assert!(waited.is_err(), "returned while the agent held the stores");
     }
 
     /// The window drives relay-setup's own driver: a scan on the phone must
