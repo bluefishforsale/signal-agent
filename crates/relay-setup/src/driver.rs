@@ -879,10 +879,15 @@ mod tests {
         );
         assert!(crate::setup_running(&paths), "setup let go before quitting");
         drop(h);
-        assert!(
-            !crate::setup_running(&paths),
-            "a closed setup kept the profile"
-        );
+        // A parallel test's spawn can share the lock's descriptor for an
+        // instant after it is let go.
+        let released = (0..100).any(|_| {
+            !crate::setup_running(&paths) || {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                false
+            }
+        });
+        assert!(released, "a closed setup kept the profile");
     }
 
     /// The login item runs only the profiles in the registry, so a profile

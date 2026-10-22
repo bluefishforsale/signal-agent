@@ -366,6 +366,18 @@ pub(crate) mod tests {
         }
     }
 
+    /// Whether `check` holds within a second. A lock let go of can stay held
+    /// for an instant longer: a process a parallel test is spawning shares
+    /// its descriptor until it execs.
+    fn soon(check: impl Fn() -> bool) -> bool {
+        (0..100).any(|_| {
+            check() || {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                false
+            }
+        })
+    }
+
     pub(crate) fn fake_signal() -> Arc<FakeSignal> {
         Arc::new(FakeSignal::new(Account {
             service_id: ServiceId::new(Uuid::from_u128(1)),
@@ -521,7 +533,10 @@ pub(crate) mod tests {
         };
         assert!(format!("{e:#}").contains("setup"), "{e:#}");
         drop(setup);
-        claim_stores(&config).expect("free once setup is done");
+        assert!(
+            soon(|| claim_stores(&config).is_ok()),
+            "not free once setup is done"
+        );
     }
 
     /// A profile whose setup stopped before linking has a key but no account.
