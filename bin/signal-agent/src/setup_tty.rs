@@ -66,10 +66,14 @@ async fn drive(
                 }
                 SetupEvent::RestartDesktop
             }
-            state => match ask(state, input, out)? {
-                Some(event) => event,
-                None => return Ok(()),
-            },
+            state => {
+                // A failed restart retries back to done, which offers it again.
+                offered_restart &= !matches!(state, SetupState::Failed { .. });
+                match ask(state, input, out)? {
+                    Some(event) => event,
+                    None => return Ok(()),
+                }
+            }
         };
         let mut failed = None;
         driver
@@ -645,36 +649,41 @@ mod tests {
         }
     }
 
+    /// Runs setup in `dir` against fakes, answering from `answers`.
+    async fn run_scripted(dir: &Path, clients: Clients, answers: &str) -> (Driver, String) {
+        let profile = ProfileName::default_profile();
+        let server =
+            ServerEntry::for_profile(&profile, &dir.join("signal-agent"), ["mcp"]).expect("entry");
+        let services = Services {
+            signal: Box::new(Phone),
+            secrets: Box::new(KeyFile::default()),
+            history: Box::new(NoHistoryYet),
+            login: Box::new(Agent),
+            clients,
+        };
+        let paths = ProfilePaths::under(dir.to_path_buf(), &profile);
+        let mut driver = Driver::new(SetupState::start("box"), profile, paths, server, services);
+        let mut input = io::Cursor::new(answers.to_owned());
+        let mut out = Vec::new();
+        drive(&mut driver, &mut input, &mut out)
+            .await
+            .expect("setup");
+        (driver, String::from_utf8(out).expect("utf-8"))
+    }
+
     /// A headless box over SSH, start to finish from typed answers: the key
     /// file caveat comes before anything is stored, the QR code is drawn, the
     /// access question defaults to yes, and done says no Claude app was found.
     #[tokio::test]
     async fn a_headless_link_runs_from_typed_answers_to_done() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let profile = ProfileName::default_profile();
-        let server = ServerEntry::for_profile(&profile, &dir.path().join("signal-agent"), ["mcp"])
-            .expect("entry");
-        let services = Services {
-            signal: Box::new(Phone),
-            secrets: Box::new(KeyFile::default()),
-            history: Box::new(NoHistoryYet),
-            login: Box::new(Agent),
-            clients: Clients::new(
-                relay_setup::claude::Platform::Linux,
-                Box::new(NoClaude),
-                None,
-                None,
-            ),
-        };
-        let paths = ProfilePaths::under(dir.path().to_path_buf(), &profile);
-        let mut driver = Driver::new(SetupState::start("box"), profile, paths, server, services);
-        let mut input = io::Cursor::new("\n\n");
-        let mut out = Vec::new();
-        drive(&mut driver, &mut input, &mut out)
-            .await
-            .expect("setup");
-
-        let out = String::from_utf8(out).expect("utf-8");
+        let clients = Clients::new(
+            relay_setup::claude::Platform::Linux,
+            Box::new(NoClaude),
+            None,
+            None,
+        );
+        let (driver, out) = run_scripted(dir.path(), clients, "\n\n").await;
         assert!(
             out.starts_with("Note: no keyring here"),
             "caveat not shown first: {out}"
@@ -695,5 +704,61 @@ mod tests {
                 .expect("access saved"),
             "\"full\""
         );
+    }
+
+    /// Claude Desktop on macOS: osascript quits it, and fails the first time.
+    #[derive(Default)]
+    struct FlakyDesktop(std::sync::Mutex<u32>);
+
+    impl relay_setup::claude::Runner for FlakyDesktop {
+        fn run(
+            &self,
+            program: &Path,
+            _: &[String],
+        ) -> anyhow::Result<relay_setup::claude::RunOutput> {
+            let mut quits = self.0.lock().expect("quits");
+            if program == Path::new("osascript") {
+                *quits += 1;
+            }
+            Ok(relay_setup::claude::RunOutput {
+                success: *quits != 1,
+                ..Default::default()
+            })
+        }
+    }
+
+    /// A failed Claude Desktop restart, retried, must offer the restart again
+    /// rather than end setup with Desktop still running its old config.
+    #[tokio::test]
+    async fn a_failed_desktop_restart_is_offered_again_after_retry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let desktop = dir.path().join("Claude");
+        std::fs::create_dir_all(&desktop).expect("desktop dir");
+        let runner = std::sync::Arc::new(FlakyDesktop::default());
+        let clients = Clients::new(
+            relay_setup::claude::Platform::MacOs,
+            Box::new(Shared(runner.clone())),
+            None,
+            Some(desktop),
+        );
+        let (_, out) = run_scripted(dir.path(), clients, "\n\n\n\n\n").await;
+        assert_eq!(
+            out.matches("Restart Claude Desktop now").count(),
+            2,
+            "{out}"
+        );
+        assert_eq!(*runner.0.lock().expect("quits"), 2, "{out}");
+    }
+
+    struct Shared(std::sync::Arc<FlakyDesktop>);
+
+    impl relay_setup::claude::Runner for Shared {
+        fn run(
+            &self,
+            program: &Path,
+            args: &[String],
+        ) -> anyhow::Result<relay_setup::claude::RunOutput> {
+            self.0.run(program, args)
+        }
     }
 }
