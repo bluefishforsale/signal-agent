@@ -44,19 +44,38 @@ impl Webhook {
     /// Posts `message` in the background, best effort.
     // NOTE: spawned, never awaited. A slow or dead receiver must not hold up
     // capture, or messages would back up behind it and be lost at shutdown.
-    fn post(&self, message: &Message) {
-        let request = self.client.post(self.url.as_url().clone()).json(&json!({
-            "event": "message",
-            "profile": self.profile.to_string(),
-            "message": message,
-        }));
-        let url = self.url.clone();
+    fn post(self: &Arc<Self>, message: &Message) {
+        let (webhook, message) = (self.clone(), message.clone());
         tokio::spawn(async move {
-            let sent = request.send().await.and_then(|r| r.error_for_status());
-            if let Err(e) = sent {
-                tracing::warn!("webhook {url} missed a message: {e}");
+            if let Some(failure) = webhook.deliver(&message).await {
+                tracing::warn!("{failure}");
             }
         });
+    }
+
+    /// Posts `message` and returns the line to log if it wasn't accepted.
+    // NOTE: the URL may carry a token and the body is the message, so the log
+    // line names the redacted URL only, and reqwest's error loses its URL.
+    async fn deliver(&self, message: &Message) -> Option<String> {
+        let sent = self
+            .client
+            .post(self.url.as_url().clone())
+            .json(&json!({
+                "event": "message",
+                "profile": self.profile.to_string(),
+                "message": message,
+            }))
+            .send()
+            .await;
+        let why = match sent {
+            Ok(response) if response.status().is_success() => return None,
+            Ok(response) => format!("it answered {}", response.status()),
+            Err(e) => e.without_url().to_string(),
+        };
+        Some(format!(
+            "webhook {} missed a message: {why}",
+            self.url.redacted()
+        ))
     }
 }
 
@@ -66,6 +85,7 @@ pub(crate) async fn run(
     store: Arc<dyn MessageStore>,
     webhook: Option<Webhook>,
 ) {
+    let webhook = webhook.map(Arc::new);
     let mut events = signal.incoming();
     while let Some(event) = events.next().await {
         let result = match event {
@@ -83,7 +103,7 @@ pub(crate) async fn run(
 async fn apply(
     signal: &dyn SignalBackend,
     store: &dyn MessageStore,
-    webhook: Option<&Webhook>,
+    webhook: Option<&Arc<Webhook>>,
     event: Incoming,
 ) -> anyhow::Result<()> {
     match event {
@@ -468,6 +488,47 @@ mod tests {
             followed.is_err(),
             "the redirect target received {followed:?}"
         );
+    }
+
+    /// A failed delivery is logged, but a token in the webhook's query or
+    /// userinfo, and the message itself, must never reach the log file. A
+    /// redirect answer counts as a failure, since it isn't followed.
+    #[tokio::test]
+    async fn a_failed_delivery_logs_neither_the_token_nor_the_message() {
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = closed.local_addr().expect("addr").port();
+        drop(closed);
+        let (redirecting, _posts) = receiver(Some(
+            "HTTP/1.1 307 Temporary Redirect\r\nlocation: http://127.0.0.1:1/\r\ncontent-length: 0\r\n\r\n"
+                .into(),
+        ))
+        .await;
+        let redirecting = redirecting.as_url();
+        let urls = [
+            format!("http://user:SECRET@127.0.0.1:{port}/hook?token=SECRET"),
+            format!(
+                "http://user:SECRET@127.0.0.1:{}/hook?token=SECRET",
+                redirecting.port().expect("port")
+            ),
+        ];
+        for url in urls {
+            let url = WebhookUrl::parse(&url).expect("url");
+            let webhook = Webhook::new(ProfileName::default_profile(), url).expect("client");
+            let logged = webhook
+                .deliver(&msg(2, 10, "BODYTEXT"))
+                .await
+                .expect("a failed delivery must be logged");
+            assert!(
+                !logged.contains("SECRET") && !logged.contains("BODYTEXT"),
+                "leaked into the log: {logged}"
+            );
+            assert!(
+                logged.contains("127.0.0.1"),
+                "log doesn't say where: {logged}"
+            );
+        }
     }
 
     /// A webhook receiver on loopback that hands each request body to the
