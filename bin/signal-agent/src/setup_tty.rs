@@ -328,18 +328,8 @@ fn parse_number(answer: &str) -> Result<String, &'static str> {
 /// The token Signal needs, from a pasted `signalcaptcha://` link or the bare
 /// token people copy out of it.
 fn parse_captcha(answer: &str) -> Result<String, &'static str> {
-    let token = if answer.starts_with("signalcaptcha://") {
-        relay_setup::captcha_token(answer).ok_or("That link has no token; copy it again.")?
-    } else if answer.starts_with("signal-") {
-        answer.to_owned()
-    } else {
-        return Err("Paste the whole link; it starts with signalcaptcha://.");
-    };
-    // A paste wrapped across lines over SSH leaves a space inside the token.
-    if token.contains(char::is_whitespace) {
-        return Err("That link looks cut off; copy it again.");
-    }
-    Ok(token)
+    relay_setup::pasted_captcha_token(answer)
+        .ok_or("That isn't a whole captcha link or token; copy the link again.")
 }
 
 /// The verification code, accepting the dash Signal's SMS shows in it.
