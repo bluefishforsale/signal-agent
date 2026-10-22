@@ -4,5 +4,5 @@
 mod http;
 mod stdio;
 
-pub use http::{Grant, HttpSettings, Listener, Tls, TlsFiles, Tokens, serve};
+pub use http::{Grant, HttpSettings, Listener, Tls, TlsFiles, Tokens, run_http, serve};
 pub use stdio::run_stdio;

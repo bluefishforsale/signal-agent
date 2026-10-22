@@ -10,11 +10,33 @@ mod tokens;
 use std::{fs, path::Path};
 
 use anyhow::Context;
+use relay_core::{ProfileName, ProfilePaths};
 
 pub use server::{Listener, serve};
 pub use settings::{HttpSettings, TlsFiles};
 pub use tls::Tls;
 pub use tokens::{Grant, Tokens};
+
+/// Serves the profile's HTTP endpoint through its agent, if the user turned
+/// it on; otherwise returns at once.
+pub async fn run_http(profile: &ProfileName, paths: &ProfilePaths) -> anyhow::Result<()> {
+    let settings = HttpSettings::load(paths)?;
+    if !settings.enabled {
+        return Ok(());
+    }
+    let (addr, tls) = settings.listen_on(paths)?;
+    let scheme = if tls.is_some() { "https" } else { "http" };
+    let listener = Listener::bind(addr, tls.as_ref().map(|t| t.config.clone())).await?;
+    match &tls {
+        Some(tls) => tracing::info!(
+            "serving MCP at {scheme}://{addr}/mcp, certificate SHA-256 {}",
+            tls.fingerprint
+        ),
+        None => tracing::info!("serving MCP at {scheme}://{addr}/mcp"),
+    }
+    let agent = relay_agent::endpoint::name(profile, paths)?;
+    serve(listener, Tokens::of(paths), agent).await
+}
 
 /// Writes `bytes` to `path` readable only by the current user.
 fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {

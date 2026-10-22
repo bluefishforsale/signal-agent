@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, anyhow, bail};
-use relay_core::AccessMode;
+use relay_core::{AccessMode, ProfilePaths};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -34,6 +34,11 @@ struct Saved {
 }
 
 impl Tokens {
+    /// The profile's tokens.
+    pub fn of(paths: &ProfilePaths) -> Self {
+        Self::at(&paths.root.join("http_tokens.json"))
+    }
+
     pub fn at(path: &Path) -> Self {
         Self {
             path: path.to_owned(),
