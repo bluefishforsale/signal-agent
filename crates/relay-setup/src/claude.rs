@@ -424,7 +424,7 @@ fn find_claude(platform: Platform, dirs: &[PathBuf]) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
-struct SystemRunner;
+pub(crate) struct SystemRunner;
 
 impl Runner for SystemRunner {
     fn run(&self, program: &Path, args: &[String]) -> anyhow::Result<RunOutput> {

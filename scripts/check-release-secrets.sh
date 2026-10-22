@@ -30,6 +30,13 @@ for name in "${required[@]}"; do
   [[ -n "${!name:-}" ]] || missing+=("$name")
 done
 
+# The updater's public key is committed rather than secret, but until it is
+# the real one no release can be installed as an update.
+config="$(dirname "$0")/../app/src-tauri/tauri.conf.json"
+if ! jq -r .plugins.updater.pubkey "$config" | base64 -d 2>/dev/null | grep -q '^untrusted comment: minisign public key'; then
+  missing+=("plugins.updater.pubkey in app/src-tauri/tauri.conf.json")
+fi
+
 if ((${#missing[@]} == 0)); then
   echo "All ${#required[@]} signing inputs are present in the release environment."
   exit 0

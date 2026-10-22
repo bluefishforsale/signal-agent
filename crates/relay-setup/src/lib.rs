@@ -15,7 +15,10 @@ pub use machine::{
     AccountChoice, ClientOutcome, Command, HistoryGap, SetupEvent, SetupState, transition,
 };
 pub use profiles::Profiles;
-pub use uninstall::{Step, StepOutcome, run_steps, uninstall_steps};
+pub use uninstall::{
+    APP_ID, DELETE_DATA_LABEL, Footprint, LAUNCHD_LABEL, Leftover, Machine, Roots, Step,
+    StepOutcome, checklist, removal_steps, run_steps, stop_agents, uninstall, uninstall_steps,
+};
 
 /// What every front end tells the user while a linked device imports history.
 pub const HISTORY_NOTE: &str = "Your phone sends all the messages it has. Photos and files \
