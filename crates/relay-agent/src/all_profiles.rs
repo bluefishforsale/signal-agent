@@ -3,14 +3,19 @@
 //! can't take the others down, and follows the `Supervisor` policy for when.
 
 use std::{
-    collections::BTreeMap, future::Future, path::PathBuf, process::Stdio, sync::Arc, time::Duration,
+    collections::BTreeMap,
+    future::Future,
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::Arc,
+    time::Duration,
 };
 
 use anyhow::Context;
 
 use futures::future::BoxFuture;
 use relay_core::ProfileName;
-use relay_setup::Profiles;
+use relay_setup::{Profiles, claude::Platform};
 use relay_tools::{Clock, SystemClock};
 use tokio::{
     sync::{mpsc, oneshot},
@@ -34,6 +39,13 @@ pub async fn run_all_profiles() -> anyhow::Result<()> {
     #[cfg(windows)]
     if let Err(e) = end_children_with_this_process() {
         tracing::warn!("agents may outlive the supervisor: {e:#}");
+    }
+    match installed_app(&exe, Platform::current()) {
+        Some(app) => drop(tokio::spawn(check_for_updates(app))),
+        None => tracing::info!(
+            "no setup app beside \"{}\", so no update checks",
+            exe.display()
+        ),
     }
     supervise(
         move || ready_profiles(&profiles),
@@ -89,6 +101,67 @@ fn end_children_with_this_process() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// How often the supervisor asks the app to look for an update. The app
+/// looks at GitHub at most once a day, so this only bounds how late a notice
+/// can be after waking from sleep.
+const UPDATE_CHECK_EVERY: Duration = Duration::from_secs(60 * 60);
+
+/// Longest an update check may take before it is given up on.
+const UPDATE_CHECK_LIMIT: Duration = Duration::from_secs(2 * 60);
+
+/// Asks the app to look for an update now and every hour, so its notice
+/// appears without the window open.
+async fn check_for_updates(app: PathBuf) {
+    let mut every = tokio::time::interval(UPDATE_CHECK_EVERY);
+    every.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        every.tick().await;
+        match tokio::time::timeout(UPDATE_CHECK_LIMIT, update_check(&app).status()).await {
+            Ok(Ok(status)) if status.success() => {}
+            Ok(Ok(status)) => tracing::warn!("the update check exited ({status})"),
+            Ok(Err(e)) => tracing::warn!("unable to run \"{}\": {e}", app.display()),
+            Err(_) => tracing::warn!("the update check took over {UPDATE_CHECK_LIMIT:?}"),
+        }
+    }
+}
+
+/// The app's update check, which only ever notifies.
+// NOTE: never anything but `--check-for-update`. Installing is the user's
+// click in the app window (PRD anti-goal 6); the supervisor only asks.
+fn update_check(app: &Path) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(app);
+    command
+        .arg("--check-for-update")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    command
+}
+
+/// The setup app installed beside the agent binary `exe`: the bundle's own
+/// executable on macOS, `relay-app.exe` beside it on Windows. Linux ships no
+/// app, and a dev build has none.
+fn installed_app(exe: &Path, platform: Platform) -> Option<PathBuf> {
+    let dir = exe.parent()?;
+    let app = match platform {
+        Platform::MacOs => {
+            let plist = std::fs::read_to_string(dir.parent()?.join("Info.plist")).ok()?;
+            dir.join(bundle_executable(&plist)?)
+        }
+        Platform::Windows => dir.join("relay-app.exe"),
+        Platform::Linux => return None,
+    };
+    (app != exe && app.is_file()).then_some(app)
+}
+
+/// `CFBundleExecutable` from an Info.plist's XML.
+fn bundle_executable(plist: &str) -> Option<&str> {
+    let after = plist.split("<key>CFBundleExecutable</key>").nth(1)?;
+    let value = after.trim_start().strip_prefix("<string>")?;
+    value.split("</string>").next().filter(|v| !v.is_empty())
 }
 
 /// Starts one profile's agent.
@@ -494,5 +567,46 @@ mod tests {
                 Event::Stopped(name("personal")),
             ]
         );
+    }
+
+    /// The supervisor asks the app installed beside it to check for updates:
+    /// the bundle's real executable on macOS, relay-app.exe on Windows, and
+    /// nothing on Linux or in a dev build, where there is no app.
+    #[test]
+    fn the_update_check_runs_the_app_installed_beside_the_agent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let macos = tmp.path().join("MCP Relay for Signal.app/Contents/MacOS");
+        std::fs::create_dir_all(&macos).expect("bundle");
+        std::fs::write(
+            macos.parent().expect("Contents").join("Info.plist"),
+            "<dict>\n\t<key>CFBundleExecutable</key>\n\t<string>relay-app</string>\n</dict>",
+        )
+        .expect("plist");
+        let agent = macos.join("signal-agent");
+        assert_eq!(installed_app(&agent, Platform::MacOs), None, "no app yet");
+        std::fs::write(macos.join("relay-app"), b"").expect("app");
+        assert_eq!(
+            installed_app(&agent, Platform::MacOs),
+            Some(macos.join("relay-app"))
+        );
+
+        let windows = tmp.path().join("win");
+        std::fs::create_dir_all(&windows).expect("dir");
+        std::fs::write(windows.join("relay-app.exe"), b"").expect("app");
+        let agent = windows.join("signal-agent.exe");
+        assert_eq!(
+            installed_app(&agent, Platform::Windows),
+            Some(windows.join("relay-app.exe"))
+        );
+        assert_eq!(installed_app(&agent, Platform::Linux), None);
+    }
+
+    /// Whatever schedules it, the supervisor's update check may only ask
+    /// the app to look and notify; installing waits for the user's click.
+    #[test]
+    fn the_supervisors_update_check_only_ever_notifies() {
+        let command = update_check(Path::new("/Applications/X.app/Contents/MacOS/relay-app"));
+        let args: Vec<_> = command.as_std().get_args().collect();
+        assert_eq!(args, ["--check-for-update"]);
     }
 }

@@ -38,6 +38,7 @@ pub enum View {
     ImportingHistory {
         imported: u64,
         percent: Option<u8>,
+        note: &'static str,
     },
     ConnectingClients,
     Done {
@@ -89,6 +90,7 @@ pub fn view(state: &SetupState) -> View {
         } => View::ImportingHistory {
             imported: *imported,
             percent: total.map(|total| percent(*imported, total)),
+            note: HISTORY_NOTE,
         },
         S::ConnectingClients { .. } => View::ConnectingClients,
         S::Done { clients } => View::Done {
@@ -234,6 +236,23 @@ mod tests {
         assert_eq!(history_percent(1, Some(4)), Some(25));
         assert_eq!(history_percent(12, Some(10)), Some(100));
         assert_eq!(history_percent(u64::MAX, Some(u64::MAX)), Some(100));
+    }
+
+    /// The window once claimed Signal shares about 45 days of messages, which
+    /// is its limit for media only; it must show relay-setup's note instead of
+    /// copy of its own.
+    #[test]
+    fn importing_history_shows_the_shared_history_note() {
+        let View::ImportingHistory { note, .. } = view(&SetupState::ImportingHistory {
+            imported: 0,
+            total: None,
+            access: AccessMode::Full,
+        }) else {
+            panic!("not the history screen");
+        };
+        assert_eq!(note, HISTORY_NOTE);
+        assert!(PAGE.contains(r#"data-field="note""#), "no note field");
+        assert!(!PAGE.contains("45 days"), "index.html has its own copy");
     }
 
     fn done(clients: &[(ClaudeClient, Result<(), &str>)]) -> View {

@@ -47,6 +47,7 @@ function render(view) {
       if (view.percent === null) bar.removeAttribute("value");
       else bar.value = view.percent;
       fill(section, "imported", view.imported.toLocaleString());
+      fill(section, "note", view.note);
       break;
     }
     case "done": {

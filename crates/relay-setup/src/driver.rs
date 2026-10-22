@@ -273,7 +273,11 @@ impl Driver {
     }
 
     /// Lists the profile beside the others before it gets a key or a store,
-    /// so the login item runs its agent and uninstall finds its key.
+    /// so uninstall finds its key and, once its access choice is saved, the
+    /// login item runs its agent.
+    // NOTE: listed is not set up. Everything that starts an agent (supervisor,
+    // shim, startup re-registration) waits for access.json, which SaveAccess
+    // writes only after the link's store is closed.
     fn list_profile(&self) -> anyhow::Result<()> {
         let root = &self.paths.root;
         let base = root
