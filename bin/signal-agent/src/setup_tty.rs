@@ -23,6 +23,9 @@ use relay_signal::{PresageProvisioner, Provisioner, Servers};
 /// Runs setup for `profile` on this terminal until it is done or the user quits.
 pub async fn run(profile: ProfileName) -> anyhow::Result<()> {
     let exe = std::env::current_exe().context("unable to locate this executable")?;
+    if let Some(why) = relay_agent::login::unregistrable_from(&exe) {
+        bail!(why);
+    }
     let server = ServerEntry::for_profile(&profile, &exe, ["mcp", "--profile", &profile])?;
     let paths = ProfilePaths::for_profile(&profile)?;
     let store = || -> anyhow::Result<ProfileStore> {

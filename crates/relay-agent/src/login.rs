@@ -41,6 +41,48 @@ pub fn unregister() -> anyhow::Result<()> {
     anyhow::bail!("no login registration on this OS")
 }
 
+/// Whether the login item that starts every profile's agent is on.
+pub fn is_registered() -> anyhow::Result<bool> {
+    #[cfg(target_os = "linux")]
+    return Ok(succeeds(
+        "systemctl",
+        &["--user", "is-enabled", systemd::UNIT_NAME],
+    ));
+    #[cfg(windows)]
+    return Ok(succeeds("schtasks", &["/Query", "/TN", task::TASK_NAME]));
+    #[cfg(target_os = "macos")]
+    return launchd::is_registered();
+    #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
+    anyhow::bail!("no login registration on this OS")
+}
+
+/// Why `exe` can't register the login item, if it can't: on macOS only the
+/// copy inside the app bundle can.
+pub fn unregistrable_from(exe: &std::path::Path) -> Option<&'static str> {
+    #[cfg(target_os = "macos")]
+    return launchd::app_bundle(exe).is_none().then_some(
+        "On a Mac, set up with the MCP Relay for Signal app. Only the app can add the \
+         background agent to your login items; this copy of signal-agent isn't inside it.",
+    );
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = exe;
+        None
+    }
+}
+
+/// Whether `program args` runs and exits successfully.
+#[cfg(any(target_os = "linux", windows))]
+fn succeeds(program: &str, args: &[&str]) -> bool {
+    std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
 /// Every profile that may have had its own logon task before the supervisor.
 #[cfg(windows)]
 fn known_profiles() -> anyhow::Result<Vec<ProfileName>> {
@@ -96,4 +138,25 @@ fn run(program: &str, args: &[&str]) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+
+    /// Terminal setup on a Mac fails at its last step unless it runs from the
+    /// app bundle, so it must be able to tell up front, and only there.
+    #[test]
+    fn only_the_bundled_agent_can_register_on_a_mac() {
+        let bundled =
+            Path::new("/Applications/MCP Relay for Signal.app/Contents/MacOS/signal-agent");
+        assert_eq!(unregistrable_from(bundled), None);
+        let loose = Path::new("/usr/local/bin/signal-agent");
+        assert!(
+            unregistrable_from(loose).is_some_and(|why| why.contains("app")),
+            "a loose binary was allowed to register"
+        );
+    }
 }

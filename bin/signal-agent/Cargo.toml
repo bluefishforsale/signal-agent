@@ -15,6 +15,7 @@ relay-mcp.workspace = true
 relay-secrets.workspace = true
 relay-setup.workspace = true
 relay-signal.workspace = true
+relay-store.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
