@@ -9,7 +9,9 @@ use serde_json::{Value, json};
 use crate::{
     Tool, ToolContext, ToolError,
     directory::MAX_ATTACHMENT_BYTES,
-    input::{contact, contact_schema, e164, e164_schema, parse, recipient, recipient_schema},
+    input::{
+        contact, contact_schema, e164, e164_schema, non_blank, parse, recipient, recipient_schema,
+    },
 };
 
 pub struct GetProfile;
@@ -56,6 +58,116 @@ impl Tool for GetProfile {
             "service_id": service_id.map(|id| id.to_string()),
             "registered": service_id.is_some(),
         }))
+    }
+}
+
+pub struct GetUserStatus;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GetUserStatusInput {
+    recipients: Option<Vec<String>>,
+    usernames: Option<Vec<String>>,
+}
+
+impl GetUserStatus {
+    // NOTE: discovery reaches Signal's servers, which rate-limit it per
+    // account. Without a cap one looping client could spend that budget in a
+    // few calls and get the account's lookups throttled.
+    const MAX_LOOKUPS: usize = 50;
+
+    fn list_schema(items: Value, description: &str) -> Value {
+        json!({
+            "type": "array",
+            "items": items,
+            "minItems": 1,
+            "maxItems": Self::MAX_LOOKUPS,
+            "description": description,
+        })
+    }
+
+    /// `list` when given, which must hold 1 to MAX_LOOKUPS entries.
+    fn checked(field: &str, list: Option<Vec<String>>) -> Result<Vec<String>, ToolError> {
+        let Some(list) = list else {
+            return Ok(vec![]);
+        };
+        if list.is_empty() || list.len() > Self::MAX_LOOKUPS {
+            return Err(ToolError::InvalidInput(format!(
+                "{field} holds 1 to {} entries, got {}",
+                Self::MAX_LOOKUPS,
+                list.len()
+            )));
+        }
+        Ok(list)
+    }
+}
+
+#[async_trait]
+impl Tool for GetUserStatus {
+    fn name(&self) -> &'static str {
+        "get_user_status"
+    }
+    fn description(&self) -> &'static str {
+        "Check whether phone numbers or Signal usernames are registered on Signal, in one \
+         batch. recipients are E.164 numbers and usernames are Signal usernames (alice.42); \
+         give at least one of the two, each up to 50. Returns results, one per input in the \
+         order given, numbers first: number or username, service_id (null when not \
+         registered) and registered. A number that hides itself from discovery shows as not \
+         registered. Nothing is sent."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "recipients": Self::list_schema(e164_schema("A number to check"), "Phone numbers to check"),
+                "usernames": Self::list_schema(
+                    json!({"type": "string", "minLength": 1, "description": "A Signal username, e.g. alice.42"}),
+                    "Signal usernames to check",
+                ),
+            },
+            "additionalProperties": false,
+        })
+    }
+    fn writes(&self) -> bool {
+        false
+    }
+    async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
+        let GetUserStatusInput {
+            recipients,
+            usernames,
+        } = parse(input)?;
+        if recipients.is_none() && usernames.is_none() {
+            return Err(ToolError::InvalidInput(
+                "give recipients, usernames or both".into(),
+            ));
+        }
+        let numbers = Self::checked("recipients", recipients)?
+            .into_iter()
+            .map(e164)
+            .collect::<Result<Vec<_>, _>>()?;
+        let usernames = Self::checked("usernames", usernames)?
+            .into_iter()
+            .map(|u| non_blank("usernames", u))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut results = vec![];
+        if !numbers.is_empty() {
+            for (number, id) in ctx.signal.discover(&numbers).await? {
+                results.push(json!({
+                    "number": number,
+                    "service_id": id.map(|id| id.to_string()),
+                    "registered": id.is_some(),
+                }));
+            }
+        }
+        for username in usernames {
+            let id = ctx.signal.lookup_username(&username).await?;
+            results.push(json!({
+                "username": username,
+                "service_id": id.map(|id| id.to_string()),
+                "registered": id.is_some(),
+            }));
+        }
+        Ok(json!({ "results": results }))
     }
 }
 
@@ -443,6 +555,50 @@ mod tests {
         assert_eq!(
             missing,
             json!({"number": "+15550000008", "service_id": null, "registered": false})
+        );
+    }
+
+    /// One batch answers every number and username, in the order given, so a
+    /// client can line the answers up with what it asked.
+    #[tokio::test]
+    async fn get_user_status_answers_every_number_and_username_in_order() {
+        let ctx = ctx_of(|s| {
+            s.with_registered("+15550000009", sid(9))
+                .with_username("ada.42", sid(4))
+        });
+        let out = Registry::standard()
+            .call(
+                &ctx,
+                "get_user_status",
+                json!({
+                    "recipients": ["+15550000008", "+15550000009"],
+                    "usernames": ["ada.42", "nobody.01"],
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            json!({"results": [
+                {"number": "+15550000008", "service_id": null, "registered": false},
+                {"number": "+15550000009", "service_id": sid(9).to_string(), "registered": true},
+                {"username": "ada.42", "service_id": sid(4).to_string(), "registered": true},
+                {"username": "nobody.01", "service_id": null, "registered": false},
+            ]})
+        );
+    }
+
+    /// With neither list there is nothing to ask, and an empty answer would
+    /// read as "nobody is registered".
+    #[tokio::test]
+    async fn get_user_status_with_neither_list_is_invalid_input() {
+        let ctx = ctx_of(|s| s);
+        let result = Registry::standard()
+            .call(&ctx, "get_user_status", json!({}))
+            .await;
+        assert!(
+            matches!(result, Err(ToolError::InvalidInput(_))),
+            "got {result:?}"
         );
     }
 }

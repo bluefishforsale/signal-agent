@@ -54,6 +54,7 @@ impl Registry {
             .with(media::SendSticker)
             .with(media::SendGroupSticker)
             .with(lookup::GetProfile)
+            .with(lookup::GetUserStatus)
     }
 
     /// Applies account-safety limits to every send a tool makes.
