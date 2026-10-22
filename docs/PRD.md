@@ -32,6 +32,8 @@ The primary user is non-technical: they can download a file, double-click it, an
 11. **Uninstall.** In-app Uninstall, also run by the Windows uninstaller, removes the agent registration, the Claude entries, and Keychain or credential items. Messages and keys are deleted only when the user ticks a clearly labeled box.
 12. **Testing.** Fake Signal behind one interface in CI on every push, with property tests at the tool registry (read-only enforcement, input validation) so every tool is covered automatically. A nightly link-and-message test between two accounts on Signal's staging servers. A real-account smoke checklist before every release.
 
+13. **Account safety.** The agent is the one choke point every MCP client goes through, so it rate-limits everything that reaches Signal: a per-profile send rate limit, a daily cap on new recipients, and backoff on linking and registration that surfaces Signal's own rate-limit responses instead of retrying. Over a limit, a tool refuses with a clear message saying when to retry; nothing is queued to burst later. Defaults are conservative and adjustable under Advanced. The goal is that no AI client, however it loops, can make the account look like a spammer (#62).
+
 ## Anti-goals (v2.0)
 
 1. No chat UI. The window does setup and settings only.
@@ -45,6 +47,7 @@ The primary user is non-technical: they can download a file, double-click it, an
 9. No OAuth on the HTTP endpoint.
 10. No read-only default.
 11. No Signal logo or Signal-blue speech bubble in the icon, and no "Signal"-first product name.
+12. No bulk or broadcast send tool, ever: messaging many people at once is what gets accounts banned.
 
 ## Acceptance criteria (v2.0)
 
