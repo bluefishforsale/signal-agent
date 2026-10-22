@@ -14,8 +14,8 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use relay_core::prelude::*;
 use relay_signal::{
-    Account, Contact, Device, Group, Identity, Incoming, Outgoing, RateLimited, RequestResponse,
-    SendableFile, SignalBackend, StickerImage, StickerPack,
+    Account, Contact, Device, Group, Identity, Incoming, Outgoing, ProfileUpdate, RateLimited,
+    RequestResponse, SendableFile, SignalBackend, StickerImage, StickerPack,
 };
 use relay_store::MessageStore;
 use serde::{Deserialize, Serialize};
@@ -45,6 +45,9 @@ pub struct Limits {
     /// Numbers, usernames and avatars looked up back to back, refilling over
     /// a day.
     pub lookups_per_day: NonZeroU32,
+    /// Changes to the account's own profile back to back, refilling over a
+    /// day.
+    pub account_changes_per_day: NonZeroU32,
 }
 
 impl Default for Limits {
@@ -56,6 +59,7 @@ impl Default for Limits {
             provisioning_backoff_minutes: NonZeroU32::new(5).expect("nonzero literal"),
             lookup_burst_per_minute: NonZeroU32::new(10).expect("nonzero literal"),
             lookups_per_day: NonZeroU32::new(50).expect("nonzero literal"),
+            account_changes_per_day: NonZeroU32::new(3).expect("nonzero literal"),
         }
     }
 }
@@ -108,6 +112,7 @@ struct State {
     sends_paused_until_ms: u64,
     lookup_minute: Bucket,
     lookup_day: Bucket,
+    account_changes: Bucket,
 }
 
 impl State {
@@ -125,6 +130,7 @@ impl State {
             sends_paused_until_ms: 0,
             lookup_minute: empty(),
             lookup_day: empty(),
+            account_changes: empty(),
         }
     }
 }
@@ -315,6 +321,22 @@ impl Limiter {
         }
         state.lookup_minute.take(MINUTE_MS, lookups);
         state.lookup_day.take(DAY_MS, lookups);
+        self.save(&state)
+    }
+
+    /// Counts one change to the account's own profile, or refuses it.
+    fn admit_account_change(&self) -> anyhow::Result<()> {
+        let now = self.clock.now_ms();
+        let mut state = self.state.lock().expect("limiter state");
+        let per_day = self.limits.account_changes_per_day;
+        if let Some(retry_after) = state.account_changes.wait(now, per_day, DAY_MS, 1) {
+            return Err(LimitExceeded {
+                limit: format!("at most {per_day} profile changes a day"),
+                retry_after,
+            }
+            .into());
+        }
+        state.account_changes.take(DAY_MS, 1);
         self.save(&state)
     }
 
@@ -545,6 +567,13 @@ impl SignalBackend for Guarded {
     async fn install_sticker_pack(&self, pack: StickerPackId, key: [u8; 32]) -> anyhow::Result<()> {
         self.limiter.admit_lookups(1)?;
         self.inner.install_sticker_pack(pack, key).await
+    }
+    // NOTE: a change every contact sees, and the one a prompt injection would
+    // want, so it has its own small budget. A RateLimited from Signal goes
+    // back to the caller as is; nothing here retries it.
+    async fn update_profile(&self, update: ProfileUpdate) -> anyhow::Result<()> {
+        self.limiter.admit_account_change()?;
+        self.inner.update_profile(update).await
     }
 }
 
@@ -893,6 +922,46 @@ mod tests {
             .await
             .expect("a delete spent the new-recipient cap");
         assert_eq!(signal.sent().len(), 2, "{:?}", signal.sent());
+    }
+
+    /// A profile change shows to every contact, so a looping or injected
+    /// client gets three a day by default: the fourth is refused before
+    /// Signal, and the budget frees up a day later.
+    #[tokio::test]
+    async fn a_fourth_profile_change_in_a_day_is_refused_before_signal() {
+        let clock = Arc::new(FakeClock::default());
+        let limiter = Arc::new(Limiter::new(Limits::default(), clock.clone()));
+        let (ctx, signal) = ctx();
+        let guarded = guard(Some(&limiter), &ctx).signal;
+        let rename = |n: u32| ProfileUpdate {
+            given_name: Some(format!("bot {n}")),
+            ..ProfileUpdate::default()
+        };
+        for n in 0..3 {
+            guarded
+                .update_profile(rename(n))
+                .await
+                .unwrap_or_else(|e| panic!("change {n} refused: {e:#}"));
+        }
+        let result = guarded.update_profile(rename(3)).await;
+        let Some(e) = result
+            .as_ref()
+            .err()
+            .and_then(|e| e.downcast_ref::<LimitExceeded>())
+        else {
+            panic!("a fourth change in a day went through: {result:?}");
+        };
+        assert_eq!(e.retry_after, Duration::from_millis(DAY_MS / 3), "{e}");
+        assert_eq!(
+            signal.profile_updates().len(),
+            3,
+            "a refused change reached Signal"
+        );
+        clock.advance(DAY_MS);
+        guarded
+            .update_profile(rename(4))
+            .await
+            .expect("the budget did not free up after a day");
     }
 
     /// Installing a sticker pack downloads it from Signal's CDN on a link a
@@ -1264,6 +1333,9 @@ mod tests {
             key: [u8; 32],
         ) -> anyhow::Result<()> {
             self.inner.install_sticker_pack(pack, key).await
+        }
+        async fn update_profile(&self, update: ProfileUpdate) -> anyhow::Result<()> {
+            self.inner.update_profile(update).await
         }
     }
 

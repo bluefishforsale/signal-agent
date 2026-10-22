@@ -97,6 +97,18 @@ pub struct StickerImage {
     pub bytes: Vec<u8>,
 }
 
+/// Changes to this account's own profile; a `None` field stays as it is.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileUpdate {
+    pub given_name: Option<String>,
+    /// `Some("")` removes the family name.
+    pub family_name: Option<String>,
+    /// `Some("")` removes the about text.
+    pub about: Option<String>,
+    /// `Some("")` removes the about emoji.
+    pub about_emoji: Option<String>,
+}
+
 /// Something to send. Reactions, edits and deletes reference the target by its
 /// `MessageId`, as Signal does.
 // NOTE: every variant here must be classified in relay-tools' limits.rs
@@ -313,6 +325,9 @@ pub trait SignalBackend: Send + Sync {
     /// Signal's CDN into the local store, and tells this account's other
     /// devices it was installed.
     async fn install_sticker_pack(&self, pack: StickerPackId, key: [u8; 32]) -> anyhow::Result<()>;
+    /// Changes this account's name, about text or about emoji as every
+    /// contact sees them, keeping the avatar.
+    async fn update_profile(&self, update: ProfileUpdate) -> anyhow::Result<()>;
 }
 
 /// Progress while linking as a secondary device.

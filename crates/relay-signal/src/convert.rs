@@ -11,8 +11,10 @@ use presage::libsignal_service::prelude::{
 };
 use presage::{
     libsignal_service::{
+        Profile,
         content::{Content, ContentBody},
         groups_v2::Role,
+        profile_name::ProfileName,
         protocol,
         sender::AttachmentSpec,
         websocket::account::DeviceInfo,
@@ -29,7 +31,9 @@ use presage::{
 };
 use relay_core::prelude::*;
 
-use crate::{Account, Incoming, Outgoing, RequestResponse, StickerInfo, StickerPack};
+use crate::{
+    Account, Incoming, Outgoing, ProfileUpdate, RequestResponse, StickerInfo, StickerPack,
+};
 
 /// What `content` means to the agent, or `None` when it carries nothing the
 /// agent keeps (delivery receipts, calls, stories, key syncs). `me` is the
@@ -372,6 +376,34 @@ pub(crate) fn content_body(
             ..Default::default()
         })),
     })
+}
+
+/// The name, about text and about emoji to upload: `update` laid over
+/// `current`, since Signal replaces the whole profile on upload.
+pub(crate) fn merged_profile(
+    current: Profile,
+    update: ProfileUpdate,
+) -> anyhow::Result<(ProfileName<String>, Option<String>, Option<String>)> {
+    let (given, family) = match current.name {
+        Some(name) => (Some(name.given_name), name.family_name),
+        None => (None, None),
+    };
+    let Some(given_name) = update.given_name.or(given).filter(|g| !g.trim().is_empty()) else {
+        bail!("a Signal profile needs a given name");
+    };
+    let set = |new: Option<String>, old: Option<String>| match new {
+        Some(new) if new.is_empty() => None,
+        Some(new) => Some(new),
+        None => old,
+    };
+    Ok((
+        ProfileName {
+            given_name,
+            family_name: set(update.family_name, family),
+        },
+        set(update.about, current.about),
+        set(update.about_emoji, current.about_emoji),
+    ))
 }
 
 /// A message that only hands the recipient this account's profile key, which
@@ -1182,6 +1214,59 @@ mod tests {
             };
             prop_assert_eq!(answer.r#type, Some(expected as i32));
         }
+    }
+
+    /// Signal replaces the whole profile on upload, so a change to one field
+    /// must carry the others over unchanged, an empty string must remove an
+    /// optional field, and a name with no given name must never be uploaded.
+    #[test]
+    fn a_profile_update_keeps_unnamed_fields_and_empty_removes_one() {
+        let current = Profile {
+            name: Some(ProfileName {
+                given_name: "Ada".into(),
+                family_name: Some("Lovelace".into()),
+            }),
+            about: Some("engines".into()),
+            about_emoji: Some("⚙️".into()),
+            avatar: None,
+            unrestricted_unidentified_access: false,
+        };
+        let (name, about, emoji) = merged_profile(
+            current.clone(),
+            ProfileUpdate {
+                about: Some("looms".into()),
+                about_emoji: Some(String::new()),
+                ..ProfileUpdate::default()
+            },
+        )
+        .expect("merges");
+        assert_eq!(
+            (name.given_name.as_str(), name.family_name.as_deref()),
+            ("Ada", Some("Lovelace"))
+        );
+        assert_eq!((about.as_deref(), emoji), (Some("looms"), None));
+        for blank in ["", "  "] {
+            let update = ProfileUpdate {
+                given_name: Some(blank.into()),
+                ..ProfileUpdate::default()
+            };
+            assert!(
+                merged_profile(current.clone(), update).is_err(),
+                "{blank:?}"
+            );
+        }
+        let nameless = Profile {
+            name: None,
+            ..current
+        };
+        let update = ProfileUpdate {
+            about: Some("x".into()),
+            ..ProfileUpdate::default()
+        };
+        assert!(
+            merged_profile(nameless, update).is_err(),
+            "uploaded without a name"
+        );
     }
 
     /// A group's timer lives in the group's state, so a timer update sent as

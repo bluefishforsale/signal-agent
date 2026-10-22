@@ -17,7 +17,8 @@ use tokio::sync::mpsc;
 
 use crate::{
     Account, Contact, Device, DiscoveryUnsupported, Group, Identity, Incoming, Outgoing,
-    RateLimited, SendableFile, SignalBackend, StickerImage, StickerInfo, StickerPack,
+    ProfileUpdate, RateLimited, SendableFile, SignalBackend, StickerImage, StickerInfo,
+    StickerPack,
 };
 
 /// A fake registered account. Build one with `FakeSignal::new`, seed it with
@@ -44,6 +45,7 @@ struct State {
     devices: Vec<Device>,
     sticker_packs: HashMap<StickerPackId, Vec<u32>>,
     uploads: u64,
+    profile_updates: Vec<ProfileUpdate>,
 }
 
 impl FakeSignal {
@@ -109,6 +111,11 @@ impl FakeSignal {
     /// Everything sent so far, in order.
     pub fn sent(&self) -> Vec<(Recipient, Outgoing)> {
         self.state().sent.clone()
+    }
+
+    /// Every profile change asked for so far, in order.
+    pub fn profile_updates(&self) -> Vec<ProfileUpdate> {
+        self.state().profile_updates.clone()
     }
 
     /// Sends that reached Signal so far, whether it accepted them or not.
@@ -307,6 +314,11 @@ impl SignalBackend for FakeSignal {
         _key: [u8; 32],
     ) -> anyhow::Result<()> {
         self.state().sticker_packs.entry(pack).or_default();
+        Ok(())
+    }
+
+    async fn update_profile(&self, update: ProfileUpdate) -> anyhow::Result<()> {
+        self.state().profile_updates.push(update);
         Ok(())
     }
 }

@@ -46,8 +46,9 @@ use tracing::warn;
 
 use crate::{
     Account, Contact, Device, DiscoveryUnsupported, Group, HistoryTransfer, Identity, Incoming,
-    LinkEvent, Outgoing, Provisioner, RateLimited, RegistrationStep, RequestResponse, SendableFile,
-    SignalBackend, StickerImage, StickerPack, Trust, convert, transfer::PendingTransfer,
+    LinkEvent, Outgoing, ProfileUpdate, Provisioner, RateLimited, RegistrationStep,
+    RequestResponse, SendableFile, SignalBackend, StickerImage, StickerPack, Trust, convert,
+    transfer::PendingTransfer,
 };
 
 type Job = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()>>> + Send>;
@@ -483,6 +484,23 @@ impl SignalBackend for PresageSignal {
             .run(move || async move { manager.install_sticker_pack(pack.as_bytes(), &key).await })
             .await?
             .map_err(|e| signal_error(e, format!("unable to install sticker pack {pack}")))
+    }
+
+    async fn update_profile(&self, update: ProfileUpdate) -> anyhow::Result<()> {
+        let mut manager = self.manager.clone();
+        self.worker
+            .run(move || async move {
+                let current = manager
+                    .retrieve_profile()
+                    .await
+                    .map_err(|e| signal_error(e, "unable to read this account's profile"))?;
+                let (name, about, emoji) = convert::merged_profile(current, update)?;
+                manager
+                    .update_profile(name, about, emoji)
+                    .await
+                    .map_err(|e| signal_error(e, "unable to update this account's profile"))
+            })
+            .await?
     }
 }
 

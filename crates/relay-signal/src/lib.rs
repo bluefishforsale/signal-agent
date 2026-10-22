@@ -11,8 +11,9 @@ mod transfer;
 
 pub use backend::{
     Account, Contact, Device, DiscoveryUnsupported, Group, HISTORY_ARCHIVE_FILE, HistoryTransfer,
-    Identity, Incoming, LinkEvent, Outgoing, Provisioner, RateLimited, RegistrationStep,
-    RequestResponse, SignalBackend, StickerImage, StickerInfo, StickerPack, Trust,
+    Identity, Incoming, LinkEvent, Outgoing, ProfileUpdate, Provisioner, RateLimited,
+    RegistrationStep, RequestResponse, SignalBackend, StickerImage, StickerInfo, StickerPack,
+    Trust,
 };
 pub use fake::FakeSignal;
 pub use files::{SendRoots, SendableFile};
@@ -21,8 +22,8 @@ pub use presage_backend::{PresageProvisioner, PresageSignal, Servers};
 pub mod prelude {
     pub use crate::{
         Account, Contact, Device, DiscoveryUnsupported, FakeSignal, Group, HistoryTransfer,
-        Identity, Incoming, LinkEvent, Outgoing, Provisioner, RateLimited, RegistrationStep,
-        RequestResponse, SendRoots, SendableFile, SignalBackend, StickerImage, StickerInfo,
-        StickerPack, Trust,
+        Identity, Incoming, LinkEvent, Outgoing, ProfileUpdate, Provisioner, RateLimited,
+        RegistrationStep, RequestResponse, SendRoots, SendableFile, SignalBackend, StickerImage,
+        StickerInfo, StickerPack, Trust,
     };
 }

@@ -925,6 +925,9 @@ pub(crate) mod tests {
         async fn install_sticker_pack(&self, _: StickerPackId, _: [u8; 32]) -> anyhow::Result<()> {
             anyhow::bail!("offline")
         }
+        async fn update_profile(&self, _: relay_signal::ProfileUpdate) -> anyhow::Result<()> {
+            anyhow::bail!("offline")
+        }
     }
 
     /// An agent that fails after its store opened must still close the store,
