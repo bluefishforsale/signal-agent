@@ -714,4 +714,31 @@ mod tests {
         sorted.sort();
         assert_eq!(sorted, ["bot", "personal", "work"], "found {names:?}");
     }
+
+    /// Removing the app from Settings > Apps must run this same cleanup,
+    /// carry the delete-data choice through, and never run during an update
+    /// or upgrade, which would leave a working profile with no agent.
+    #[test]
+    fn the_windows_uninstaller_runs_this_cleanup_but_never_on_update() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../app/src-tauri");
+        let config: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join("tauri.conf.json")).expect("tauri.conf.json"),
+        )
+        .expect("json");
+        let hooks = config["bundle"]["windows"]["nsis"]["installerHooks"]
+            .as_str()
+            .expect("installerHooks");
+        let hooks = std::fs::read_to_string(root.join(hooks)).expect("hooks file");
+        for needle in [
+            "!macro NSIS_HOOK_PREUNINSTALL",
+            "${If} $UpdateMode <> 1",
+            "${AndIf} $R9 != \"1\"",
+            "${If} $DeleteAppDataCheckboxState = 1",
+            r#"'"$INSTDIR\signal-agent.exe" uninstall --delete-data'"#,
+            r#"'"$INSTDIR\signal-agent.exe" uninstall'"#,
+            "!define MUI_CUSTOMFUNCTION_GUIINIT SignalAgentMarkInstalling",
+        ] {
+            assert!(hooks.contains(needle), "hooks lack {needle}");
+        }
+    }
 }
