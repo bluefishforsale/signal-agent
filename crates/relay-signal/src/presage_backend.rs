@@ -19,7 +19,6 @@ use std::{
 use anyhow::{Context, anyhow, bail};
 use async_trait::async_trait;
 use futures::{StreamExt, stream::BoxStream};
-use libsignal_net::cdsi::LookupError;
 use presage::{
     Manager,
     libsignal_service::{
@@ -321,25 +320,9 @@ impl SignalBackend for PresageSignal {
 
     async fn discover(
         &self,
-        numbers: &[String],
+        _numbers: &[String],
     ) -> anyhow::Result<Vec<(String, Option<ServiceId>)>> {
-        if numbers.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut phones = Vec::with_capacity(numbers.len());
-        for number in numbers {
-            let phone: PhoneNumber = number
-                .parse()
-                .with_context(|| format!("\"{number}\" is not a phone number"))?;
-            phones.push(phone);
-        }
-        let mut manager = self.manager.clone();
-        let found = self
-            .worker
-            .run(move || async move { manager.discover_contacts_by_phone_number(phones).await })
-            .await?
-            .map_err(|e| signal_error(e, "unable to look up phone numbers on Signal"))?;
-        Ok(convert::discovered(numbers, found))
+        bail!("contact discovery is not implemented yet (lane L1b)")
     }
 
     async fn lookup_username(&self, username: &str) -> anyhow::Result<Option<ServiceId>> {
@@ -971,10 +954,6 @@ fn service_rate_limited(error: &ServiceError) -> Option<RateLimited> {
             retry_after: retry_after.and_then(|wait| wait.to_std().ok()),
         }),
         ServiceError::ProofRequiredError(proof) => Some(proof_required(&proof.options)),
-        ServiceError::CdsiLookupError(LookupError::RateLimited(later)) => Some(RateLimited {
-            message: error.to_string(),
-            retry_after: Some(Duration::from_secs(u64::from(later.retry_after_seconds))),
-        }),
         ServiceError::WsError(ws) => match ws.as_ref() {
             reqwest_websocket::Error::Handshake(
                 reqwest_websocket::HandshakeError::UnexpectedStatusCode(status),
@@ -1953,22 +1932,6 @@ mod tests {
         );
         let limited = rate_limited(&error).expect("a profile 429 went unrecognized");
         assert_eq!(limited.retry_after, Some(Duration::from_secs(30)));
-    }
-
-    /// Contact discovery runs on its own service with its own quota, and says
-    /// "retry later" in its own error. That is Signal rate-limiting lookups
-    /// and must surface as RateLimited with the wait it named.
-    #[test]
-    fn a_rate_limited_discovery_carries_signals_wait() {
-        let error = TestError::ServiceError(ServiceError::CdsiLookupError(
-            libsignal_net::cdsi::LookupError::RateLimited(
-                libsignal_net::infra::errors::RetryLater {
-                    retry_after_seconds: 90,
-                },
-            ),
-        ));
-        let limited = rate_limited(&error).expect("a discovery limit went unrecognized");
-        assert_eq!(limited.retry_after, Some(Duration::from_secs(90)));
     }
 
     /// Reconnecting to receive after a drop is fine, but reconnecting a second
