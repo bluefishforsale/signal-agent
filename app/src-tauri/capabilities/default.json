@@ -10,6 +10,8 @@
     "core:event:allow-unlisten",
     "allow-current",
     "allow-send",
+    "allow-accounts",
+    "allow-add-account",
     "allow-open-captcha",
     "allow-needs-move",
     "allow-move-to-applications",

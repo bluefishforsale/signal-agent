@@ -19,6 +19,7 @@ mod view;
 
 use std::time::Duration;
 
+use relay_core::ProfileName;
 use relay_setup::prelude::*;
 use scripted::Scripted;
 use session::{Session, Setup};
@@ -39,17 +40,32 @@ mod placement {
     }
 }
 
-/// Who carries setup forward: relay-setup's driver, or the scripted
-/// walk-through in development builds.
+/// Who carries `profile`'s setup forward: relay-setup's driver, or the
+/// scripted walk-through in development builds.
 #[cfg(not(feature = "mock-driver"))]
-fn setup() -> Box<dyn Setup> {
+fn setup(profile: ProfileName) -> Box<dyn Setup> {
     let start = start_state();
-    real::setup(start.clone()).unwrap_or_else(|e| Box::new(Scripted::new(start, unavailable(e))))
+    real::setup(start.clone(), profile)
+        .unwrap_or_else(|e| Box::new(Scripted::new(start, unavailable(e))))
 }
 
 #[cfg(feature = "mock-driver")]
-fn setup() -> Box<dyn Setup> {
+fn setup(_profile: ProfileName) -> Box<dyn Setup> {
     Box::new(Scripted::new(start_state(), mock::script))
+}
+
+/// The accounts on this computer, or in development builds a scratch list
+/// that never touches the developer's own setup.
+#[cfg(not(feature = "mock-driver"))]
+fn profiles() -> anyhow::Result<Profiles> {
+    Profiles::system()
+}
+
+#[cfg(feature = "mock-driver")]
+fn profiles() -> anyhow::Result<Profiles> {
+    Ok(Profiles::under(
+        std::env::temp_dir().join("mcp-relay-for-signal-dev"),
+    ))
 }
 
 /// Fails each step with why setup couldn't start, instead of pretending.
@@ -110,6 +126,24 @@ fn send(event: SetupEvent, session: State<'_, Session>, app: AppHandle) {
         return;
     };
     session.send(event);
+}
+
+#[tauri::command]
+fn accounts() -> Result<Vec<accounts::Account>, String> {
+    profiles()
+        .and_then(|profiles| accounts::list(&profiles))
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Starts setup of a new account called `name` in the window.
+#[tauri::command]
+fn add_account(name: String, session: State<'_, Session>) -> Result<View, String> {
+    let start = || -> anyhow::Result<View> {
+        let profile = profiles()?.available(&name)?;
+        tauri::async_runtime::spawn(session.switch_to(setup(profile))?);
+        Ok(session.view())
+    };
+    start().map_err(|e| format!("{e:#}"))
 }
 
 #[tauri::command]
@@ -238,7 +272,7 @@ fn main() {
                     eprintln!("unable to redraw the setup window: {e}");
                 }
             };
-            let (session, run) = Session::new(setup(), redraw);
+            let (session, run) = Session::new(setup(ProfileName::default_profile()), redraw);
             app.manage(session);
             tauri::async_runtime::spawn(run);
             tauri::async_runtime::spawn(updater::watch(app.handle().clone()));
@@ -261,6 +295,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             current,
             send,
+            accounts,
+            add_account,
             open_captcha,
             needs_move,
             move_to_applications,

@@ -177,6 +177,18 @@
       "description": "Permission identifier",
       "oneOf": [
         {
+          "description": "Enables the accounts command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-accounts",
+          "markdownDescription": "Enables the accounts command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the add_account command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-add-account",
+          "markdownDescription": "Enables the add_account command without any pre-configured scope."
+        },
+        {
           "description": "Enables the current command without any pre-configured scope.",
           "type": "string",
           "const": "allow-current",
@@ -229,6 +241,18 @@
           "type": "string",
           "const": "allow-update-offer",
           "markdownDescription": "Enables the update_offer command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the accounts command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-accounts",
+          "markdownDescription": "Denies the accounts command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the add_account command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-add-account",
+          "markdownDescription": "Denies the add_account command without any pre-configured scope."
         },
         {
           "description": "Denies the current command without any pre-configured scope.",

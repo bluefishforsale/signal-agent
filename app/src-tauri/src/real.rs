@@ -36,9 +36,8 @@ impl Setup for Driver {
     }
 }
 
-/// Setup of the default profile, starting at `start`.
-pub fn setup(start: SetupState) -> anyhow::Result<Box<dyn Setup>> {
-    let profile = ProfileName::default_profile();
+/// Setup of `profile`, starting at `start`.
+pub fn setup(start: SetupState, profile: ProfileName) -> anyhow::Result<Box<dyn Setup>> {
     let server = ServerEntry::for_profile(&profile, &agent()?, ["mcp", "--profile", &profile])?;
     let paths = ProfilePaths::for_profile(&profile)?;
     let store = || -> anyhow::Result<ProfileStore> {
