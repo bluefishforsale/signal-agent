@@ -59,7 +59,7 @@ impl Tool for SendMessage {
         let to = Recipient::Contact(contact(ctx, &input.recipient).await?);
         let body = non_blank("message", input.message)?;
         let quote = quote(ctx, input.quote_author, input.quote_timestamp).await?;
-        send_text(ctx, to, body, quote).await
+        send_text(ctx, to, body, quote, vec![]).await
     }
 }
 
@@ -108,7 +108,7 @@ impl Tool for SendGroupMessage {
         let to = Recipient::Group(group(&input.group_id)?);
         let body = non_blank("message", input.message)?;
         let quote = quote(ctx, input.quote_author, input.quote_timestamp).await?;
-        send_text(ctx, to, body, quote).await
+        send_text(ctx, to, body, quote, vec![]).await
     }
 }
 
@@ -155,7 +155,7 @@ impl Tool for SendNoteToSelf {
             author: me,
             sent_at_ms: t.ms(),
         });
-        send_text(ctx, Recipient::Contact(me), body, quote).await
+        send_text(ctx, Recipient::Contact(me), body, quote, vec![]).await
     }
 }
 
@@ -281,7 +281,7 @@ impl Tool for SendReadReceipt {
 
 /// The quoted message named by an author and send time, which must come
 /// together or not at all.
-async fn quote(
+pub(crate) async fn quote(
     ctx: &ToolContext,
     author: Option<String>,
     timestamp: Option<Timestamp>,
@@ -298,15 +298,16 @@ async fn quote(
     }
 }
 
-/// Sends `body` to `to` and records it in the local history as this
-/// account's own message.
+/// Sends `body` with `attachments` to `to` and records it in the local
+/// history as this account's own message.
 // NOTE: Signal doesn't echo a device's own sends back to it, so a send that
 // skips the store never shows up in get_conversation or search_messages.
-async fn send_text(
+pub(crate) async fn send_text(
     ctx: &ToolContext,
     to: Recipient,
     body: String,
     quote: Option<MessageId>,
+    attachments: Vec<AttachmentRef>,
 ) -> Result<Value, ToolError> {
     let id = ctx
         .signal
@@ -315,7 +316,7 @@ async fn send_text(
             Outgoing::Text {
                 body: body.clone(),
                 quote,
-                attachments: vec![],
+                attachments: attachments.clone(),
             },
         )
         .await?;
@@ -326,8 +327,8 @@ async fn send_text(
             sender: id.author,
             from_me: true,
             received_at_ms: id.sent_at_ms,
-            body: Some(body),
-            attachments: vec![],
+            body: (!body.is_empty()).then_some(body),
+            attachments,
             quote,
             edited: false,
             deleted: false,
