@@ -4,9 +4,13 @@
 
 use std::{
     future::Future,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
+use anyhow::bail;
 use async_trait::async_trait;
 use relay_setup::{driver::HistorySkip, prelude::*};
 use tokio::sync::mpsc;
@@ -42,6 +46,8 @@ pub struct Session {
 struct Current {
     events: mpsc::UnboundedSender<SetupEvent>,
     skip: Option<HistorySkip>,
+    /// Clicks sent and not yet handled.
+    unhandled: Arc<AtomicUsize>,
 }
 
 impl Session {
@@ -70,9 +76,13 @@ impl Session {
         &self,
         setup: Box<dyn Setup>,
     ) -> anyhow::Result<impl Future<Output = ()> + Send + 'static> {
+        let mut current = self.current.lock().expect("setup lock");
+        if current.unhandled.load(Ordering::SeqCst) > 0 {
+            bail!("setup is still working; wait for it to finish");
+        }
         let first = view(setup.state());
-        let (current, run) = drive(setup, Arc::clone(&self.screen), Arc::clone(&self.on_change));
-        *self.current.lock().expect("setup lock") = current;
+        let (next, run) = drive(setup, Arc::clone(&self.screen), Arc::clone(&self.on_change));
+        *current = next;
         *self.screen.lock().expect("screen lock") = first.clone();
         (self.on_change)(&first);
         Ok(run)
@@ -90,6 +100,7 @@ impl Session {
         if let (SetupEvent::SkipHistory, Some(skip)) = (&event, &current.skip) {
             skip.skip();
         }
+        current.unhandled.fetch_add(1, Ordering::SeqCst);
         if current.events.send(event).is_err() {
             eprintln!("setup has stopped; ignoring a click");
         }
@@ -105,6 +116,8 @@ fn drive(
 ) -> (Current, impl Future<Output = ()> + Send + 'static) {
     let (events, mut queued) = mpsc::unbounded_channel();
     let skip = setup.history_skip();
+    let unhandled = Arc::new(AtomicUsize::new(0));
+    let handled = Arc::clone(&unhandled);
     let run = async move {
         let mut redraw = move |state: &SetupState| {
             let view = view(state);
@@ -118,9 +131,17 @@ fn drive(
             // NOTE: a driver shows only changed states, but the page keeps
             // the clicked button disabled until it is redrawn.
             redraw(setup.state());
+            handled.fetch_sub(1, Ordering::SeqCst);
         }
     };
-    (Current { events, skip }, run)
+    (
+        Current {
+            events,
+            skip,
+            unhandled,
+        },
+        run,
+    )
 }
 
 #[cfg(test)]
@@ -233,6 +254,20 @@ mod tests {
             number: "+15555550123".into(),
         });
         assert_eq!(next(&mut rx).await, "requesting_code");
+    }
+
+    /// A click still queued or running would carry on against the setup
+    /// being replaced, which for the real driver may be mid-link with Signal,
+    /// so switching must wait until setup is idle.
+    #[tokio::test(start_paused = true)]
+    async fn switching_is_refused_while_a_click_is_queued_or_running() {
+        let (session, mut rx) = started();
+        session.send(SetupEvent::AccountChosen {
+            choice: AccountChoice::LinkExisting,
+        });
+        let switched = session.switch_to(scripted());
+        assert!(switched.is_err(), "switched with a click queued");
+        assert_eq!(next(&mut rx).await, "linking");
     }
 
     /// A click setup ignores changes nothing, but the page still needs a
