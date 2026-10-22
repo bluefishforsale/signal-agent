@@ -113,8 +113,11 @@ pub(crate) fn incoming(content: &Content, me: ServiceId) -> Option<Incoming> {
         });
     }
     if let Some(delete) = &data.admin_delete {
-        return Some(Incoming::Delete {
-            conversation,
+        let Recipient::Group(group) = conversation else {
+            return None;
+        };
+        return Some(Incoming::AdminDelete {
+            group,
             target: MessageId {
                 author: aci_of(delete.target_author_aci_binary.as_deref(), None)?,
                 sent_at_ms: delete.target_sent_timestamp?,
@@ -248,13 +251,22 @@ pub(crate) fn content_body(
             r#type: Some(receipt_message::Type::Read.into()),
             timestamp: targets.iter().map(|t| t.sent_at_ms).collect(),
         }),
+        Outgoing::AdminDelete { .. } if group.is_none() => {
+            bail!("an admin delete only goes to a group")
+        }
+        Outgoing::AdminDelete { target } => ContentBody::DataMessage(data(DataMessage {
+            admin_delete: Some(data_message::AdminDelete {
+                target_author_aci_binary: Some(aci(target.author).service_id_binary()),
+                target_sent_timestamp: Some(target.sent_at_ms),
+            }),
+            ..Default::default()
+        })),
         Outgoing::Sticker { .. }
         | Outgoing::Pin { .. }
         | Outgoing::Unpin { .. }
         | Outgoing::PollCreate { .. }
         | Outgoing::PollVote { .. }
-        | Outgoing::PollTerminate { .. }
-        | Outgoing::AdminDelete { .. } => {
+        | Outgoing::PollTerminate { .. } => {
             bail!("sending {message:?} is not implemented yet (lane L1b)")
         }
     })
@@ -575,26 +587,36 @@ mod tests {
         );
     }
 
-    /// A group admin deleting someone else's message must arrive as a delete
-    /// whose `from` is the admin and whose target keeps its real author, so the
-    /// store sees the mismatch instead of a forged self-delete.
+    /// A group admin deleting someone else's message must arrive as an admin
+    /// delete naming its group, with the admin as `from` and the target keeping
+    /// its real author, so capture can check `from` against the group's admins.
+    /// Outside a group there are no admins, so it carries nothing to apply.
     #[test]
-    fn admin_delete_keeps_target_author_and_admin_as_from() {
-        let content = content_from(
-            ALICE,
-            ContentBody::DataMessage(DataMessage {
-                timestamp: Some(61),
-                admin_delete: Some(data_message::AdminDelete {
-                    target_author_aci_binary: Some(ME.as_bytes().to_vec()),
-                    target_sent_timestamp: Some(51),
+    fn admin_delete_arrives_as_an_admin_delete_only_in_its_group() {
+        let master_key = [6u8; 32];
+        let admin_delete = |group_v2| {
+            content_from(
+                ALICE,
+                ContentBody::DataMessage(DataMessage {
+                    timestamp: Some(61),
+                    group_v2,
+                    admin_delete: Some(data_message::AdminDelete {
+                        target_author_aci_binary: Some(ME.as_bytes().to_vec()),
+                        target_sent_timestamp: Some(51),
+                    }),
+                    ..Default::default()
                 }),
-                ..Default::default()
-            }),
-        );
+            )
+        };
+        let in_group = admin_delete(Some(GroupContextV2 {
+            master_key: Some(master_key.to_vec()),
+            revision: Some(1),
+            group_change: None,
+        }));
         assert_eq!(
-            incoming(&content, ServiceId::new(ME)),
-            Some(Incoming::Delete {
-                conversation: Recipient::Contact(ServiceId::new(ALICE)),
+            incoming(&in_group, ServiceId::new(ME)),
+            Some(Incoming::AdminDelete {
+                group: group_id(master_key),
                 target: MessageId {
                     author: ServiceId::new(ME),
                     sent_at_ms: 51
@@ -602,6 +624,7 @@ mod tests {
                 from: ServiceId::new(ALICE),
             })
         );
+        assert_eq!(incoming(&admin_delete(None), ServiceId::new(ME)), None);
     }
 
     /// A read receipt from a contact marks the account's own messages read;
@@ -819,6 +842,7 @@ mod tests {
             (message_id_by(ALICE), ".{0,40}")
                 .prop_map(|(target, body)| Outgoing::Edit { target, body }),
             message_id_by(ALICE).prop_map(|target| Outgoing::Delete { target }),
+            message_id_by(ME).prop_map(|target| Outgoing::AdminDelete { target }),
         ]
     }
 
@@ -838,7 +862,12 @@ mod tests {
                 revision: Some(4),
                 group_change: None,
             });
-            let body = content_body(&message, sent_at_ms, group.as_ref()).expect("generated variants convert");
+            let body = content_body(&message, sent_at_ms, group.as_ref());
+            if matches!(message, Outgoing::AdminDelete { .. }) && !in_group {
+                prop_assert!(body.is_err(), "an admin delete went to a person");
+                return Ok(());
+            }
+            let body = body.expect("generated variants convert");
             let alice = ServiceId::new(ALICE);
             let conversation = if in_group {
                 Recipient::Group(group_id(master_key))
@@ -861,6 +890,7 @@ mod tests {
                 Outgoing::Reaction { target, emoji, remove } => Incoming::Reaction { conversation, target, from: alice, emoji, remove },
                 Outgoing::Edit { target, body } => Incoming::Edit { conversation, target, from: alice, body },
                 Outgoing::Delete { target } => Incoming::Delete { conversation, target, from: alice },
+                Outgoing::AdminDelete { target } => Incoming::AdminDelete { group: group_id(master_key), target, from: alice },
                 other => unreachable!("not generated: {other:?}"),
             };
             prop_assert_eq!(got, Some(expected));
