@@ -10,7 +10,7 @@ use futures::StreamExt;
 use relay_core::prelude::*;
 use relay_secrets::{SecretStore, StoreKey};
 use relay_signal::{LinkEvent, Provisioner, RegistrationStep};
-use relay_tools::{Clock, Limits, SystemClock};
+use relay_tools::{Clock, Limits, Settings, SystemClock};
 
 use crate::{
     Command, SetupEvent, SetupState,
@@ -242,13 +242,19 @@ impl Driver {
 
     /// Refuses a link or registration too soon after the last one, before
     /// Signal hears of it.
-    // NOTE: the default limits apply until they're read from settings (#72).
     fn begin_provisioning(&self) -> anyhow::Result<()> {
         let root = &self.paths.root;
         fs::create_dir_all(root)
             .with_context(|| format!("unable to create \"{}\"", root.display()))?;
-        let path = root.join("provisioning.json");
-        relay_tools::begin_provisioning(&path, &Limits::default(), self.clock.now_ms())
+        // A damaged settings file must not block setup, which may be how the
+        // user gets back to Advanced to fix it; the defaults are conservative.
+        let limits = Settings::load(&self.paths.settings)
+            .map(|s| s.limits)
+            .unwrap_or_else(|e| {
+                tracing::warn!("using the default provisioning backoff: {e:#}");
+                Limits::default()
+            });
+        relay_tools::begin_provisioning(&self.paths.provisioning, &limits, self.clock.now_ms())
     }
 
     // NOTE: the agent opens this same store once it starts, and two processes
@@ -978,6 +984,33 @@ mod tests {
             }
         );
         assert_eq!(links(world.log()), 2, "{:?}", world.log());
+    }
+
+    /// A longer provisioning backoff saved under Advanced must hold setup back
+    /// too, not just the default five minutes.
+    #[tokio::test]
+    async fn the_provisioning_backoff_saved_in_settings_is_the_one_applied() {
+        let world = World::new()
+            .stopped_clock()
+            .link(vec![Err(anyhow::anyhow!("network down"))])
+            .link(vec![linked()]);
+        let paths = world.paths();
+        std::fs::create_dir_all(&paths.root).expect("profile dir");
+        std::fs::write(
+            &paths.settings,
+            br#"{"limits": {"provisioning_backoff_minutes": 30}}"#,
+        )
+        .expect("settings");
+        let mut h = Harness::new(&world);
+        assert_failed(&h.send(LINK).await, "link");
+        world.clock.advance(10 * 60 * 1_000);
+        assert_failed(&h.send(SetupEvent::Retry).await, "early retry");
+        let links = |log: Vec<String>| log.iter().filter(|e| e.starts_with("link as")).count();
+        assert_eq!(links(world.log()), 1, "{:?}", world.log());
+        assert!(
+            paths.provisioning.exists(),
+            "the attempt wasn't recorded at the profile's provisioning path"
+        );
     }
 
     /// Sending the captcha Signal asked for finishes the same attempt, so the
