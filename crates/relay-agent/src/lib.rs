@@ -2,6 +2,7 @@
 //! else (stdio shims, the HTTP front end, setup) reaches Signal through it,
 //! because two processes driving one Signal device corrupt its sessions.
 
+mod all_profiles;
 mod capture;
 pub mod endpoint;
 pub mod login;
@@ -22,6 +23,7 @@ use relay_tools::{
 use rmcp::ServiceExt;
 use tokio::task::JoinSet;
 
+pub use all_profiles::run_all_profiles;
 pub use supervisor::{Supervisor, SupervisorAction};
 
 /// What the agent needs to start.
