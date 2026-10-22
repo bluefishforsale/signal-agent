@@ -17,6 +17,7 @@ mod registry;
 mod schedule;
 mod send;
 mod settings;
+mod stickers;
 #[cfg(test)]
 mod testing;
 mod tool;
