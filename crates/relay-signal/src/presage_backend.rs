@@ -284,8 +284,28 @@ impl SignalBackend for PresageSignal {
         };
         futures::stream::once(start).flatten().boxed()
     }
-    async fn upload(&self, _file: &SendableFile) -> anyhow::Result<AttachmentRef> {
-        bail!("uploading attachments is not implemented yet (lane L1b)")
+    async fn upload(&self, file: &SendableFile) -> anyhow::Result<AttachmentRef> {
+        let path = file.path().to_owned();
+        let size = tokio::fs::metadata(&path)
+            .await
+            .with_context(|| format!("unable to read \"{}\"", path.display()))?
+            .len();
+        if size > MAX_ATTACHMENT_BYTES {
+            bail!(
+                "\"{}\" is {size} bytes, larger than the {MAX_ATTACHMENT_BYTES} Signal accepts",
+                path.display()
+            );
+        }
+        let bytes = tokio::fs::read(&path)
+            .await
+            .with_context(|| format!("unable to read \"{}\"", path.display()))?;
+        let spec = convert::attachment_spec(&path, bytes.len());
+        let manager = self.manager.clone();
+        let pointer = self
+            .worker
+            .run(move || async move { upload(&manager, spec, bytes).await })
+            .await??;
+        Ok(convert::attachment_ref(&pointer))
     }
 
     async fn discover(
@@ -311,6 +331,9 @@ impl SignalBackend for PresageSignal {
         bail!("listing devices is not implemented yet (lane L1b)")
     }
 }
+
+/// The largest attachment Signal's apps accept.
+const MAX_ATTACHMENT_BYTES: u64 = 100 * 1024 * 1024;
 
 /// Which Signal service an account lives on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1210,6 +1233,29 @@ mod tests {
                 "sticker {sticker_id}: unclear error: {err:#}"
             );
         }
+    }
+
+    /// A file past Signal's attachment limit would be read whole into memory
+    /// only for Signal to refuse it; it must fail before either happens.
+    #[tokio::test]
+    async fn a_file_over_signals_attachment_limit_is_refused_before_reading() {
+        let (dir, path) = temp_store();
+        register_linked(&path).await;
+        let big = dir.path().join("big.bin");
+        std::fs::File::create(&big)
+            .and_then(|file| file.set_len(MAX_ATTACHMENT_BYTES + 1))
+            .expect("sparse file");
+        let roots = crate::SendRoots::new([dir.path().to_path_buf()]).expect("roots");
+        let file = roots.admit(&big).expect("admitted");
+        let signal = PresageSignal::open(&path, &KEY).await.expect("opens");
+        let err = signal
+            .upload(&file)
+            .await
+            .expect_err("uploaded past the limit");
+        assert!(
+            err.to_string().contains("larger than"),
+            "unclear error: {err:#}"
+        );
     }
 
     /// Sending to a group the account isn't in must fail with a reason, before

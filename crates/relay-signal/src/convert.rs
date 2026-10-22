@@ -1,6 +1,8 @@
 //! The only place presage and libsignal types meet relay-core types, so the
 //! protocol's shape changes in one file when presage moves.
 
+use std::path::Path;
+
 use anyhow::{Context, bail};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use presage::libsignal_service::prelude::{
@@ -12,6 +14,7 @@ use presage::{
         content::{Content, ContentBody},
         groups_v2::Role,
         protocol,
+        sender::AttachmentSpec,
         zkgroup::groups::{GroupMasterKey, GroupSecretParams},
     },
     manager::{RegistrationData, RegistrationType},
@@ -172,6 +175,21 @@ pub(crate) fn attachment_pointer(attachment: &AttachmentRef) -> anyhow::Result<A
         .context("attachment id is not one this backend issued")?;
     AttachmentPointer::decode(bytes.as_slice())
         .context("attachment id is not one this backend issued")
+}
+
+/// How to upload the file at `path`, `length` bytes long.
+pub(crate) fn attachment_spec(path: &Path, length: usize) -> AttachmentSpec {
+    AttachmentSpec {
+        content_type: mime_guess::from_path(path)
+            .first_or_octet_stream()
+            .essence_str()
+            .to_owned(),
+        length,
+        file_name: path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned()),
+        ..Default::default()
+    }
 }
 
 /// What to put on the wire for `message`, sent at `sent_at_ms`, carrying
@@ -1097,6 +1115,24 @@ mod tests {
         assert_eq!(sticker.emoji.as_deref(), Some("🐈"));
         assert_eq!(sticker.data, Some(image));
         assert_eq!(data.timestamp, Some(9));
+    }
+
+    /// Receivers decide how to show an attachment by its content type, so a
+    /// photo must go out as an image, under its own file name; a type nobody
+    /// recognizes goes out as a plain file rather than a guess.
+    #[test]
+    fn an_upload_carries_its_file_name_and_a_content_type_from_it() {
+        let cases = [
+            ("/send/cat.png", "image/png"),
+            ("/send/Notes.PDF", "application/pdf"),
+            ("/send/unknown.zzz9", "application/octet-stream"),
+        ];
+        for (path, content_type) in cases {
+            let spec = attachment_spec(std::path::Path::new(path), 42);
+            assert_eq!(spec.content_type, content_type, "{path}");
+            assert_eq!(spec.length, 42, "{path}");
+            assert_eq!(spec.file_name.as_deref(), path.rsplit('/').next(), "{path}");
+        }
     }
 
     /// Typing in a group names the group by its public id; group members' apps
