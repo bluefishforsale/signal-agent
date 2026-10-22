@@ -2,9 +2,12 @@
 //! Desktop and want more than the phone's link-time transfer gave them. It only
 //! reads Desktop's database; it never writes to it.
 
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use base64::Engine as _;
 use futures::TryStreamExt as _;
 use relay_core::prelude::*;
@@ -14,13 +17,27 @@ use sqlx::{ConnectOptions as _, Connection as _, sqlite::SqliteConnectOptions};
 
 use crate::{ImportProgress, ImportSummary, desktop_key, full_name};
 
+/// Where Signal Desktop keeps its data on this OS: Application Support on
+/// macOS, `%APPDATA%` on Windows, `$XDG_CONFIG_HOME` on Linux.
+pub fn signal_desktop_dir() -> Option<PathBuf> {
+    dirs::config_dir().map(|dir| dir.join("Signal"))
+}
+
+/// Whether `dir` holds Signal Desktop's data: its config and its database.
+pub fn is_signal_desktop(dir: &Path) -> bool {
+    dir.join("config.json").is_file() && dir.join("sql").join("db.sqlite").is_file()
+}
+
 /// Imports the messages in Signal Desktop's database under `signal_dir` (its
 /// data directory, holding `config.json` and `sql/db.sqlite`) into `store`.
+/// Refuses, writing nothing, when Desktop is signed in to an account other
+/// than `our_aci`.
 ///
 /// Reading the database key may ask the user to allow access to the OS
 /// keystore. Messages from people without an ACI are skipped and counted.
 pub async fn import_signal_desktop(
     signal_dir: &Path,
+    our_aci: ServiceId,
     store: &dyn MessageStore,
     progress: &mut (dyn FnMut(ImportProgress) + Send),
 ) -> anyhow::Result<ImportSummary> {
@@ -34,17 +51,24 @@ pub async fn import_signal_desktop(
         .await
         .with_context(|| format!("unable to open \"{}\"", db_path.display()))?;
 
-    let (our_aci,) = sqlx::query_as::<_, (String,)>("SELECT json FROM items WHERE id = 'uuid_id'")
-        .fetch_optional(&mut conn)
-        .await
-        .context("reading Signal Desktop's account")?
-        .context("Signal Desktop isn't linked to an account")?;
-    let our_aci = parse(&our_aci)?
+    let (desktop_aci,) =
+        sqlx::query_as::<_, (String,)>("SELECT json FROM items WHERE id = 'uuid_id'")
+            .fetch_optional(&mut conn)
+            .await
+            .context("reading Signal Desktop's account")?
+            .context("Signal Desktop isn't linked to an account")?;
+    let desktop_aci = parse(&desktop_aci)?
         .get("value")
         .and_then(Value::as_str)
         .and_then(|v| v.split('.').next())
         .and_then(|aci| ServiceId::parse(aci).ok())
         .context("Signal Desktop's account has no ACI")?;
+    if desktop_aci != our_aci {
+        bail!(
+            "Signal Desktop is signed in to another account ({desktop_aci}), not this \
+             profile's ({our_aci}); its history isn't yours to import here"
+        );
+    }
 
     let mut conversations = HashMap::new();
     let mut titles = Vec::new();
@@ -289,11 +313,29 @@ mod tests {
         async fn import(self) -> (MemoryStore, ImportSummary) {
             self.conn.close().await.expect("close");
             let store = MemoryStore::default();
-            let summary = import_signal_desktop(self.dir.path(), &store, &mut |_| {})
+            let summary = import_signal_desktop(self.dir.path(), aci(OUR_ACI), &store, &mut |_| {})
                 .await
                 .expect("import");
             (store, summary)
         }
+    }
+
+    /// Setup offers the import only where Desktop's data really is: a folder
+    /// with its config and database, not a leftover or unrelated "Signal"
+    /// folder, which would fail after the user said yes.
+    #[test]
+    fn only_a_folder_with_desktops_config_and_database_counts_as_desktop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        assert!(!is_signal_desktop(root), "empty folder");
+        std::fs::write(root.join("config.json"), "{}").expect("config");
+        assert!(!is_signal_desktop(root), "config without a database");
+        std::fs::create_dir(root.join("sql")).expect("sql");
+        std::fs::write(root.join("sql/db.sqlite"), "").expect("db");
+        assert!(is_signal_desktop(root), "config and database");
+        std::fs::remove_file(root.join("config.json")).expect("rm");
+        assert!(!is_signal_desktop(root), "database without a config");
+        assert!(!is_signal_desktop(&root.join("missing")), "missing folder");
     }
 
     fn aci(s: &str) -> ServiceId {
@@ -311,6 +353,47 @@ mod tests {
             );
         }
         out
+    }
+
+    /// A Signal Desktop signed in to another account must not pour that
+    /// account's history into this profile: the import refuses before writing
+    /// anything, and says whose it is.
+    #[tokio::test]
+    async fn desktop_signed_in_to_another_account_is_refused() {
+        let mut desktop = Desktop::new().await;
+        desktop
+            .conversation(
+                "c-alice",
+                json!({ "type": "private", "serviceId": ALICE_ACI }),
+            )
+            .await;
+        desktop
+            .message(
+                "m1",
+                "c-alice",
+                json!({ "type": "incoming", "sent_at": 1, "sourceServiceId": ALICE_ACI, "body": "x" }),
+            )
+            .await;
+        desktop.conn.close().await.expect("close");
+        let store = MemoryStore::default();
+        let Err(e) =
+            import_signal_desktop(desktop.dir.path(), aci(ALICE_ACI), &store, &mut |_| {}).await
+        else {
+            panic!("imported another account's history");
+        };
+        assert!(format!("{e:#}").contains(OUR_ACI), "{e:#}");
+        assert!(
+            all_messages(&store).await.is_empty(),
+            "wrote before refusing"
+        );
+        assert!(
+            store
+                .conversations()
+                .await
+                .expect("conversations")
+                .is_empty(),
+            "titled conversations before refusing"
+        );
     }
 
     /// The basic promise: a text in Desktop's encrypted database comes out in
@@ -649,9 +732,11 @@ mod tests {
         desktop.conn.close().await.expect("close");
         let store = MemoryStore::default();
         let mut seen = vec![];
-        import_signal_desktop(desktop.dir.path(), &store, &mut |p| seen.push(p.imported))
-            .await
-            .expect("import");
+        import_signal_desktop(desktop.dir.path(), aci(OUR_ACI), &store, &mut |p| {
+            seen.push(p.imported)
+        })
+        .await
+        .expect("import");
         assert_eq!(seen, vec![1, 2]);
     }
 
@@ -672,7 +757,7 @@ mod tests {
         let mut summaries = vec![];
         for _ in 0..2 {
             summaries.push(
-                import_signal_desktop(desktop.dir.path(), &store, &mut |_| {})
+                import_signal_desktop(desktop.dir.path(), aci(OUR_ACI), &store, &mut |_| {})
                     .await
                     .expect("import"),
             );
@@ -694,7 +779,12 @@ mod tests {
         fn assert_send<T: Send>(_: T) {}
         let store = MemoryStore::default();
         let mut progress = |_| {};
-        assert_send(import_signal_desktop(Path::new("."), &store, &mut progress));
+        assert_send(import_signal_desktop(
+            Path::new("."),
+            aci(OUR_ACI),
+            &store,
+            &mut progress,
+        ));
     }
 
     /// Copies the fixture made by the stock `sqlcipher` CLI (SQLCipher 4.19,
@@ -717,7 +807,7 @@ mod tests {
     async fn a_database_written_by_stock_sqlcipher_opens() {
         let dir = stock_sqlcipher_fixture();
         let store = MemoryStore::default();
-        let summary = import_signal_desktop(dir.path(), &store, &mut |_| {})
+        let summary = import_signal_desktop(dir.path(), aci(OUR_ACI), &store, &mut |_| {})
             .await
             .expect("import");
         assert_eq!(summary.imported, 1, "{summary:?}");
@@ -741,7 +831,7 @@ mod tests {
         )
         .expect("config");
         let store = MemoryStore::default();
-        let result = import_signal_desktop(dir.path(), &store, &mut |_| {}).await;
+        let result = import_signal_desktop(dir.path(), aci(OUR_ACI), &store, &mut |_| {}).await;
         assert!(result.is_err(), "opened with the wrong key: {result:?}");
     }
 }

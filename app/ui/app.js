@@ -54,6 +54,14 @@ function render(view) {
       fill(section, "note", view.note);
       break;
     }
+    case "history_unavailable":
+      for (const p of section.querySelectorAll("[data-reason]")) {
+        p.hidden = p.dataset.reason !== view.reason;
+      }
+      break;
+    case "importing_desktop":
+      fill(section, "imported", view.imported.toLocaleString());
+      break;
     case "done": {
       const list = section.querySelector('[data-field="clients"]');
       list.replaceChildren(...view.clients.map((client) => {
@@ -73,6 +81,7 @@ function render(view) {
     }
     case "failed":
       fill(section, "message", view.message);
+      section.querySelector('[data-field="skip_history"]').hidden = !view.can_skip_history;
       break;
   }
 
@@ -145,6 +154,9 @@ const actions = {
   choose_access: () => send({ event: "access_chosen", access: checked("access") }),
   restart_desktop: () => send({ event: "restart_desktop" }),
   retry: () => send({ event: "retry" }),
+  skip_history: () => send({ event: "skip_history" }),
+  desktop_yes: () => send({ event: "desktop_import_chosen", import: true }),
+  desktop_no: () => send({ event: "desktop_import_chosen", import: false }),
   open_captcha: async (button) => {
     const error = document.querySelector('[data-field="captcha_error"]');
     error.hidden = true;

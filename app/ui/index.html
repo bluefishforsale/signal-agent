@@ -145,6 +145,37 @@
       <progress data-field="percent" max="100"></progress>
       <p><strong data-field="imported"></strong> messages so far</p>
       <p class="note" data-field="note"></p>
+      <div class="actions"><button data-action="skip_history">Skip</button></div>
+    </section>
+
+    <section data-screen="history_unavailable" hidden>
+      <h1>No earlier messages</h1>
+      <p data-reason="not_sent" hidden>Your phone didn't send any earlier messages.</p>
+      <p data-reason="relink_requested" hidden>Your phone couldn't send your earlier messages. To try again later, remove this computer in Signal's Linked devices and run setup again.</p>
+      <p data-reason="timed_out" hidden>Your phone didn't send your earlier messages in time.</p>
+      <p>Claude can still read every message from now on.</p>
+      <div class="actions"><button class="primary" data-action="skip_history">Continue</button></div>
+    </section>
+
+    <section data-screen="finding_desktop" hidden>
+      <h1>Finishing up</h1>
+      <p class="waiting"><span class="spinner"></span>One moment.</p>
+    </section>
+
+    <section data-screen="offer_desktop_import" hidden>
+      <h1>Import from Signal Desktop too?</h1>
+      <p>Signal Desktop is on this computer. Its messages can be imported as well, which may bring in older ones your phone didn't send.</p>
+      <p class="note">Only Desktop's database is read; nothing in it changes. Your computer may ask to let this read Signal Desktop's key.</p>
+      <div class="actions">
+        <button class="primary" data-action="desktop_no">No thanks</button>
+        <button data-action="desktop_yes">Import</button>
+      </div>
+    </section>
+
+    <section data-screen="importing_desktop" hidden>
+      <h1>Importing from Signal Desktop</h1>
+      <p><strong data-field="imported"></strong> messages so far</p>
+      <p class="note">If your computer asks to let this read Signal Desktop's key, allow it, or the import can't open the database.</p>
     </section>
 
     <section data-screen="connecting_clients" hidden>
@@ -188,7 +219,10 @@
     <section data-screen="failed" hidden>
       <h1>Something went wrong</h1>
       <p data-field="message"></p>
-      <div class="actions"><button class="primary" data-action="retry">Try again</button></div>
+      <div class="actions">
+        <button class="primary" data-action="retry">Try again</button>
+        <button data-action="skip_history" data-field="skip_history" hidden>Skip earlier messages</button>
+      </div>
     </section>
   </main>
 </body>

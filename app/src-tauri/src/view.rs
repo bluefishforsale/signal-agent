@@ -45,13 +45,24 @@ pub enum View {
         percent: Option<u8>,
         note: &'static str,
     },
+    HistoryUnavailable {
+        reason: HistoryGap,
+    },
+    FindingDesktop,
+    OfferDesktopImport,
+    ImportingDesktop {
+        imported: u64,
+    },
     ConnectingClients,
     Done {
         clients: Vec<ClientLine>,
         can_restart_desktop: bool,
     },
+    /// `can_skip_history` when what failed was the history import, which
+    /// the user may give up on.
     Failed {
         message: String,
+        can_skip_history: bool,
     },
 }
 
@@ -104,6 +115,12 @@ pub fn view(state: &SetupState) -> View {
             percent: total.map(|total| percent(*imported, total)),
             note: HISTORY_NOTE,
         },
+        S::HistoryUnavailable { reason, .. } => View::HistoryUnavailable { reason: *reason },
+        S::FindingDesktop { .. } => View::FindingDesktop,
+        S::OfferDesktopImport { .. } => View::OfferDesktopImport,
+        S::ImportingDesktop { imported, .. } => View::ImportingDesktop {
+            imported: *imported,
+        },
         S::ConnectingClients { .. } => View::ConnectingClients,
         S::Done { clients } => View::Done {
             clients: clients
@@ -117,8 +134,9 @@ pub fn view(state: &SetupState) -> View {
                 .iter()
                 .any(|c| c.client == ClaudeClient::Desktop && c.result.is_ok()),
         },
-        S::Failed { message, .. } => View::Failed {
+        S::Failed { message, retry } => View::Failed {
             message: message.clone(),
+            can_skip_history: matches!(**retry, S::ImportingHistory { .. }),
         },
     }
 }
@@ -198,6 +216,20 @@ mod tests {
                 total: Some(10),
                 access: AccessMode::Full,
             },
+            SetupState::HistoryUnavailable {
+                reason: HistoryGap::TimedOut,
+                access: AccessMode::Full,
+            },
+            SetupState::FindingDesktop {
+                access: AccessMode::Full,
+            },
+            SetupState::OfferDesktopImport {
+                access: AccessMode::Full,
+            },
+            SetupState::ImportingDesktop {
+                imported: 4,
+                access: AccessMode::Full,
+            },
             SetupState::ConnectingClients {
                 access: AccessMode::Full,
             },
@@ -266,6 +298,53 @@ mod tests {
         assert_eq!(note, HISTORY_NOTE);
         assert!(PAGE.contains(r#"data-field="note""#), "no note field");
         assert!(!PAGE.contains("45 days"), "index.html has its own copy");
+    }
+
+    /// The page shows the reason whose name the view sends; a reason with no
+    /// matching paragraph would leave the screen without its explanation.
+    #[test]
+    fn every_missing_history_reason_has_its_explanation() {
+        for reason in [
+            HistoryGap::NotSent,
+            HistoryGap::RelinkRequested,
+            HistoryGap::TimedOut,
+        ] {
+            let json = serde_json::to_value(view(&SetupState::HistoryUnavailable {
+                reason,
+                access: AccessMode::Full,
+            }))
+            .unwrap();
+            let name = json["reason"].as_str().expect("reason name");
+            let paragraph = format!(r#"data-reason="{name}""#);
+            assert!(PAGE.contains(&paragraph), "index.html has no {paragraph}");
+        }
+    }
+
+    /// Only a failed history import may offer skipping; anywhere else the
+    /// button would send an event setup ignores.
+    #[test]
+    fn only_a_failed_history_import_offers_skipping() {
+        let failed = |retry| {
+            let View::Failed {
+                can_skip_history, ..
+            } = view(&SetupState::Failed {
+                message: "no".into(),
+                retry: Box::new(retry),
+            })
+            else {
+                panic!("not the failure screen");
+            };
+            can_skip_history
+        };
+        assert!(failed(SetupState::ImportingHistory {
+            imported: 0,
+            total: None,
+            access: AccessMode::Full,
+        }));
+        assert!(!failed(SetupState::EnterNumber));
+        assert!(!failed(SetupState::OfferDesktopImport {
+            access: AccessMode::Full,
+        }));
     }
 
     fn done(clients: &[(ClaudeClient, Result<(), &str>)]) -> View {
