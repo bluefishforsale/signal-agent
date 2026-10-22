@@ -61,13 +61,7 @@ impl Tool for ListContacts {
             .await?
             .iter()
             .filter(|c| needle.as_deref().is_none_or(|n| matches(c, n)))
-            .map(|c| {
-                json!({
-                    "number": c.phone_number,
-                    "service_id": c.service_id.to_string(),
-                    "name": c.name,
-                })
-            })
+            .map(contact_row)
             .collect();
         Ok(json!({ "contacts": contacts }))
     }
@@ -78,6 +72,65 @@ fn matches(contact: &Contact, needle: &str) -> bool {
         .into_iter()
         .flatten()
         .any(|field| field.to_lowercase().contains(needle))
+}
+
+fn contact_row(contact: &Contact) -> Value {
+    json!({
+        "number": contact.phone_number,
+        "service_id": contact.service_id.to_string(),
+        "name": contact.name,
+    })
+}
+
+pub struct FindContact;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FindContactInput {
+    query: String,
+}
+
+#[async_trait]
+impl Tool for FindContact {
+    fn name(&self) -> &'static str {
+        "find_contact"
+    }
+    fn description(&self) -> &'static str {
+        "Find contacts whose name, phone number or service id contains query \
+         (case-insensitive), from the contacts this account already knows; nobody is looked up \
+         on Signal. Returns number (E.164, null if unknown), service_id and name for each. \
+         No messages sent."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Part of a name, number or service id (case-insensitive)",
+                },
+            },
+            "required": ["query"],
+            "additionalProperties": false,
+        })
+    }
+    fn writes(&self) -> bool {
+        false
+    }
+    async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
+        let FindContactInput { query } = parse(input)?;
+        let needle = non_blank("query", query)?.to_lowercase();
+        let contacts: Vec<_> = ctx
+            .signal
+            .contacts()
+            .await?
+            .iter()
+            .filter(|c| matches(c, &needle) || c.service_id.to_string().contains(&needle))
+            .map(contact_row)
+            .collect();
+        Ok(json!({ "contacts": contacts }))
+    }
 }
 
 pub struct ListGroups;
@@ -337,6 +390,36 @@ mod tests {
             3,
             "{everyone}"
         );
+    }
+
+    /// find_contact is how a client turns whatever it was handed (a name, a
+    /// number fragment, a pasted service id) into one contact, so all three
+    /// must match and nobody else may.
+    #[tokio::test]
+    async fn find_contact_matches_name_number_or_service_id_and_nothing_else() {
+        let contacts = vec![
+            contact(2, "Ada Lovelace", "+15550000002"),
+            contact(0xfeed, "Grace Hopper", "+15550000003"),
+        ];
+        let (ctx, _) = ctx_with(AccessMode::ReadOnly, ProfileKind::Linked, contacts);
+        let registry = Registry::standard();
+        for (query, expected) in [
+            ("ada", "Ada Lovelace"),
+            ("0000003", "Grace Hopper"),
+            ("FEED", "Grace Hopper"),
+        ] {
+            let out = registry
+                .call(&ctx, "find_contact", json!({"query": query}))
+                .await
+                .unwrap();
+            let names: Vec<_> = out["contacts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["name"].as_str().unwrap().to_owned())
+                .collect();
+            assert_eq!(names, [expected], "query {query}: {out}");
+        }
     }
 
     fn group(byte: u8, title: &str, members: &[u128]) -> Group {
