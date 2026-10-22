@@ -204,6 +204,14 @@ pub struct RateLimited {
     pub retry_after: Option<Duration>,
 }
 
+/// This version can't look phone numbers up on Signal.
+// NOTE: typed so a tool can say so plainly instead of reporting every number
+// as unregistered. Discovery needs presage's cdsi feature, held back for now
+// (BoringSSL on every target, and bulk lookups look like contact scraping).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("looking up phone numbers on Signal isn't supported in this version")]
+pub struct DiscoveryUnsupported;
+
 fn wait_hint(retry_after: Option<Duration>) -> String {
     match retry_after {
         Some(wait) => format!("Try again in {}s", wait.as_secs()),

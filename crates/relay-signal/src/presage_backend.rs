@@ -3,7 +3,7 @@
 //! dedicated thread and the trait methods only pass work to it.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt::Display,
     future::Future,
     path::Path,
@@ -22,19 +22,21 @@ use futures::{StreamExt, stream::BoxStream};
 use presage::{
     Manager,
     libsignal_service::{
+        ProfileManagerError,
         configuration::SignalServers,
         prelude::{MessageSenderError, ServiceError, phonenumber::PhoneNumber},
         provisioning::ProvisioningError,
     },
     libsignal_service::{
-        content::Content,
+        content::{Content, ContentBody},
         protocol::{
             DeviceId, IdentityKey, IdentityKeyStore, ProtocolAddress, ServiceId as SignalServiceId,
         },
+        sender::{AttachmentSpec, AttachmentUploadError},
     },
     manager::{Confirmation, Registered, RegistrationOptions},
     model::messages::Received,
-    proto::GroupContextV2,
+    proto::{AttachmentPointer, GroupContextV2},
     store::{ContentsStore, StateStore, Store, Thread},
 };
 use presage_store_sqlite::{OnNewIdentity, SqliteConnectOptions, SqliteStore};
@@ -43,8 +45,8 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
 use crate::{
-    Account, Contact, Device, Group, Identity, Incoming, LinkEvent, Outgoing, Provisioner,
-    RateLimited, RegistrationStep, SendableFile, SignalBackend, convert,
+    Account, Contact, Device, DiscoveryUnsupported, Group, Identity, Incoming, LinkEvent, Outgoing,
+    Provisioner, RateLimited, RegistrationStep, SendableFile, SignalBackend, Trust, convert,
 };
 
 type Job = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()>>> + Send>;
@@ -159,7 +161,14 @@ pub struct PresageSignal {
     account: Account,
     incoming_taken: AtomicBool,
     last_sent_at_ms: AtomicU64,
+    changed_identities: ChangedIdentities,
 }
+
+/// Contacts whose identity key the receive loop saw change.
+// NOTE: in memory only, so it starts empty on every start. presage keeps no
+// record of a replaced key or of verification (its contact sync drops the
+// phone's Verified record), so this is the only source `changed` has.
+type ChangedIdentities = Arc<Mutex<HashSet<ServiceId>>>;
 
 impl PresageSignal {
     /// Opens the account in the store at `path`, encrypted with `key`. Nothing
@@ -184,6 +193,7 @@ impl PresageSignal {
             account,
             incoming_taken: AtomicBool::new(false),
             last_sent_at_ms: AtomicU64::new(0),
+            changed_identities: ChangedIdentities::default(),
         })
     }
 }
@@ -200,6 +210,11 @@ impl SignalBackend for PresageSignal {
             && target.author != me
         {
             bail!("Signal only edits and deletes your own messages; {target:?} is someone else's");
+        }
+        if let Outgoing::PollTerminate { poll } = &message
+            && poll.author != me
+        {
+            bail!("Signal only ends your own polls; {poll:?} is someone else's");
         }
         let sent_at_ms = next_timestamp(&self.last_sent_at_ms, now_ms()?);
         let manager = self.manager.clone();
@@ -258,17 +273,18 @@ impl SignalBackend for PresageSignal {
             .boxed();
         }
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let (worker, manager, me) = (
+        let (worker, manager, me, changed) = (
             self.worker.clone(),
             self.manager.clone(),
             self.account.service_id,
+            self.changed_identities.clone(),
         );
         // Connecting waits for the first poll, so holding the stream unpolled
         // never touches the network.
         let start = async move {
             let started = worker
                 .run(move || async move {
-                    tokio::task::spawn_local(receive(manager, me, tx));
+                    tokio::task::spawn_local(receive(manager, me, changed, tx));
                 })
                 .await;
             match started {
@@ -278,33 +294,143 @@ impl SignalBackend for PresageSignal {
         };
         futures::stream::once(start).flatten().boxed()
     }
-    async fn upload(&self, _file: &SendableFile) -> anyhow::Result<AttachmentRef> {
-        bail!("uploading attachments is not implemented yet (lane L1b)")
+    async fn upload(&self, file: &SendableFile) -> anyhow::Result<AttachmentRef> {
+        let path = file.path().to_owned();
+        let size = tokio::fs::metadata(&path)
+            .await
+            .with_context(|| format!("unable to read \"{}\"", path.display()))?
+            .len();
+        if size > MAX_ATTACHMENT_BYTES {
+            bail!(
+                "\"{}\" is {size} bytes, larger than the {MAX_ATTACHMENT_BYTES} Signal accepts",
+                path.display()
+            );
+        }
+        let bytes = tokio::fs::read(&path)
+            .await
+            .with_context(|| format!("unable to read \"{}\"", path.display()))?;
+        let spec = convert::attachment_spec(&path, bytes.len());
+        let manager = self.manager.clone();
+        let pointer = self
+            .worker
+            .run(move || async move { upload(&manager, spec, bytes).await })
+            .await??;
+        Ok(convert::attachment_ref(&pointer))
     }
 
     async fn discover(
         &self,
         _numbers: &[String],
     ) -> anyhow::Result<Vec<(String, Option<ServiceId>)>> {
-        bail!("contact discovery is not implemented yet (lane L1b)")
+        Err(DiscoveryUnsupported.into())
     }
 
-    async fn lookup_username(&self, _username: &str) -> anyhow::Result<Option<ServiceId>> {
-        bail!("username lookup is not implemented yet (lane L1b)")
+    async fn lookup_username(&self, username: &str) -> anyhow::Result<Option<ServiceId>> {
+        let (mut manager, name) = (self.manager.clone(), username.to_owned());
+        let aci = self
+            .worker
+            .run(move || async move { manager.lookup_username(&name).await })
+            .await?
+            .map_err(|e| signal_error(e, format!("unable to look up username \"{username}\"")))?;
+        Ok(aci.map(|aci| ServiceId::new(aci.into())))
     }
 
-    async fn avatar(&self, _of: Recipient) -> anyhow::Result<Option<Vec<u8>>> {
-        bail!("avatars are not implemented yet (lane L1b)")
+    async fn avatar(&self, of: Recipient) -> anyhow::Result<Option<Vec<u8>>> {
+        let me = self.account.service_id;
+        let mut manager = self.manager.clone();
+        self.worker
+            .run(move || async move {
+                match of {
+                    Recipient::Contact(contact) => {
+                        let profile_key = if contact == me {
+                            Some(manager.registration_data().profile_key())
+                        } else {
+                            manager
+                                .store()
+                                .profile_key(&convert::aci(contact).into())
+                                .await
+                                .context("unable to read profile keys")?
+                        };
+                        let Some(profile_key) = profile_key else {
+                            bail!("{contact} hasn't shared their profile key, so their picture can't be read");
+                        };
+                        manager
+                            .retrieve_profile_avatar_by_uuid(contact.uuid(), profile_key)
+                            .await
+                            .map_err(|e| {
+                                signal_error(e, format!("unable to fetch the picture of {contact}"))
+                            })
+                    }
+                    Recipient::Group(id) => {
+                        let (master_key, group) = group_by_id(manager.store(), id).await?;
+                        let context = GroupContextV2 {
+                            master_key: Some(master_key.to_vec()),
+                            revision: Some(group.revision),
+                            group_change: None,
+                        };
+                        manager.retrieve_group_avatar(context).await.map_err(|e| {
+                            signal_error(e, format!("unable to fetch the avatar of group {id}"))
+                        })
+                    }
+                }
+            })
+            .await?
     }
 
     async fn identities(&self) -> anyhow::Result<Vec<Identity>> {
-        bail!("listing identities is not implemented yet (lane L1b)")
+        let me = self.account.service_id;
+        let store = self.manager.store().clone();
+        let changed = self
+            .changed_identities
+            .lock()
+            .expect("changed identities lock")
+            .clone();
+        self.worker
+            .run(move || async move {
+                let keys = store.aci_protocol_store();
+                let mine = keys
+                    .get_identity_key_pair()
+                    .await
+                    .context("unable to read the account's identity key")?;
+                let mut identities = Vec::new();
+                for contact in store.contacts().await.context("unable to list contacts")? {
+                    let contact = contact.context("unreadable contact in the store")?;
+                    let them = ServiceId::new(contact.uuid);
+                    let address = protocol_address(SignalServiceId::from(convert::aci(them)))?;
+                    let Some(key) = keys
+                        .get_identity(&address)
+                        .await
+                        .with_context(|| format!("unable to read the identity key of {them}"))?
+                    else {
+                        continue;
+                    };
+                    identities.push(Identity {
+                        service_id: them,
+                        safety_number: convert::safety_number(me, mine.identity_key(), them, &key)?,
+                        // NOTE: nothing in presage's store records a
+                        // verification, so no key reads as verified here.
+                        trust: Trust::Unverified,
+                        changed: changed.contains(&them),
+                    });
+                }
+                anyhow::Ok(identities)
+            })
+            .await?
     }
 
     async fn devices(&self) -> anyhow::Result<Vec<Device>> {
-        bail!("listing devices is not implemented yet (lane L1b)")
+        let manager = self.manager.clone();
+        let devices = self
+            .worker
+            .run(move || async move { manager.devices().await })
+            .await?
+            .map_err(|e| signal_error(e, "unable to list linked devices"))?;
+        Ok(devices.iter().map(convert::device).collect())
     }
 }
+
+/// The largest attachment Signal's apps accept.
+const MAX_ATTACHMENT_BYTES: u64 = 100 * 1024 * 1024;
 
 /// Which Signal service an account lives on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -493,7 +619,7 @@ async fn send(
     }
     match to {
         Recipient::Contact(contact) => {
-            let body = convert::content_body(&message, sent_at_ms, None)?;
+            let body = content_body(&manager, &message, sent_at_ms, None).await?;
             manager
                 .send_message(convert::aci(contact), body, sent_at_ms)
                 .await
@@ -506,13 +632,77 @@ async fn send(
                 revision: Some(group.revision),
                 group_change: None,
             };
-            let body = convert::content_body(&message, sent_at_ms, Some(&context))?;
+            let body = content_body(&manager, &message, sent_at_ms, Some(&context)).await?;
             manager
                 .send_message_to_group(&master_key, body, sent_at_ms)
                 .await
                 .map_err(|e| signal_error(e, format!("unable to send to group {id}")))
         }
     }
+}
+
+/// What to put on the wire for `message`, uploading a sticker's image first.
+// NOTE: the sticker is looked up before anything is uploaded, so a pack that
+// isn't installed fails without reaching Signal.
+async fn content_body(
+    manager: &Manager<SqliteStore, Registered>,
+    message: &Outgoing,
+    sent_at_ms: u64,
+    group: Option<&GroupContextV2>,
+) -> anyhow::Result<ContentBody> {
+    let Outgoing::Sticker { pack, sticker_id } = message else {
+        return convert::content_body(message, sent_at_ms, group);
+    };
+    let Some(installed) = manager
+        .store()
+        .sticker_pack(pack.as_bytes())
+        .await
+        .context("unable to read sticker packs")?
+    else {
+        bail!("sticker pack {pack} is not installed");
+    };
+    let Some(sticker) = installed
+        .manifest
+        .stickers
+        .iter()
+        .find(|s| s.id == *sticker_id)
+    else {
+        bail!("sticker pack {pack} has no sticker {sticker_id}");
+    };
+    let Some(bytes) = sticker.bytes.clone() else {
+        bail!("sticker {sticker_id} of pack {pack} was never downloaded");
+    };
+    let spec = AttachmentSpec {
+        content_type: sticker
+            .content_type
+            .clone()
+            .unwrap_or_else(|| "image/webp".into()),
+        length: bytes.len(),
+        ..Default::default()
+    };
+    let image = upload(manager, spec, bytes).await?;
+    Ok(convert::sticker_body(
+        *pack,
+        &installed.key,
+        *sticker_id,
+        sticker.emoji.as_deref(),
+        image,
+        sent_at_ms,
+        group,
+    ))
+}
+
+/// Encrypts and uploads `bytes`, returning the pointer a message carries.
+async fn upload(
+    manager: &Manager<SqliteStore, Registered>,
+    spec: AttachmentSpec,
+    bytes: Vec<u8>,
+) -> anyhow::Result<AttachmentPointer> {
+    manager
+        .upload_attachment(spec, bytes)
+        .await
+        .map_err(|e| signal_error(e, "unable to upload attachment"))?
+        .map_err(upload_error)
 }
 
 /// The cached group with public id `id`, with the master key sending needs.
@@ -590,10 +780,11 @@ async fn admitted(store: &SqliteStore, content: &Content) -> bool {
 // message. A stranger's first key is new, not changed, and isn't reported.
 struct IdentityWatch {
     known: HashMap<String, IdentityKey>,
+    changed: ChangedIdentities,
 }
 
 impl IdentityWatch {
-    async fn primed(store: &SqliteStore) -> Self {
+    async fn primed(store: &SqliteStore, changed: ChangedIdentities) -> Self {
         let mut people: Vec<SignalServiceId> = Vec::new();
         match store.contacts().await {
             Ok(contacts) => people.extend(
@@ -613,6 +804,7 @@ impl IdentityWatch {
         }
         let mut watch = Self {
             known: HashMap::new(),
+            changed,
         };
         for who in people {
             watch.changed(store, who).await;
@@ -623,11 +815,9 @@ impl IdentityWatch {
     /// Whether `who`'s identity key differs from the last one seen.
     async fn changed(&mut self, store: &SqliteStore, who: SignalServiceId) -> bool {
         let name = who.service_id_string();
-        // Identity keys are per account; the device id is ignored by the lookup.
-        let Ok(device) = DeviceId::new(1) else {
+        let Ok(address) = protocol_address(who) else {
             return false;
         };
-        let address = ProtocolAddress::new(name.clone(), device);
         let current = match store.aci_protocol_store().get_identity(&address).await {
             Ok(Some(current)) => current,
             Ok(None) => return false,
@@ -636,10 +826,25 @@ impl IdentityWatch {
                 return false;
             }
         };
-        self.known
+        let changed = self
+            .known
             .insert(name, current)
-            .is_some_and(|previous| previous != current)
+            .is_some_and(|previous| previous != current);
+        if changed {
+            self.changed
+                .lock()
+                .expect("changed identities lock")
+                .insert(ServiceId::new(who.raw_uuid()));
+        }
+        changed
     }
+}
+
+/// The address `who`'s identity key is stored under.
+fn protocol_address(who: SignalServiceId) -> anyhow::Result<ProtocolAddress> {
+    // Identity keys are per account; the device id is ignored by the lookup.
+    let device = DeviceId::new(1).context("device 1 is out of range")?;
+    Ok(ProtocolAddress::new(who.service_id_string(), device))
 }
 
 /// Receives from Signal for as long as anyone holds the other end of `tx`,
@@ -649,9 +854,10 @@ impl IdentityWatch {
 async fn receive(
     mut manager: Manager<SqliteStore, Registered>,
     me: ServiceId,
+    changed: ChangedIdentities,
     tx: mpsc::UnboundedSender<anyhow::Result<Incoming>>,
 ) {
-    let mut identities = IdentityWatch::primed(manager.store()).await;
+    let mut identities = IdentityWatch::primed(manager.store(), changed).await;
     let mut delay = MIN_RECONNECT_DELAY;
     while !tx.is_closed() {
         let mut wait = delay;
@@ -728,7 +934,8 @@ where
 fn rate_limited<S: std::error::Error>(error: &presage::Error<S>) -> Option<RateLimited> {
     match error {
         presage::Error::ServiceError(service)
-        | presage::Error::ProvisioningError(ProvisioningError::ServiceError(service)) => {
+        | presage::Error::ProvisioningError(ProvisioningError::ServiceError(service))
+        | presage::Error::ProfileManagerError(ProfileManagerError::ServiceError(service)) => {
             service_rate_limited(service)
         }
         presage::Error::MessageSenderError(sender) => match sender.as_ref() {
@@ -782,6 +989,16 @@ fn service_rate_limited(error: &ServiceError) -> Option<RateLimited> {
     }
 }
 
+/// A failed upload, as the typed `RateLimited` when Signal rate-limited it.
+fn upload_error(error: AttachmentUploadError) -> anyhow::Error {
+    if let AttachmentUploadError::ServiceError(service) = &error
+        && let Some(limited) = service_rate_limited(service)
+    {
+        return limited.into();
+    }
+    anyhow!(error).context("unable to upload attachment")
+}
+
 // NOTE: the challenge token stays out of the message; it would otherwise reach
 // whatever MCP client asked for the send.
 fn proof_required(options: &[String]) -> RateLimited {
@@ -813,6 +1030,7 @@ mod tests {
     use presage::{
         libsignal_service::{
             content::{ContentBody, Metadata},
+            protocol::IdentityKeyPair,
             websocket::registration::RegistrationSessionMetadataResponse,
         },
         manager::RegistrationData,
@@ -827,9 +1045,39 @@ mod tests {
     const KEY: [u8; 32] = [7; 32];
     const ME: &str = "00000000-0000-0000-0000-00000000003e";
 
+    /// Every test that builds the staging fixture must run behind a proxy that
+    /// goes nowhere, so a send that slips past a local guard fails instead of
+    /// dialing Signal. Running these tests without it is the bug.
+    #[test]
+    fn tests_run_behind_a_proxy_that_goes_nowhere() {
+        assert_network_is_dead();
+    }
+
+    fn assert_network_is_dead() {
+        for var in ["HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"] {
+            assert_eq!(
+                std::env::var(var).as_deref(),
+                Ok("http://127.0.0.1:9"),
+                "{var} must point at the dead proxy; run tests with \
+                 HTTPS_PROXY=HTTP_PROXY=ALL_PROXY=http://127.0.0.1:9"
+            );
+        }
+        let no_proxy = std::env::var("NO_PROXY").unwrap_or_default();
+        assert!(
+            !no_proxy.contains("signal") && !no_proxy.contains('*'),
+            "NO_PROXY exempts Signal from the dead proxy: {no_proxy}"
+        );
+    }
+
     /// Writes a linked account's registration into a fresh store at `path`, as
     /// linking would, without touching Signal's servers.
+    // NOTE: presage's SignalServers offers only Staging and Production, so this
+    // account points at Signal's staging servers and nothing here can make
+    // that address unroutable. The dead proxy is the barrier: anything that
+    // gets past a local guard dials staging unless it is set, which is why
+    // building the fixture checks for it.
     async fn register_linked(path: &Path) {
+        assert_network_is_dead();
         let phone_number: presage::libsignal_service::prelude::phonenumber::PhoneNumber =
             "+15550000001".parse().expect("valid number");
         // presage's profile key deserializer borrows, so this goes through text.
@@ -1039,6 +1287,349 @@ mod tests {
         }
     }
 
+    /// Ending a poll names only its timestamp, which receivers pair with the
+    /// sender; ending someone else's poll would close one of ours, or nothing,
+    /// so it must fail here before reaching Signal.
+    #[tokio::test]
+    async fn ending_someone_elses_poll_is_refused() {
+        let (_dir, path) = temp_store();
+        register_linked(&path).await;
+        let signal = PresageSignal::open(&path, &KEY).await.expect("opens");
+        let alice = ServiceId::new(uuid::Uuid::from_u128(0xa11ce));
+        let theirs = MessageId {
+            author: alice,
+            sent_at_ms: 5,
+        };
+        let err = signal
+            .send(
+                Recipient::Contact(alice),
+                Outgoing::PollTerminate { poll: theirs },
+            )
+            .await
+            .expect_err("ended someone else's poll");
+        assert!(
+            err.to_string().contains("your own"),
+            "failed for the wrong reason: {err:#}"
+        );
+    }
+
+    /// A sticker's pack key comes from presage's store; a pack the account
+    /// never installed has none, so the send must fail before reaching Signal.
+    #[tokio::test]
+    async fn a_sticker_from_a_pack_not_installed_fails_without_the_network() {
+        let (_dir, path) = temp_store();
+        register_linked(&path).await;
+        let signal = PresageSignal::open(&path, &KEY).await.expect("opens");
+        let alice = ServiceId::new(uuid::Uuid::from_u128(0xa11ce));
+        let err = signal
+            .send(
+                Recipient::Contact(alice),
+                Outgoing::Sticker {
+                    pack: StickerPackId::new([1; 16]),
+                    sticker_id: 0,
+                },
+            )
+            .await
+            .expect_err("sent a sticker from a pack never installed");
+        assert!(
+            err.to_string().contains("not installed"),
+            "unclear error: {err:#}"
+        );
+    }
+
+    /// An installed pack without the asked-for sticker, or whose image never
+    /// downloaded, has nothing to send; both must fail before any upload.
+    #[tokio::test]
+    async fn a_sticker_missing_from_its_installed_pack_fails_without_the_network() {
+        let (_dir, path) = temp_store();
+        register_linked(&path).await;
+        let pack = StickerPackId::new([1; 16]);
+        seed(&path, move |mut store| async move {
+            let sticker = |id, bytes| presage::store::Sticker {
+                id,
+                emoji: None,
+                content_type: Some("image/webp".into()),
+                bytes,
+            };
+            store
+                .add_sticker_pack(&presage::store::StickerPack {
+                    id: pack.as_bytes().to_vec(),
+                    key: vec![2; 32],
+                    manifest: presage::store::StickerPackManifest {
+                        title: "cats".into(),
+                        author: "me".into(),
+                        cover: None,
+                        stickers: vec![sticker(0, None), sticker(1, Some(vec![1, 2, 3]))],
+                    },
+                })
+                .await
+                .expect("saved");
+        })
+        .await;
+        let signal = PresageSignal::open(&path, &KEY).await.expect("opens");
+        let alice = Recipient::Contact(ServiceId::new(uuid::Uuid::from_u128(0xa11ce)));
+        for (sticker_id, reason) in [(9, "has no sticker"), (0, "never downloaded")] {
+            let err = signal
+                .send(alice, Outgoing::Sticker { pack, sticker_id })
+                .await
+                .expect_err("sent a sticker with no image");
+            assert!(
+                err.to_string().contains(reason),
+                "sticker {sticker_id}: unclear error: {err:#}"
+            );
+        }
+    }
+
+    /// A file past Signal's attachment limit would be read whole into memory
+    /// only for Signal to refuse it; it must fail before either happens.
+    #[tokio::test]
+    async fn a_file_over_signals_attachment_limit_is_refused_before_reading() {
+        let (dir, path) = temp_store();
+        register_linked(&path).await;
+        let big = dir.path().join("big.bin");
+        std::fs::File::create(&big)
+            .and_then(|file| file.set_len(MAX_ATTACHMENT_BYTES + 1))
+            .expect("sparse file");
+        let roots = crate::SendRoots::new([dir.path().to_path_buf()]).expect("roots");
+        let file = roots.admit(&big).expect("admitted");
+        let signal = PresageSignal::open(&path, &KEY).await.expect("opens");
+        let err = signal
+            .upload(&file)
+            .await
+            .expect_err("uploaded past the limit");
+        assert!(
+            err.to_string().contains("larger than"),
+            "unclear error: {err:#}"
+        );
+    }
+
+    /// A username must have Signal's `name.digits` shape; anything else is
+    /// refused before a lookup reaches Signal, where it could only fail.
+    #[tokio::test]
+    async fn a_malformed_username_fails_without_the_network() {
+        let (_dir, path) = temp_store();
+        register_linked(&path).await;
+        let signal = PresageSignal::open(&path, &KEY).await.expect("opens");
+        let err = signal
+            .lookup_username("no-discriminator")
+            .await
+            .expect_err("looked up a malformed username");
+        assert!(
+            format!("{err:#}").contains("invalid Signal username"),
+            "unclear error: {err:#}"
+        );
+    }
+
+    /// A contact's profile picture is encrypted with their profile key; with
+    /// none shared, there's nothing to decrypt, so fetching it from Signal
+    /// would only spend a request. It must fail clearly instead.
+    #[tokio::test]
+    async fn a_contacts_avatar_without_their_profile_key_fails_without_the_network() {
+        let (_dir, path) = temp_store();
+        register_linked(&path).await;
+        let signal = PresageSignal::open(&path, &KEY).await.expect("opens");
+        let alice = ServiceId::new(uuid::Uuid::from_u128(0xa11ce));
+        let err = signal
+            .avatar(Recipient::Contact(alice))
+            .await
+            .expect_err("fetched an avatar with no profile key");
+        assert!(
+            err.to_string().contains("profile key"),
+            "unclear error: {err:#}"
+        );
+    }
+
+    /// Pictures presage already fetched come from its store, for a contact
+    /// under their profile key and for a group under its public id, without
+    /// asking Signal again.
+    #[tokio::test]
+    async fn cached_avatars_come_from_the_store() {
+        let (_dir, path) = temp_store();
+        register_linked(&path).await;
+        let me = uuid::Uuid::parse_str(ME).expect("uuid");
+        let alice = uuid::Uuid::from_u128(0xa11ce);
+        seed(&path, move |mut store| async move {
+            let key = presage::libsignal_service::prelude::ProfileKey::create([5; 32]);
+            store.upsert_profile_key(&alice, key).await.expect("key");
+            store
+                .save_profile_avatar(alice, key, &vec![1, 2, 3])
+                .await
+                .expect("profile avatar");
+            store
+                .save_group([4; 32], cached_group("cats", &[me]))
+                .await
+                .expect("group");
+            store
+                .save_group_avatar([4; 32], &vec![4, 5])
+                .await
+                .expect("group avatar");
+        })
+        .await;
+        let signal = PresageSignal::open(&path, &KEY).await.expect("opens");
+        let contact = signal
+            .avatar(Recipient::Contact(ServiceId::new(alice)))
+            .await
+            .expect("contact avatar");
+        assert_eq!(contact, Some(vec![1, 2, 3]));
+        let group = signal
+            .avatar(Recipient::Group(convert::group_id([4; 32])))
+            .await
+            .expect("group avatar");
+        assert_eq!(group, Some(vec![4, 5]));
+    }
+
+    /// Identities are read from the store alone: each contact with a key gets
+    /// the safety number for that key, and a contact the account never
+    /// exchanged keys with is left out. Nothing here has verified anyone.
+    #[tokio::test]
+    async fn identities_list_each_stored_key_with_its_safety_number() {
+        let (_dir, path) = temp_store();
+        register_linked(&path).await;
+        let (alice, bob) = (uuid::Uuid::from_u128(0xa11ce), uuid::Uuid::from_u128(0xb0b));
+        let mine = presage::libsignal_service::protocol::PrivateKey::deserialize(&[9; 32])
+            .ok()
+            .and_then(|private| IdentityKeyPair::try_from(private).ok())
+            .expect("a key pair");
+        seed(&path, move |mut store| async move {
+            store
+                .set_aci_identity_key_pair(mine)
+                .await
+                .expect("own key");
+            for uuid in [alice, bob] {
+                store
+                    .save_contact(&presage::model::contacts::Contact {
+                        uuid,
+                        phone_number: None,
+                        name: String::new(),
+                        verified: Default::default(),
+                        profile_key: Vec::new(),
+                        expire_timer: 0,
+                        expire_timer_version: 2,
+                        inbox_position: 0,
+                        avatar: None,
+                    })
+                    .await
+                    .expect("contact");
+            }
+            let address = ProtocolAddress::new(
+                SignalServiceId::from(convert::aci(ServiceId::new(alice))).service_id_string(),
+                DeviceId::new(1).expect("device 1"),
+            );
+            store
+                .aci_protocol_store()
+                .save_identity(&address, &identity_key(1))
+                .await
+                .expect("alice's key");
+        })
+        .await;
+        let signal = PresageSignal::open(&path, &KEY).await.expect("opens");
+        let identities = signal.identities().await.expect("identities");
+        let alice = ServiceId::new(alice);
+        let me = ServiceId::parse(ME).expect("uuid");
+        assert_eq!(
+            identities,
+            vec![Identity {
+                service_id: alice,
+                safety_number: convert::safety_number(
+                    me,
+                    mine.identity_key(),
+                    alice,
+                    &identity_key(1)
+                )
+                .expect("computes"),
+                trust: crate::Trust::Unverified,
+                changed: false,
+            }]
+        );
+    }
+
+    /// A contact whose key the receive loop saw change is listed as changed,
+    /// so list_identities shows the new safety number for what it is.
+    #[tokio::test]
+    async fn an_identity_whose_key_changed_while_receiving_is_listed_as_changed() {
+        let (_dir, path) = temp_store();
+        register_linked(&path).await;
+        let alice = uuid::Uuid::from_u128(0xa11ce);
+        let alice_id = SignalServiceId::from(convert::aci(ServiceId::new(alice)));
+        seed(&path, move |mut store| async move {
+            let mine = presage::libsignal_service::protocol::PrivateKey::deserialize(&[9; 32])
+                .ok()
+                .and_then(|private| IdentityKeyPair::try_from(private).ok())
+                .expect("a key pair");
+            store
+                .set_aci_identity_key_pair(mine)
+                .await
+                .expect("own key");
+            store
+                .save_contact(&presage::model::contacts::Contact {
+                    uuid: alice,
+                    phone_number: None,
+                    name: "Alice".into(),
+                    verified: Default::default(),
+                    profile_key: Vec::new(),
+                    expire_timer: 0,
+                    expire_timer_version: 2,
+                    inbox_position: 0,
+                    avatar: None,
+                })
+                .await
+                .expect("contact");
+            store
+                .aci_protocol_store()
+                .save_identity(
+                    &protocol_address(alice_id).expect("address"),
+                    &identity_key(1),
+                )
+                .await
+                .expect("first key");
+        })
+        .await;
+        let signal = PresageSignal::open(&path, &KEY).await.expect("opens");
+        let (store, changed) = (
+            signal.manager.store().clone(),
+            signal.changed_identities.clone(),
+        );
+        signal
+            .worker
+            .run(move || async move {
+                let mut watch = IdentityWatch::primed(&store, changed).await;
+                store
+                    .aci_protocol_store()
+                    .save_identity(
+                        &protocol_address(alice_id).expect("address"),
+                        &identity_key(2),
+                    )
+                    .await
+                    .expect("new key");
+                assert!(watch.changed(&store, alice_id).await, "change missed");
+            })
+            .await
+            .expect("worker ran");
+        let identities = signal.identities().await.expect("identities");
+        assert!(
+            matches!(identities.as_slice(), [identity] if identity.changed),
+            "{identities:?}"
+        );
+    }
+
+    /// Number discovery isn't in this version. Asking must fail with the typed
+    /// error a tool can match on, never an empty answer that reads as "nobody
+    /// is on Signal", and never reach Signal.
+    #[tokio::test]
+    async fn discovery_fails_as_unsupported_without_the_network() {
+        let (_dir, path) = temp_store();
+        register_linked(&path).await;
+        let signal = PresageSignal::open(&path, &KEY).await.expect("opens");
+        let err = signal
+            .discover(&["+15550000003".into()])
+            .await
+            .expect_err("discovery answered");
+        assert!(
+            err.downcast_ref::<crate::DiscoveryUnsupported>().is_some(),
+            "untyped: {err:#}"
+        );
+    }
+
     /// Sending to a group the account isn't in must fail with a reason, before
     /// anything reaches Signal, as it does on FakeSignal.
     #[tokio::test]
@@ -1234,7 +1825,7 @@ mod tests {
                 .save_identity(&address, &identity_key(1))
                 .await
                 .expect("first key");
-            let mut watch = IdentityWatch::primed(&store).await;
+            let mut watch = IdentityWatch::primed(&store, ChangedIdentities::default()).await;
             assert!(
                 !watch.changed(&store, alice_id).await,
                 "an unchanged key was reported"
@@ -1358,6 +1949,37 @@ mod tests {
             "not typed: {error:#}"
         );
         assert!(error.to_string().contains("30s"), "wait hidden: {error}");
+    }
+
+    /// An upload reports its failure in its own error type, beside presage's.
+    /// A 429 there is still Signal rate-limiting the account and must come
+    /// back typed, with its wait, and outermost.
+    #[test]
+    fn a_rate_limited_upload_is_recognized() {
+        let error = upload_error(AttachmentUploadError::ServiceError(
+            ServiceError::RateLimitExceeded {
+                retry_after: Some(chrono::Duration::seconds(30)),
+            },
+        ));
+        let limited = error
+            .downcast_ref::<RateLimited>()
+            .unwrap_or_else(|| panic!("an upload 429 went unrecognized: {error:#}"));
+        assert_eq!(limited.retry_after, Some(Duration::from_secs(30)));
+    }
+
+    /// Fetching a contact's profile for their picture wraps Signal's answer in
+    /// a profile error; a 429 there must still be recognized.
+    #[test]
+    fn a_rate_limited_profile_fetch_is_recognized() {
+        let error = TestError::ProfileManagerError(
+            presage::libsignal_service::ProfileManagerError::ServiceError(
+                ServiceError::RateLimitExceeded {
+                    retry_after: Some(chrono::Duration::seconds(30)),
+                },
+            ),
+        );
+        let limited = rate_limited(&error).expect("a profile 429 went unrecognized");
+        assert_eq!(limited.retry_after, Some(Duration::from_secs(30)));
     }
 
     /// Reconnecting to receive after a drop is fine, but reconnecting a second

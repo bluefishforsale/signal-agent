@@ -1,6 +1,8 @@
 //! The only place presage and libsignal types meet relay-core types, so the
 //! protocol's shape changes in one file when presage moves.
 
+use std::path::Path;
+
 use anyhow::{Context, bail};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use presage::libsignal_service::prelude::{
@@ -12,6 +14,8 @@ use presage::{
         content::{Content, ContentBody},
         groups_v2::Role,
         protocol,
+        sender::AttachmentSpec,
+        websocket::account::DeviceInfo,
         zkgroup::groups::{GroupMasterKey, GroupSecretParams},
     },
     manager::{RegistrationData, RegistrationType},
@@ -113,8 +117,11 @@ pub(crate) fn incoming(content: &Content, me: ServiceId) -> Option<Incoming> {
         });
     }
     if let Some(delete) = &data.admin_delete {
-        return Some(Incoming::Delete {
-            conversation,
+        let Recipient::Group(group) = conversation else {
+            return None;
+        };
+        return Some(Incoming::AdminDelete {
+            group,
             target: MessageId {
                 author: aci_of(delete.target_author_aci_binary.as_deref(), None)?,
                 sent_at_ms: delete.target_sent_timestamp?,
@@ -171,6 +178,21 @@ pub(crate) fn attachment_pointer(attachment: &AttachmentRef) -> anyhow::Result<A
         .context("attachment id is not one this backend issued")
 }
 
+/// How to upload the file at `path`, `length` bytes long.
+pub(crate) fn attachment_spec(path: &Path, length: usize) -> AttachmentSpec {
+    AttachmentSpec {
+        content_type: mime_guess::from_path(path)
+            .first_or_octet_stream()
+            .essence_str()
+            .to_owned(),
+        length,
+        file_name: path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned()),
+        ..Default::default()
+    }
+}
+
 /// What to put on the wire for `message`, sent at `sent_at_ms`, carrying
 /// `group` when it goes to a group.
 pub(crate) fn content_body(
@@ -184,11 +206,16 @@ pub(crate) fn content_body(
         ..message
     };
     Ok(match message {
-        Outgoing::Text { attachments, .. } if !attachments.is_empty() => {
-            bail!("sending attachments is not implemented yet (lane L1b)")
-        }
-        Outgoing::Text { body, quote, .. } => ContentBody::DataMessage(data(DataMessage {
+        Outgoing::Text {
+            body,
+            quote,
+            attachments,
+        } => ContentBody::DataMessage(data(DataMessage {
             body: Some(body.clone()),
+            attachments: attachments
+                .iter()
+                .map(attachment_pointer)
+                .collect::<anyhow::Result<_>>()?,
             quote: quote.map(|quote| data_message::Quote {
                 id: Some(quote.sent_at_ms),
                 author_aci: Some(aci(quote.author).service_id_string()),
@@ -243,16 +270,128 @@ pub(crate) fn content_body(
             r#type: Some(receipt_message::Type::Read.into()),
             timestamp: targets.iter().map(|t| t.sent_at_ms).collect(),
         }),
-        Outgoing::Sticker { .. }
-        | Outgoing::Pin { .. }
-        | Outgoing::Unpin { .. }
-        | Outgoing::PollCreate { .. }
-        | Outgoing::PollVote { .. }
-        | Outgoing::PollTerminate { .. }
-        | Outgoing::AdminDelete { .. } => {
-            bail!("sending {message:?} is not implemented yet (lane L1b)")
+        Outgoing::AdminDelete { .. } if group.is_none() => {
+            bail!("an admin delete only goes to a group")
+        }
+        Outgoing::AdminDelete { target } => ContentBody::DataMessage(data(DataMessage {
+            admin_delete: Some(data_message::AdminDelete {
+                target_author_aci_binary: Some(aci(target.author).service_id_binary()),
+                target_sent_timestamp: Some(target.sent_at_ms),
+            }),
+            ..Default::default()
+        })),
+        Outgoing::Pin {
+            target,
+            duration_secs,
+        } => ContentBody::DataMessage(data(DataMessage {
+            pin_message: Some(data_message::PinMessage {
+                target_author_aci_binary: Some(aci(target.author).service_id_binary()),
+                target_sent_timestamp: Some(target.sent_at_ms),
+                pin_duration: Some(match duration_secs {
+                    Some(secs) => {
+                        data_message::pin_message::PinDuration::PinDurationSeconds(secs.get())
+                    }
+                    None => data_message::pin_message::PinDuration::PinDurationForever(true),
+                }),
+            }),
+            ..Default::default()
+        })),
+        Outgoing::Unpin { target } => ContentBody::DataMessage(data(DataMessage {
+            unpin_message: Some(data_message::UnpinMessage {
+                target_author_aci_binary: Some(aci(target.author).service_id_binary()),
+                target_sent_timestamp: Some(target.sent_at_ms),
+            }),
+            ..Default::default()
+        })),
+        Outgoing::PollCreate {
+            question,
+            options,
+            multi_select,
+        } => ContentBody::DataMessage(data(DataMessage {
+            poll_create: Some(data_message::PollCreate {
+                question: Some(question.clone()),
+                allow_multiple: Some(*multi_select),
+                options: options.clone(),
+            }),
+            ..Default::default()
+        })),
+        Outgoing::PollVote {
+            poll,
+            option_indexes,
+            vote_count,
+        } => ContentBody::DataMessage(data(DataMessage {
+            poll_vote: Some(data_message::PollVote {
+                target_author_aci_binary: Some(aci(poll.author).service_id_binary()),
+                target_sent_timestamp: Some(poll.sent_at_ms),
+                option_indexes: option_indexes.clone(),
+                vote_count: Some(*vote_count),
+            }),
+            ..Default::default()
+        })),
+        Outgoing::PollTerminate { poll } => ContentBody::DataMessage(data(DataMessage {
+            poll_terminate: Some(data_message::PollTerminate {
+                target_sent_timestamp: Some(poll.sent_at_ms),
+            }),
+            ..Default::default()
+        })),
+        Outgoing::Sticker { .. } => {
+            bail!("a sticker goes out through sticker_body, once its pack is looked up")
         }
     })
+}
+
+/// What to put on the wire for sticker `sticker_id` of `pack`, whose image
+/// was uploaded as `image`.
+pub(crate) fn sticker_body(
+    pack: StickerPackId,
+    pack_key: &[u8],
+    sticker_id: u32,
+    emoji: Option<&str>,
+    image: AttachmentPointer,
+    sent_at_ms: u64,
+    group: Option<&GroupContextV2>,
+) -> ContentBody {
+    ContentBody::DataMessage(DataMessage {
+        timestamp: Some(sent_at_ms),
+        group_v2: group.cloned(),
+        sticker: Some(data_message::Sticker {
+            pack_id: Some(pack.as_bytes().to_vec()),
+            pack_key: Some(pack_key.to_vec()),
+            sticker_id: Some(sticker_id),
+            data: Some(image),
+            emoji: emoji.map(str::to_owned),
+        }),
+        ..Default::default()
+    })
+}
+
+pub(crate) fn device(info: &DeviceInfo) -> crate::Device {
+    crate::Device {
+        id: u32::from(info.id),
+        name: info.name.clone(),
+        created_at_ms: u64::try_from(info.created_at.timestamp_millis()).unwrap_or_default(),
+        last_seen_at_ms: u64::try_from(info.last_seen.timestamp_millis()).unwrap_or_default(),
+    }
+}
+
+/// The safety number Signal's apps show for `me` and `them` with these keys.
+pub(crate) fn safety_number(
+    me: ServiceId,
+    my_key: &protocol::IdentityKey,
+    them: ServiceId,
+    their_key: &protocol::IdentityKey,
+) -> anyhow::Result<String> {
+    // Version 2 and 5200 iterations, keyed by ACI bytes, as Signal's apps do.
+    protocol::Fingerprint::new(
+        2,
+        5200,
+        me.uuid().as_bytes(),
+        my_key,
+        them.uuid().as_bytes(),
+        their_key,
+    )
+    .and_then(|fingerprint| fingerprint.display_string())
+    .map_err(|e| anyhow::anyhow!("unable to compute the safety number with {them}: {e}"))
 }
 
 pub(crate) fn contact_from(contact: &presage::model::contacts::Contact) -> crate::Contact {
@@ -570,26 +709,36 @@ mod tests {
         );
     }
 
-    /// A group admin deleting someone else's message must arrive as a delete
-    /// whose `from` is the admin and whose target keeps its real author, so the
-    /// store sees the mismatch instead of a forged self-delete.
+    /// A group admin deleting someone else's message must arrive as an admin
+    /// delete naming its group, with the admin as `from` and the target keeping
+    /// its real author, so capture can check `from` against the group's admins.
+    /// Outside a group there are no admins, so it carries nothing to apply.
     #[test]
-    fn admin_delete_keeps_target_author_and_admin_as_from() {
-        let content = content_from(
-            ALICE,
-            ContentBody::DataMessage(DataMessage {
-                timestamp: Some(61),
-                admin_delete: Some(data_message::AdminDelete {
-                    target_author_aci_binary: Some(ME.as_bytes().to_vec()),
-                    target_sent_timestamp: Some(51),
+    fn admin_delete_arrives_as_an_admin_delete_only_in_its_group() {
+        let master_key = [6u8; 32];
+        let admin_delete = |group_v2| {
+            content_from(
+                ALICE,
+                ContentBody::DataMessage(DataMessage {
+                    timestamp: Some(61),
+                    group_v2,
+                    admin_delete: Some(data_message::AdminDelete {
+                        target_author_aci_binary: Some(ME.as_bytes().to_vec()),
+                        target_sent_timestamp: Some(51),
+                    }),
+                    ..Default::default()
                 }),
-                ..Default::default()
-            }),
-        );
+            )
+        };
+        let in_group = admin_delete(Some(GroupContextV2 {
+            master_key: Some(master_key.to_vec()),
+            revision: Some(1),
+            group_change: None,
+        }));
         assert_eq!(
-            incoming(&content, ServiceId::new(ME)),
-            Some(Incoming::Delete {
-                conversation: Recipient::Contact(ServiceId::new(ALICE)),
+            incoming(&in_group, ServiceId::new(ME)),
+            Some(Incoming::AdminDelete {
+                group: group_id(master_key),
                 target: MessageId {
                     author: ServiceId::new(ME),
                     sent_at_ms: 51
@@ -597,6 +746,7 @@ mod tests {
                 from: ServiceId::new(ALICE),
             })
         );
+        assert_eq!(incoming(&admin_delete(None), ServiceId::new(ME)), None);
     }
 
     /// A read receipt from a contact marks the account's own messages read;
@@ -767,15 +917,43 @@ mod tests {
         })
     }
 
+    /// A ref as `upload` returns it: the id encodes a full pointer.
+    fn uploaded() -> impl Strategy<Value = AttachmentRef> {
+        (
+            proptest::collection::vec(any::<u8>(), 64),
+            proptest::collection::vec(any::<u8>(), 32),
+            "[A-Za-z0-9_-]{1,40}",
+            any::<u32>(),
+            proptest::option::of("[a-z]{1,8}\\.png"),
+        )
+            .prop_map(|(key, digest, cdn_key, size, file_name)| {
+                attachment_ref(&AttachmentPointer {
+                    content_type: Some("image/png".into()),
+                    key: Some(key),
+                    digest: Some(digest),
+                    size: Some(size),
+                    file_name,
+                    cdn_number: Some(3),
+                    attachment_identifier: Some(attachment_pointer::AttachmentIdentifier::CdnKey(
+                        cdn_key,
+                    )),
+                    ..Default::default()
+                })
+            })
+    }
+
     fn sendable() -> impl Strategy<Value = Outgoing> {
         prop_oneof![
-            (".{0,40}", proptest::option::of(message_id_by(ME))).prop_map(|(body, quote)| {
-                Outgoing::Text {
+            (
+                ".{0,40}",
+                proptest::option::of(message_id_by(ME)),
+                proptest::collection::vec(uploaded(), 0..3),
+            )
+                .prop_map(|(body, quote, attachments)| Outgoing::Text {
                     body,
                     quote,
-                    attachments: vec![],
-                }
-            }),
+                    attachments,
+                }),
             (message_id_by(ME), ".{1,4}", any::<bool>()).prop_map(|(target, emoji, remove)| {
                 Outgoing::Reaction {
                     target,
@@ -786,6 +964,7 @@ mod tests {
             (message_id_by(ALICE), ".{0,40}")
                 .prop_map(|(target, body)| Outgoing::Edit { target, body }),
             message_id_by(ALICE).prop_map(|target| Outgoing::Delete { target }),
+            message_id_by(ME).prop_map(|target| Outgoing::AdminDelete { target }),
         ]
     }
 
@@ -805,7 +984,12 @@ mod tests {
                 revision: Some(4),
                 group_change: None,
             });
-            let body = content_body(&message, sent_at_ms, group.as_ref()).expect("generated variants convert");
+            let body = content_body(&message, sent_at_ms, group.as_ref());
+            if matches!(message, Outgoing::AdminDelete { .. }) && !in_group {
+                prop_assert!(body.is_err(), "an admin delete went to a person");
+                return Ok(());
+            }
+            let body = body.expect("generated variants convert");
             let alice = ServiceId::new(ALICE);
             let conversation = if in_group {
                 Recipient::Group(group_id(master_key))
@@ -814,7 +998,7 @@ mod tests {
             };
             let got = incoming(&content_from(ALICE, body), ServiceId::new(ME));
             let expected = match message {
-                Outgoing::Text { body, quote, .. } => {
+                Outgoing::Text { body, quote, attachments } => {
                     let Some(Incoming::Message(got)) = got else {
                         return Err(TestCaseError::fail(format!("text read back as {got:?}")));
                     };
@@ -822,14 +1006,225 @@ mod tests {
                     prop_assert_eq!(got.conversation, conversation);
                     prop_assert_eq!(got.body, Some(body));
                     prop_assert_eq!(got.quote, quote);
+                    prop_assert_eq!(got.attachments, attachments);
                     return Ok(());
                 }
                 Outgoing::Reaction { target, emoji, remove } => Incoming::Reaction { conversation, target, from: alice, emoji, remove },
                 Outgoing::Edit { target, body } => Incoming::Edit { conversation, target, from: alice, body },
                 Outgoing::Delete { target } => Incoming::Delete { conversation, target, from: alice },
+                Outgoing::AdminDelete { target } => Incoming::AdminDelete { group: group_id(master_key), target, from: alice },
                 other => unreachable!("not generated: {other:?}"),
             };
             prop_assert_eq!(got, Some(expected));
+        }
+    }
+
+    /// The DataMessage `content_body` puts on the wire for `message`.
+    fn data_of(message: &Outgoing) -> DataMessage {
+        match content_body(message, 9, None).expect("converts") {
+            ContentBody::DataMessage(data) => data,
+            other => panic!("{message:?} went out as {other:?}"),
+        }
+    }
+
+    proptest! {
+        /// A pin names its target by author and timestamp, as Signal's apps
+        /// match it, for the duration asked; no duration pins until unpinned,
+        /// which the wire spells as "forever", not as a missing duration.
+        #[test]
+        fn a_pin_names_its_target_and_no_duration_means_forever(
+            target in message_id_by(ALICE),
+            duration_secs in proptest::option::of(1u32..),
+        ) {
+            let duration_secs = duration_secs.and_then(std::num::NonZeroU32::new);
+            let pin = data_of(&Outgoing::Pin { target, duration_secs })
+                .pin_message
+                .expect("a pin message");
+            prop_assert_eq!(pin.target_author_aci_binary, Some(ALICE.as_bytes().to_vec()));
+            prop_assert_eq!(pin.target_sent_timestamp, Some(target.sent_at_ms));
+            let expected = match duration_secs {
+                Some(secs) => data_message::pin_message::PinDuration::PinDurationSeconds(secs.get()),
+                None => data_message::pin_message::PinDuration::PinDurationForever(true),
+            };
+            prop_assert_eq!(pin.pin_duration, Some(expected));
+        }
+    }
+
+    proptest! {
+        /// An unpin must name the same target a pin did, or the pin stays up.
+        #[test]
+        fn an_unpin_names_its_target_like_the_pin(target in message_id_by(ALICE)) {
+            let unpin = data_of(&Outgoing::Unpin { target })
+                .unpin_message
+                .expect("an unpin message");
+            let pin = data_of(&Outgoing::Pin { target, duration_secs: None })
+                .pin_message
+                .expect("a pin message");
+            prop_assert_eq!(unpin.target_author_aci_binary, pin.target_author_aci_binary);
+            prop_assert_eq!(unpin.target_sent_timestamp, pin.target_sent_timestamp);
+        }
+    }
+
+    proptest! {
+        /// A poll goes out with its question, its options in the order given
+        /// (votes are indexes into them), and whether several may be chosen.
+        #[test]
+        fn a_poll_keeps_its_question_and_option_order(
+            question in ".{1,40}",
+            options in proptest::collection::vec(".{1,20}", 2..6),
+            multi_select in any::<bool>(),
+        ) {
+            let poll = data_of(&Outgoing::PollCreate {
+                question: question.clone(),
+                options: options.clone(),
+                multi_select,
+            })
+            .poll_create
+            .expect("a poll");
+            prop_assert_eq!(poll.question, Some(question));
+            prop_assert_eq!(poll.options, options);
+            prop_assert_eq!(poll.allow_multiple, Some(multi_select));
+        }
+    }
+
+    proptest! {
+        /// A vote names the poll by its author and timestamp and carries the
+        /// caller's counter untouched; receivers keep only the highest count,
+        /// so a rewritten counter would make a later vote lose to an earlier one.
+        #[test]
+        fn a_vote_names_its_poll_and_keeps_its_count(
+            poll in message_id_by(ALICE),
+            option_indexes in proptest::collection::vec(0u32..10, 0..4),
+            vote_count in 1u32..,
+        ) {
+            let vote = data_of(&Outgoing::PollVote {
+                poll,
+                option_indexes: option_indexes.clone(),
+                vote_count,
+            })
+            .poll_vote
+            .expect("a vote");
+            prop_assert_eq!(vote.target_author_aci_binary, Some(ALICE.as_bytes().to_vec()));
+            prop_assert_eq!(vote.target_sent_timestamp, Some(poll.sent_at_ms));
+            prop_assert_eq!(vote.option_indexes, option_indexes);
+            prop_assert_eq!(vote.vote_count, Some(vote_count));
+        }
+    }
+
+    proptest! {
+        /// Ending a poll names it by timestamp alone; receivers take the
+        /// sender as its author.
+        #[test]
+        fn ending_a_poll_names_its_timestamp(poll in message_id_by(ME)) {
+            let end = data_of(&Outgoing::PollTerminate { poll })
+                .poll_terminate
+                .expect("a poll end");
+            prop_assert_eq!(end.target_sent_timestamp, Some(poll.sent_at_ms));
+        }
+    }
+
+    /// A sticker goes out naming its pack and key, so receivers with the pack
+    /// show it from there, and with the uploaded image for those without.
+    #[test]
+    fn a_sticker_names_its_pack_and_carries_its_image() {
+        let pack = StickerPackId::new([1; 16]);
+        let image = AttachmentPointer {
+            content_type: Some("image/webp".into()),
+            size: Some(10),
+            ..Default::default()
+        };
+        let ContentBody::DataMessage(data) =
+            sticker_body(pack, &[2; 32], 7, Some("🐈"), image.clone(), 9, None)
+        else {
+            panic!("a sticker is not a data message");
+        };
+        let sticker = data.sticker.expect("a sticker");
+        assert_eq!(sticker.pack_id, Some(vec![1; 16]));
+        assert_eq!(sticker.pack_key, Some(vec![2; 32]));
+        assert_eq!(sticker.sticker_id, Some(7));
+        assert_eq!(sticker.emoji.as_deref(), Some("🐈"));
+        assert_eq!(sticker.data, Some(image));
+        assert_eq!(data.timestamp, Some(9));
+    }
+
+    /// Receivers decide how to show an attachment by its content type, so a
+    /// photo must go out as an image, under its own file name; a type nobody
+    /// recognizes goes out as a plain file rather than a guess.
+    #[test]
+    fn an_upload_carries_its_file_name_and_a_content_type_from_it() {
+        let cases = [
+            ("/send/cat.png", "image/png"),
+            ("/send/Notes.PDF", "application/pdf"),
+            ("/send/unknown.zzz9", "application/octet-stream"),
+        ];
+        for (path, content_type) in cases {
+            let spec = attachment_spec(std::path::Path::new(path), 42);
+            assert_eq!(spec.content_type, content_type, "{path}");
+            assert_eq!(spec.length, 42, "{path}");
+            assert_eq!(spec.file_name.as_deref(), path.rsplit('/').next(), "{path}");
+        }
+    }
+
+    proptest! {
+        /// A linked device keeps its id (1 is the primary), its decrypted
+        /// name, and both times in milliseconds, as list_devices shows them.
+        #[test]
+        fn a_device_keeps_its_id_name_and_times_in_ms(
+            id in 1u8..=127,
+            name in proptest::option::of(".{0,20}"),
+            created_at_ms in 0i64..4_000_000_000_000,
+            last_seen_at_ms in 0i64..4_000_000_000_000,
+        ) {
+            let at = |ms| Utc.timestamp_millis_opt(ms).single().expect("valid time");
+            let info = DeviceInfo {
+                id: DeviceId::new(id).expect("valid device id"),
+                registration_id: 1,
+                name: name.clone(),
+                created_at: at(created_at_ms),
+                last_seen: at(last_seen_at_ms),
+            };
+            prop_assert_eq!(
+                device(&info),
+                crate::Device {
+                    id: u32::from(id),
+                    name,
+                    created_at_ms: created_at_ms as u64,
+                    last_seen_at_ms: last_seen_at_ms as u64,
+                }
+            );
+        }
+    }
+
+    fn identity_key(seed: u8) -> protocol::IdentityKey {
+        let mut bytes = [seed; 33];
+        bytes[0] = 0x05;
+        protocol::IdentityKey::decode(&bytes).expect("a curve25519 public key")
+    }
+
+    proptest! {
+        // Each case hashes 5200 rounds four times; a few cases cover it.
+        #![proptest_config(ProptestConfig::with_cases(8))]
+        /// A safety number is compared by reading it aloud between two phones,
+        /// so both sides must compute the same 60 digits, and a new key on
+        /// either side must change them.
+        #[test]
+        fn both_sides_see_the_same_safety_number_and_a_new_key_changes_it(
+            mine in 1u8..=255,
+            theirs in 1u8..=255,
+            replaced in 1u8..=255,
+        ) {
+            prop_assume!(replaced != theirs);
+            let (me, alice) = (ServiceId::new(ME), ServiceId::new(ALICE));
+            let ours = safety_number(me, &identity_key(mine), alice, &identity_key(theirs))
+                .expect("computes");
+            let from_alice = safety_number(alice, &identity_key(theirs), me, &identity_key(mine))
+                .expect("computes");
+            prop_assert_eq!(ours.len(), 60);
+            prop_assert!(ours.bytes().all(|b| b.is_ascii_digit()), "{}", ours);
+            prop_assert_eq!(&ours, &from_alice);
+            let after = safety_number(me, &identity_key(mine), alice, &identity_key(replaced))
+                .expect("computes");
+            prop_assert_ne!(ours, after);
         }
     }
 

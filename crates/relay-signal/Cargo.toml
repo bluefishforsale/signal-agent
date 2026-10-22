@@ -9,6 +9,7 @@ anyhow.workspace = true
 async-trait.workspace = true
 base64 = "0.22.1"
 futures.workspace = true
+mime_guess = "2.0.5"
 relay-core.workspace = true
 serde.workspace = true
 thiserror.workspace = true

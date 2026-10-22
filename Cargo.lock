@@ -5025,6 +5025,7 @@ dependencies = [
  "getrandom 0.4.3",
  "http",
  "libsqlite3-sys",
+ "mime_guess",
  "presage",
  "presage-store-sqlite",
  "proptest",
