@@ -581,6 +581,27 @@ mod tests {
         assert_eq!(unread[0].id.sent_at_ms, 300);
     }
 
+    /// A send Signal refused must not show up in the local history as if it
+    /// went out.
+    #[tokio::test]
+    async fn a_failed_send_stores_nothing() {
+        let (ctx, signal) = ctx(AccessMode::Full, ProfileKind::Linked);
+        let result = Registry::standard()
+            .call(
+                &ctx,
+                "send_group_message",
+                json!({"group_id": GroupId::new(GROUP).to_string(), "message": "hi"}),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(ToolError::Internal(_))),
+            "got {result:?}"
+        );
+        assert!(signal.sent().is_empty(), "{:?}", signal.sent());
+        let stats = ctx.store.stats().await.unwrap();
+        assert_eq!(stats.messages, 0, "{stats:?}");
+    }
+
     /// Half a quote can't name a message; sending it as a plain message would
     /// silently drop the reply the caller asked for.
     #[tokio::test]
