@@ -4,7 +4,7 @@
 
 use std::{convert::Infallible, net::SocketAddr, sync::Arc};
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use bytes::Bytes;
 use http::{Request, Response, StatusCode, header};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
@@ -15,21 +15,35 @@ use rmcp::transport::{
     StreamableHttpServerConfig, StreamableHttpService,
     streamable_http_server::session::never::NeverSessionManager,
 };
-use tokio::net::TcpListener;
+use rustls::ServerConfig;
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    net::TcpListener,
+};
+use tokio_rustls::TlsAcceptor;
 
 use super::{Tokens, proxy::Proxy};
 
 /// A bound HTTP endpoint, not yet serving.
 pub struct Listener {
     tcp: TcpListener,
+    tls: Option<TlsAcceptor>,
 }
 
 impl Listener {
-    pub async fn bind(addr: SocketAddr) -> anyhow::Result<Self> {
+    /// Listens on `addr`, speaking TLS with `tls` when given. Plain HTTP is
+    /// only allowed on loopback, since every request carries a token.
+    pub async fn bind(addr: SocketAddr, tls: Option<Arc<ServerConfig>>) -> anyhow::Result<Self> {
+        if tls.is_none() && !addr.ip().is_loopback() {
+            bail!("refusing to listen on {addr} without TLS; only loopback may use plain HTTP");
+        }
         let tcp = TcpListener::bind(addr)
             .await
             .with_context(|| format!("unable to listen on {addr}"))?;
-        Ok(Self { tcp })
+        Ok(Self {
+            tcp,
+            tls: tls.map(TlsAcceptor::from),
+        })
     }
 
     pub fn local_addr(&self) -> anyhow::Result<SocketAddr> {
@@ -56,19 +70,33 @@ pub async fn serve(listener: Listener, tokens: Tokens, agent: String) -> anyhow:
     loop {
         let (tcp, peer) = listener.tcp.accept().await?;
         let gate = gate.clone();
+        let tls = listener.tls.clone();
         tokio::spawn(async move {
-            let service = hyper::service::service_fn(move |request| {
-                let gate = gate.clone();
-                async move { Ok::<_, Infallible>(gate.handle(peer, request).await) }
-            });
-            let served = hyper::server::conn::http1::Builder::new()
-                .serve_connection(TokioIo::new(tcp), service)
-                .await;
+            let served = match tls {
+                None => connection(tcp, peer, gate).await,
+                Some(tls) => match tls.accept(tcp).await {
+                    Ok(stream) => connection(stream, peer, gate).await,
+                    Err(e) => return tracing::debug!(%peer, "TLS handshake failed: {e}"),
+                },
+            };
             if let Err(e) = served {
-                tracing::debug!("http connection ended: {e}");
+                tracing::debug!(%peer, "HTTP connection ended: {e}");
             }
         });
     }
+}
+
+async fn connection<S>(stream: S, peer: SocketAddr, gate: Arc<Gate>) -> hyper::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let service = hyper::service::service_fn(move |request| {
+        let gate = gate.clone();
+        async move { Ok::<_, Infallible>(gate.handle(peer, request).await) }
+    });
+    hyper::server::conn::http1::Builder::new()
+        .serve_connection(TokioIo::new(stream), service)
+        .await
 }
 
 fn mcp_service(proxy: Proxy) -> StreamableHttpService<Proxy, NeverSessionManager> {
@@ -246,7 +274,7 @@ mod tests {
     }
 
     async fn start(tokens: Tokens, agent: String) -> SocketAddr {
-        let listener = Listener::bind(([127, 0, 0, 1], 0).into())
+        let listener = Listener::bind(([127, 0, 0, 1], 0).into(), None)
             .await
             .expect("bind");
         let addr = listener.local_addr().expect("addr");
@@ -354,5 +382,18 @@ mod tests {
             assert!(refused, "{name} over a read-only token: {result:?}");
         }
         assert!(signal.sent().is_empty(), "a read-only token reached Signal");
+    }
+
+    /// PRD acceptance 10: tokens cross the network in every request, so the
+    /// endpoint must refuse to listen anywhere but loopback in plain HTTP.
+    // NOTE: 192.0.2.1 is TEST-NET-1, so a regression can't actually bind
+    // off loopback; the assertion is on the reason, not just the failure.
+    #[tokio::test]
+    async fn an_off_loopback_address_without_tls_is_refused() {
+        let refused = Listener::bind(([192, 0, 2, 1], 0).into(), None).await;
+        let Err(e) = refused else {
+            panic!("listened off loopback without TLS")
+        };
+        assert!(format!("{e:#}").contains("TLS"), "unclear refusal: {e:#}");
     }
 }

@@ -59,7 +59,7 @@ async fn every_request_is_logged_with_its_token_name_and_never_the_token() {
     tokio::spawn(served);
     let tokens = relay_mcp::Tokens::at(&dir.path().join("http_tokens.json"));
     let token = tokens.create("laptop", AccessMode::Full).expect("create");
-    let http = relay_mcp::Listener::bind(([127, 0, 0, 1], 0).into())
+    let http = relay_mcp::Listener::bind(([127, 0, 0, 1], 0).into(), None)
         .await
         .expect("bind http");
     let addr = http.local_addr().expect("addr");
