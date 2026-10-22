@@ -6,7 +6,10 @@ on:
   pull_request:
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # On main every commit gets its own group: GitHub keeps only one pending run per
+  # group and drops the older one, so a shared group skips merges that land close
+  # together. PRs still group by branch so a new push supersedes the old run.
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   # Cancel superseded runs on PR branches only; every merge to main gets its own
   # run, so a red main points at one merge.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
