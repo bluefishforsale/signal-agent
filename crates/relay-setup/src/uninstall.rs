@@ -15,6 +15,7 @@ use crate::{
     claude::{ClaudeClient, Clients, Platform, Runner, ServerEntry, SystemRunner},
 };
 
+pub(crate) use footprint::ACCESS_FILE;
 pub use footprint::{
     APP_ID, DELETE_DATA_LABEL, Footprint, LAUNCHD_LABEL, Leftover, Roots, checklist,
 };
@@ -259,7 +260,7 @@ fn succeeded(runner: &dyn Runner, program: &str, args: &[String]) -> anyhow::Res
 }
 
 /// Removes the file or folder at `path`; one that isn't there is fine.
-fn remove_path(path: &Path) -> anyhow::Result<()> {
+pub(crate) fn remove_path(path: &Path) -> anyhow::Result<()> {
     let removed = match fs::symlink_metadata(path) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => Err(e),

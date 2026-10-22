@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     Step,
     claude::{Clients, ServerEntry},
-    uninstall_steps,
+    uninstall::{ACCESS_FILE, remove_path},
 };
 
 /// The registry file's contents.
@@ -86,15 +86,16 @@ impl Profiles {
         ProfilePaths::under(self.base.clone(), profile)
     }
 
-    /// The cleanup that removes `profile`: its Claude entries, the caller's
-    /// `login_item` step, its key, its data when `delete_data`, and finally
-    /// its place in the list. `entry` must be this profile's entry.
+    /// The cleanup that removes `profile`: its access choice, so nothing
+    /// starts its agent again, its Claude entries, the caller's `stop_agent`
+    /// step, its key and data when `delete_data`, and finally its place in
+    /// the list. `entry` must be this profile's entry.
     pub fn removal_steps<'a>(
         &'a self,
         profile: &'a ProfileName,
         clients: &'a Clients,
         entry: &'a ServerEntry,
-        login_item: Step<'a>,
+        stop_agent: Step<'a>,
         secrets: &'a dyn SecretStore,
         delete_data: bool,
     ) -> anyhow::Result<Vec<Step<'a>>> {
@@ -104,20 +105,36 @@ impl Profiles {
                 entry.name
             );
         }
-        let key = Step::new("Remove the database key", move || secrets.delete(profile));
-        let data = delete_data.then(|| {
-            let root = self.paths(profile).root;
-            Step::new("Delete messages and account data", move || {
-                fs::remove_dir_all(&root)
-                    .with_context(|| format!("unable to delete \"{}\"", root.display()))
+        let root = self.paths(profile).root;
+        let access = root.join(ACCESS_FILE);
+        let unlist = Step::new(
+            format!("Stop starting the agent for \"{profile}\""),
+            move || remove_path(&access),
+        );
+        let unregister = clients.detect().into_iter().map(|client| {
+            Step::new(format!("Remove from {client}"), move || {
+                clients.unregister(client, entry).map(|_| ())
             })
+        });
+        let data = delete_data.then(|| {
+            [
+                Step::new("Remove the database key", move || secrets.delete(profile)),
+                Step::new("Delete messages and account data", move || {
+                    fs::remove_dir_all(&root)
+                        .with_context(|| format!("unable to delete \"{}\"", root.display()))
+                }),
+            ]
         });
         let forget = Step::new(format!("Forget profile \"{profile}\""), move || {
             self.forget(profile)
         });
-        let mut steps = uninstall_steps(clients, entry, login_item, key, data);
-        steps.push(forget);
-        Ok(steps)
+        Ok([unlist]
+            .into_iter()
+            .chain(unregister)
+            .chain([stop_agent])
+            .chain(data.into_iter().flatten())
+            .chain([forget])
+            .collect())
     }
 
     fn forget(&self, profile: &ProfileName) -> anyhow::Result<()> {
@@ -362,6 +379,87 @@ mod tests {
             "personal data lost"
         );
         assert_eq!(profiles.list().expect("list"), [personal]);
+    }
+
+    /// Leaving "delete my messages" unticked promises that setting up again
+    /// picks up where it left off, as uninstall does; removing the key would
+    /// leave the kept messages unreadable.
+    #[test]
+    fn removing_a_profile_but_keeping_its_data_keeps_its_key() {
+        let base = tempfile::tempdir().expect("temp data dir");
+        let secrets = MemorySecretStore::default();
+        let profiles = Profiles::under(base.path().into());
+        profiles.ensure_default().expect("default profile");
+        let bot = profiles.create("bot").expect("create bot");
+        secrets
+            .set(&bot, &StoreKey::generate().expect("key"))
+            .expect("store key");
+        fs::create_dir_all(profiles.paths(&bot).root).expect("profile dir");
+        fs::write(profiles.paths(&bot).message_store, b"db").expect("store file");
+        let clients = Clients::new(Platform::MacOs, Box::new(NoCli), None, None);
+        let entry = ServerEntry::for_profile(&bot, &base.path().join("signal-agent"), ["mcp"])
+            .expect("entry");
+
+        let steps = profiles
+            .removal_steps(
+                &bot,
+                &clients,
+                &entry,
+                Step::new("stop agent", || Ok(())),
+                &secrets,
+                false,
+            )
+            .expect("removal steps");
+        let outcomes = run_steps(steps);
+        assert!(
+            outcomes.iter().all(|o| o.result.is_ok()),
+            "a step failed: {outcomes:?}"
+        );
+
+        assert!(secrets.get(&bot).expect("read").is_some(), "bot key lost");
+        assert!(profiles.paths(&bot).message_store.exists(), "bot data lost");
+        assert_eq!(profiles.list().expect("list"), [name("personal")]);
+    }
+
+    /// The supervisor, the stdio shim and the agent's own Claude
+    /// re-registration all go by the saved access choice, so it must be gone
+    /// before the caller waits for the agent to stop, or something starts the
+    /// agent again and puts its Claude entry back.
+    #[test]
+    fn removal_takes_away_the_access_choice_before_waiting_for_the_agent() {
+        let base = tempfile::tempdir().expect("temp data dir");
+        let secrets = MemorySecretStore::default();
+        let profiles = Profiles::under(base.path().into());
+        profiles.ensure_default().expect("default profile");
+        let bot = profiles.create("bot").expect("create bot");
+        let paths = profiles.paths(&bot);
+        paths
+            .save_access(relay_core::AccessMode::Full)
+            .expect("set up");
+        let clients = Clients::new(Platform::MacOs, Box::new(NoCli), None, None);
+        let entry = ServerEntry::for_profile(&bot, &base.path().join("signal-agent"), ["mcp"])
+            .expect("entry");
+
+        let set_up_while_stopping = Cell::new(None);
+        let steps = profiles
+            .removal_steps(
+                &bot,
+                &clients,
+                &entry,
+                Step::new("stop agent", || {
+                    set_up_while_stopping.set(Some(paths.load_access().is_ok()));
+                    Ok(())
+                }),
+                &secrets,
+                false,
+            )
+            .expect("removal steps");
+        let outcomes = run_steps(steps);
+        assert!(
+            outcomes.iter().all(|o| o.result.is_ok()),
+            "a step failed: {outcomes:?}"
+        );
+        assert_eq!(set_up_while_stopping.get(), Some(false));
     }
 
     /// Removing `bot` with `personal`'s Claude entry would unregister the
