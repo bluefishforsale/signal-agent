@@ -1,11 +1,15 @@
 //! The contract the presage implementation fulfills. Kept to what the agent
 //! needs; protocol detail stays below this line.
 
-use std::{num::NonZeroU32, time::Duration};
+use std::{
+    num::NonZeroU32,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
-use relay_core::prelude::*;
+use relay_core::{LinkAndSyncKey, prelude::*};
 use serde::{Deserialize, Serialize};
 
 use crate::SendableFile;
@@ -274,11 +278,33 @@ pub enum RegistrationStep {
     },
 }
 
+/// How the history transfer the phone may offer at link time ended.
+#[derive(Debug)]
+pub enum HistoryTransfer {
+    /// The archive is downloaded to `path`, encrypted under `key`. The caller
+    /// imports it, then deletes the file.
+    Archive { path: PathBuf, key: LinkAndSyncKey },
+    /// The phone linked without offering its history.
+    NotOffered,
+    /// The phone failed to send its history and asks the user to link again.
+    Relink,
+    /// The phone gave up on sending its history; carry on without it.
+    NoUpload,
+    /// The phone said nothing within the hour Signal's own apps wait.
+    TimedOut,
+}
+
 /// Creates an account in a profile's empty store: by linking to an existing
 /// account, or by registering a number.
 #[async_trait]
 pub trait Provisioner: Send + Sync {
     fn link(&self, device_name: String) -> BoxStream<'static, anyhow::Result<LinkEvent>>;
+    /// After `link` reports `Linked`, waits for the history the phone offered
+    /// to send and downloads it into `dir`. Fails with `RateLimited` when
+    /// Signal refuses as rate-limited, and never retries that.
+    async fn transfer_history(&self, _dir: &Path) -> anyhow::Result<HistoryTransfer> {
+        Ok(HistoryTransfer::NotOffered)
+    }
     async fn request_code(
         &self,
         phone_number: &str,

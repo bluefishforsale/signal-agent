@@ -2,7 +2,7 @@
 //! docs/link-and-sync.md traces the protocol; this module is the half after the
 //! download: verify, decrypt, parse, and write messages to the store.
 
-use std::{collections::HashMap, fmt};
+use std::collections::HashMap;
 
 use anyhow::Context;
 use futures::AsyncReadExt as _;
@@ -15,27 +15,11 @@ use libsignal_message_backup::{
     proto::backup as pb,
 };
 use protobuf::Message as _;
-use relay_core::prelude::*;
+use relay_core::{LinkAndSyncKey, prelude::*};
 use relay_store::MessageStore;
 use zkgroup::groups::{GroupMasterKey, GroupSecretParams};
 
 use crate::{ImportProgress, ImportSummary, full_name};
-
-/// The 32-byte key the phone sends in the provisioning message when it offers
-/// to transfer history. Single-use; never persist it.
-pub struct LinkAndSyncKey([u8; 32]);
-
-impl LinkAndSyncKey {
-    pub fn new(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-}
-
-impl fmt::Debug for LinkAndSyncKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("LinkAndSyncKey(..)")
-    }
-}
 
 /// Imports a downloaded link-and-sync archive into `store`.
 ///
@@ -100,7 +84,7 @@ pub async fn import_link_and_sync(
 // buffer, so libsignal's end-of-stream HMAC re-check, which guards against a
 // file changing between passes, has nothing to catch and isn't called.
 fn decrypt(archive: &[u8], key: &LinkAndSyncKey, our_aci: ServiceId) -> anyhow::Result<Vec<u8>> {
-    let backup_key: BackupKey = BackupKey(key.0);
+    let backup_key: BackupKey = BackupKey(*key.as_bytes());
     let backup_id = backup_key.derive_backup_id(&Aci::from(our_aci.uuid()));
     let message_key = MessageBackupKey::derive(&backup_key, &backup_id, None);
     futures::executor::block_on(async {
@@ -396,7 +380,7 @@ mod tests {
                     .expect("encode frame"),
             );
         }
-        let backup_key: BackupKey = BackupKey(synthetic_key().0);
+        let backup_key: BackupKey = BackupKey(*synthetic_key().as_bytes());
         let id = backup_key.derive_backup_id(&Aci::from(aci(OUR_ACI).uuid()));
         let key = MessageBackupKey::derive(&backup_key, &id, None);
         let iv = [b'I'; 16];

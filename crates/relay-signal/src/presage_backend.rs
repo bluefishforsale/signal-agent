@@ -1027,6 +1027,7 @@ async fn open_store(path: &Path, key: &[u8; 32]) -> anyhow::Result<SqliteStore> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::HistoryTransfer;
     use presage::{
         libsignal_service::{
             content::{ContentBody, Metadata},
@@ -1704,6 +1705,24 @@ mod tests {
         assert!(
             err.to_string().contains("request a code first"),
             "unclear error: {err:#}"
+        );
+    }
+
+    /// With no link that carried the phone's history key there is nothing to
+    /// wait for; asking must say so without reaching Signal.
+    #[tokio::test]
+    async fn history_without_a_link_offering_it_is_not_offered() {
+        let (dir, path) = temp_store();
+        let provisioner = PresageProvisioner::open(&path, &KEY, Servers::Staging)
+            .await
+            .expect("opens");
+        let transfer = provisioner
+            .transfer_history(dir.path())
+            .await
+            .expect("no network needed");
+        assert!(
+            matches!(transfer, HistoryTransfer::NotOffered),
+            "{transfer:?}"
         );
     }
 
