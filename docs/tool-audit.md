@@ -124,7 +124,7 @@ Of the 18 deferred, 13 are already named in anti-goal 8: block_contact, unblock_
 - upload_sticker_pack: no upload endpoint in the pinned libsignal-service.
 - start_change_number, finish_change_number: presage has no change-number flow.
 
-Four v2.0 tools ship with a narrower input than upstream, refusing the rest as invalid input rather than deferring the whole tool: update_profile (no avatar or MobileCoin fields), set_expiration_timer (DMs only), send_message_request_response (accept and delete only) and list_accounts (this profile only).
+Four v2.0 tools ship with a narrower input than upstream, refusing the rest as invalid input rather than deferring the whole tool: update_profile (no avatar or MobileCoin fields), set_expiration_timer (DMs only), send_message_request_response (accept and delete only) and list_accounts (this profile only). update_profile also can't clear a field: an empty value is refused, though the backend contract could clear one.
 
 ## Not exposed
 
