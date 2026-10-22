@@ -17,14 +17,14 @@ use relay_setup::{
     driver::{Driver, HistoryImport, LoginItem, OpenProvisioner, Services},
     prelude::*,
 };
-use relay_signal::Provisioner;
+use relay_signal::{PresageProvisioner, Provisioner, Servers};
 
 /// Runs setup for `profile` on this terminal until it is done or the user quits.
 pub async fn run(profile: ProfileName) -> anyhow::Result<()> {
     let exe = std::env::current_exe().context("unable to locate this executable")?;
     let server = ServerEntry::for_profile(&profile, &exe, ["mcp", "--profile", &profile])?;
     let services = Services {
-        signal: signal_provisioner(),
+        signal: Box::new(Presage),
         secrets: relay_secrets::platform_store()?,
         history: Box::new(NoHistoryYet),
         login: Box::new(AgentAtLogin),
@@ -364,18 +364,17 @@ fn computer_name() -> String {
         .unwrap_or_else(|| "this computer".to_owned())
 }
 
-// Integration seam: lane L1's `relay_signal::PresageProvisioner` goes here once
-// it is on main, as `PresageProvisioner::open(path, key.as_bytes(), Servers::Production)`.
-fn signal_provisioner() -> Box<dyn OpenProvisioner> {
-    Box::new(SignalNotInThisBuild)
-}
-
-struct SignalNotInThisBuild;
+/// Creates the account in the profile's presage store on Signal's production
+/// service.
+struct Presage;
 
 #[async_trait]
-impl OpenProvisioner for SignalNotInThisBuild {
-    async fn open(&self, _: &Path, _: &StoreKey) -> anyhow::Result<Box<dyn Provisioner>> {
-        bail!("this build can't talk to Signal yet: the presage backend (lane L1) isn't wired in")
+impl OpenProvisioner for Presage {
+    async fn open(&self, path: &Path, key: &StoreKey) -> anyhow::Result<Box<dyn Provisioner>> {
+        let provisioner = PresageProvisioner::open(path, key.as_bytes(), Servers::Production)
+            .await
+            .with_context(|| format!("unable to open the Signal store \"{}\"", path.display()))?;
+        Ok(Box::new(provisioner))
     }
 }
 
