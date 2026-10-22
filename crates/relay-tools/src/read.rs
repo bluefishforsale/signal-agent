@@ -139,24 +139,85 @@ impl Tool for GetUnread {
          read receipt is sent."
     }
     fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {"limit": Limit::schema()},
-            "additionalProperties": false,
-        })
+        unread_schema()
     }
     fn writes(&self) -> bool {
         false
     }
     async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
-        let GetUnreadInput { limit } = parse(input)?;
-        let mut unread = ctx.store.unread().await?;
-        unread.sort_by_key(|m| m.id.sent_at_ms);
-        let has_more = unread.len() > limit.get() as usize;
-        let messages = unread.split_off(unread.len().saturating_sub(limit.get() as usize));
-        let ids: Vec<_> = messages.iter().map(|m| m.id).collect();
-        ctx.store.mark_read(&ids).await?;
-        Ok(json!({ "messages": messages, "has_more": has_more }))
+        take_unread(ctx, input).await
+    }
+}
+
+fn unread_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {"limit": Limit::schema()},
+        "additionalProperties": false,
+    })
+}
+
+async fn take_unread(ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
+    let GetUnreadInput { limit } = parse(input)?;
+    let mut unread = ctx.store.unread().await?;
+    unread.sort_by_key(|m| m.id.sent_at_ms);
+    let has_more = unread.len() > limit.get() as usize;
+    let messages = unread.split_off(unread.len().saturating_sub(limit.get() as usize));
+    let ids: Vec<_> = messages.iter().map(|m| m.id).collect();
+    ctx.store.mark_read(&ids).await?;
+    Ok(json!({ "messages": messages, "has_more": has_more }))
+}
+
+// NOTE: the agent receives continuously, so there is nothing left for a tool
+// to poll. These two keep upstream's names and hand out get_unread's queue;
+// giving them a second cursor would show a client every message twice.
+pub struct ReceiveMessages;
+
+#[async_trait]
+impl Tool for ReceiveMessages {
+    fn name(&self) -> &'static str {
+        "receive_messages"
+    }
+    fn description(&self) -> &'static str {
+        "Return messages that arrived since any client last checked, oldest first. The \
+         background agent receives from Signal all the time, so this returns at once and \
+         shares one queue with get_unread and receive_direct: each message comes back from \
+         exactly one of them. limit keeps the newest N; if has_more is true, call again. \
+         Marks them read in the local store only; no read receipt is sent."
+    }
+    fn input_schema(&self) -> Value {
+        unread_schema()
+    }
+    fn writes(&self) -> bool {
+        false
+    }
+    async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
+        take_unread(ctx, input).await
+    }
+}
+
+pub struct ReceiveDirect;
+
+#[async_trait]
+impl Tool for ReceiveDirect {
+    fn name(&self) -> &'static str {
+        "receive_direct"
+    }
+    fn description(&self) -> &'static str {
+        "The same as receive_messages, kept for clients that call it by this name: there is \
+         no separate daemon to bypass, the background agent already holds the connection. \
+         Returns messages that arrived since any client last checked, oldest first, from the \
+         queue get_unread and receive_messages share. Marks them read in the local store \
+         only; no read receipt is sent."
+    }
+    fn input_schema(&self) -> Value {
+        unread_schema()
+    }
+    fn writes(&self) -> bool {
+        false
+    }
+    async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
+        take_unread(ctx, input).await
     }
 }
 
@@ -397,6 +458,26 @@ mod tests {
         let second = registry.call(&ctx, "get_unread", json!({})).await.unwrap();
         assert_eq!(bodies(&second["messages"]), ["a"], "{second}");
         assert_eq!(second["has_more"], json!(false), "{second}");
+    }
+
+    /// The agent receives continuously, so receive_messages and receive_direct
+    /// are views of the same new-mail queue as get_unread: a message any of
+    /// them returned must never come back from another.
+    #[tokio::test]
+    async fn receive_tools_share_get_unreads_queue_and_return_each_message_once() {
+        let (ctx, _) = ctx(AccessMode::ReadOnly, ProfileKind::Linked);
+        let registry = Registry::standard();
+        let mut seen = vec![];
+        for (t, tool) in [
+            (100, "receive_messages"),
+            (200, "receive_direct"),
+            (300, "get_unread"),
+        ] {
+            ctx.store.insert(&incoming(2, t, tool)).await.unwrap();
+            let out = registry.call(&ctx, tool, json!({})).await.unwrap();
+            seen.extend(bodies(&out["messages"]));
+        }
+        assert_eq!(seen, ["receive_messages", "receive_direct", "get_unread"]);
     }
 
     /// Paging back through a chat: offset skips the newest N, the page reads

@@ -28,6 +28,8 @@ impl Registry {
             .with(read::ListAccounts)
             .with(read::StoreStats)
             .with(read::GetUnread)
+            .with(read::ReceiveMessages)
+            .with(read::ReceiveDirect)
             .with(read::GetConversation)
             .with(read::SearchMessages)
             .with(send::SendMessage)
