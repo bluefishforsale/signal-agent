@@ -172,6 +172,65 @@ pub async fn contact(ctx: &ToolContext, s: &str) -> Result<ServiceId, ToolError>
     }
 }
 
+/// A message, named by the id object the read tools return with it.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MessageRef {
+    author: ServiceId,
+    sent_at_ms: SentAt,
+}
+
+impl MessageRef {
+    pub fn schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "author": {
+                    "type": "string",
+                    "format": "signal-service-id",
+                    "description": "The service id of who wrote the message",
+                },
+                "sent_at_ms": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": SentAt::MAX,
+                    "description": "The author's send time in epoch milliseconds",
+                },
+            },
+            "required": ["author", "sent_at_ms"],
+            "additionalProperties": false,
+            "description": "A message id exactly as get_conversation, get_unread or \
+                            search_messages return it",
+        })
+    }
+
+    pub fn id(self) -> MessageId {
+        MessageId {
+            author: self.author,
+            sent_at_ms: self.sent_at_ms.0,
+        }
+    }
+}
+
+/// A send time in epoch ms, capped at JSON's largest exact integer.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(try_from = "u64")]
+struct SentAt(u64);
+
+impl SentAt {
+    const MAX: u64 = (1 << 53) - 1;
+}
+
+impl TryFrom<u64> for SentAt {
+    type Error = String;
+    fn try_from(n: u64) -> Result<Self, String> {
+        if n > Self::MAX {
+            return Err(format!("sent_at_ms must be 0 to {}, got {n}", Self::MAX));
+        }
+        Ok(Self(n))
+    }
+}
+
 pub fn group_schema() -> Value {
     json!({
         "type": "string",
