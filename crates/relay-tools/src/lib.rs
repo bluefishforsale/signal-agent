@@ -4,6 +4,7 @@
 
 mod directory;
 mod input;
+mod mutate;
 mod read;
 mod registry;
 mod send;

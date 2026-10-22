@@ -251,6 +251,9 @@ pub(crate) mod tests {
         async fn set_title(&self, c: Recipient, t: &str) -> anyhow::Result<()> {
             self.inner.set_title(c, t).await
         }
+        async fn get(&self, id: MessageId) -> anyhow::Result<Option<Message>> {
+            self.inner.get(id).await
+        }
         async fn conversations(&self) -> anyhow::Result<Vec<Conversation>> {
             self.inner.conversations().await
         }

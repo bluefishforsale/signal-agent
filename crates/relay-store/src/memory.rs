@@ -92,6 +92,10 @@ impl MessageStore for MemoryStore {
         Ok(())
     }
 
+    async fn get(&self, id: MessageId) -> anyhow::Result<Option<Message>> {
+        Ok(self.inner().messages.iter().find(|m| m.id == id).cloned())
+    }
+
     async fn conversations(&self) -> anyhow::Result<Vec<Conversation>> {
         let inner = self.inner();
         let mut by_recipient: HashMap<Recipient, Conversation> = HashMap::new();
@@ -350,5 +354,21 @@ mod tests {
         let left = store.export(None, None).await.expect("export");
         let times: Vec<_> = left.iter().map(|m| m.id.sent_at_ms).collect();
         assert_eq!(times, vec![20, 30], "wrong messages kept");
+    }
+
+    /// get must find exactly the stored message by id and nothing for an
+    /// unknown id, since tools rely on it to check a target's conversation.
+    #[tokio::test]
+    async fn get_returns_the_stored_message_or_none() {
+        let store = MemoryStore::default();
+        let m = msg(7, "hi");
+        store.insert(&m).await.expect("insert");
+        assert_eq!(store.get(m.id).await.expect("get"), Some(m.clone()));
+        let missing = msg(8, "").id;
+        assert_eq!(
+            store.get(missing).await.expect("get"),
+            None,
+            "found a message that was never stored"
+        );
     }
 }
