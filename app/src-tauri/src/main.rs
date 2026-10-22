@@ -362,6 +362,28 @@ mod tests {
         }
     }
 
+    /// A command the page invokes but the capabilities don't grant fails only
+    /// at run time, in the window, so every invoke in app.js must be declared.
+    #[test]
+    fn every_command_the_page_invokes_is_declared() {
+        let page = include_str!("../../ui/app.js");
+        let invoked: Vec<&str> = page
+            .split("invoke(\"")
+            .skip(1)
+            .filter_map(|rest| rest.split('"').next())
+            .collect();
+        assert!(
+            invoked.contains(&"current"),
+            "found no invokes: {invoked:?}"
+        );
+        for command in invoked {
+            assert!(
+                APP_COMMANDS.contains(&command),
+                "app.js invokes undeclared {command:?}"
+            );
+        }
+    }
+
     /// The box that deletes messages and keys must say exactly that, in the
     /// words the acceptance checklist tells the tester to look for.
     #[test]
