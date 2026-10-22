@@ -315,8 +315,14 @@ impl SignalBackend for PresageSignal {
         bail!("contact discovery is not implemented yet (lane L1b)")
     }
 
-    async fn lookup_username(&self, _username: &str) -> anyhow::Result<Option<ServiceId>> {
-        bail!("username lookup is not implemented yet (lane L1b)")
+    async fn lookup_username(&self, username: &str) -> anyhow::Result<Option<ServiceId>> {
+        let (mut manager, name) = (self.manager.clone(), username.to_owned());
+        let aci = self
+            .worker
+            .run(move || async move { manager.lookup_username(&name).await })
+            .await?
+            .map_err(|e| signal_error(e, format!("unable to look up username \"{username}\"")))?;
+        Ok(aci.map(|aci| ServiceId::new(aci.into())))
     }
 
     async fn avatar(&self, _of: Recipient) -> anyhow::Result<Option<Vec<u8>>> {
@@ -328,7 +334,13 @@ impl SignalBackend for PresageSignal {
     }
 
     async fn devices(&self) -> anyhow::Result<Vec<Device>> {
-        bail!("listing devices is not implemented yet (lane L1b)")
+        let manager = self.manager.clone();
+        let devices = self
+            .worker
+            .run(move || async move { manager.devices().await })
+            .await?
+            .map_err(|e| signal_error(e, "unable to list linked devices"))?;
+        Ok(devices.iter().map(convert::device).collect())
     }
 }
 
@@ -1254,6 +1266,23 @@ mod tests {
             .expect_err("uploaded past the limit");
         assert!(
             err.to_string().contains("larger than"),
+            "unclear error: {err:#}"
+        );
+    }
+
+    /// A username must have Signal's `name.digits` shape; anything else is
+    /// refused before a lookup reaches Signal, where it could only fail.
+    #[tokio::test]
+    async fn a_malformed_username_fails_without_the_network() {
+        let (_dir, path) = temp_store();
+        register_linked(&path).await;
+        let signal = PresageSignal::open(&path, &KEY).await.expect("opens");
+        let err = signal
+            .lookup_username("no-discriminator")
+            .await
+            .expect_err("looked up a malformed username");
+        assert!(
+            format!("{err:#}").contains("invalid Signal username"),
             "unclear error: {err:#}"
         );
     }

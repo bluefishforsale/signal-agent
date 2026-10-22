@@ -15,6 +15,7 @@ use presage::{
         groups_v2::Role,
         protocol,
         sender::AttachmentSpec,
+        websocket::account::DeviceInfo,
         zkgroup::groups::{GroupMasterKey, GroupSecretParams},
     },
     manager::{RegistrationData, RegistrationType},
@@ -362,6 +363,15 @@ pub(crate) fn sticker_body(
         }),
         ..Default::default()
     })
+}
+
+pub(crate) fn device(info: &DeviceInfo) -> crate::Device {
+    crate::Device {
+        id: u32::from(info.id),
+        name: info.name.clone(),
+        created_at_ms: u64::try_from(info.created_at.timestamp_millis()).unwrap_or_default(),
+        last_seen_at_ms: u64::try_from(info.last_seen.timestamp_millis()).unwrap_or_default(),
+    }
 }
 
 pub(crate) fn contact_from(contact: &presage::model::contacts::Contact) -> crate::Contact {
@@ -1132,6 +1142,36 @@ mod tests {
             assert_eq!(spec.content_type, content_type, "{path}");
             assert_eq!(spec.length, 42, "{path}");
             assert_eq!(spec.file_name.as_deref(), path.rsplit('/').next(), "{path}");
+        }
+    }
+
+    proptest! {
+        /// A linked device keeps its id (1 is the primary), its decrypted
+        /// name, and both times in milliseconds, as list_devices shows them.
+        #[test]
+        fn a_device_keeps_its_id_name_and_times_in_ms(
+            id in 1u8..=127,
+            name in proptest::option::of(".{0,20}"),
+            created_at_ms in 0i64..4_000_000_000_000,
+            last_seen_at_ms in 0i64..4_000_000_000_000,
+        ) {
+            let at = |ms| Utc.timestamp_millis_opt(ms).single().expect("valid time");
+            let info = DeviceInfo {
+                id: DeviceId::new(id).expect("valid device id"),
+                registration_id: 1,
+                name: name.clone(),
+                created_at: at(created_at_ms),
+                last_seen: at(last_seen_at_ms),
+            };
+            prop_assert_eq!(
+                device(&info),
+                crate::Device {
+                    id: u32::from(id),
+                    name,
+                    created_at_ms: created_at_ms as u64,
+                    last_seen_at_ms: last_seen_at_ms as u64,
+                }
+            );
         }
     }
 
