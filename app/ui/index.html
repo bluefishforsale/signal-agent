@@ -9,6 +9,12 @@
 </head>
 <body>
   <main>
+    <div class="banner" data-field="update" hidden>
+      <p>Version <strong data-field="update_version"></strong> is ready to install.</p>
+      <p class="error" data-field="update_error" hidden></p>
+      <button class="primary" data-action="install_update">Install and restart</button>
+    </div>
+
     <!-- Each section is one screen, named after the setup state it draws. -->
 
     <section data-screen="move" hidden>
@@ -37,6 +43,7 @@
       <div class="actions"><button class="primary" data-action="choose_account">Continue</button></div>
       <details class="advanced">
         <summary>Advanced</summary>
+        <div class="actions"><button data-action="show_uninstall">Uninstall MCP Relay for Signal</button></div>
       </details>
     </section>
 
@@ -138,6 +145,29 @@
         <div class="actions"><button class="primary" data-action="restart_desktop">Restart Claude Desktop</button></div>
       </div>
       <p data-field="no_restart">Open Claude and ask it about your messages.</p>
+    </section>
+
+    <section data-screen="uninstall" hidden>
+      <h1>Uninstall MCP Relay for Signal</h1>
+      <p>This stops the background agent and removes Signal from your Claude apps and this computer's login items.</p>
+      <label class="choice">
+        <input type="checkbox" name="delete_data">
+        <span><strong>Also delete my messages, account data and the keys that unlock them</strong>
+        <small>Leave this unticked to keep them, so setting up again later picks up where you left off.</small></span>
+      </label>
+      <p class="error" data-field="uninstall_error" hidden></p>
+      <div class="actions">
+        <button data-action="cancel_uninstall">Cancel</button>
+        <button class="primary danger" data-action="uninstall">Uninstall</button>
+      </div>
+    </section>
+
+    <section data-screen="uninstalled" hidden>
+      <h1>Uninstalled</h1>
+      <ul class="clients" data-field="steps"></ul>
+      <p data-field="uninstall_retry" hidden>Some steps failed. Fix what they name, then open the app and uninstall again.</p>
+      <p>You can now delete the app itself.</p>
+      <div class="actions"><button class="primary" data-action="quit">Quit</button></div>
     </section>
 
     <section data-screen="failed" hidden>

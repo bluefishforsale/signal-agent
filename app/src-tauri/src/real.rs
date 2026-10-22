@@ -49,7 +49,7 @@ pub fn setup(start: SetupState) -> anyhow::Result<Box<dyn Setup>> {
 }
 
 /// The `signal-agent` binary shipped beside the app, which Claude launches.
-fn agent() -> anyhow::Result<PathBuf> {
+pub fn agent() -> anyhow::Result<PathBuf> {
     let me = std::env::current_exe().context("unable to locate this app")?;
     let agent = me.with_file_name(format!("signal-agent{}", std::env::consts::EXE_SUFFIX));
     if !agent.is_file() {
