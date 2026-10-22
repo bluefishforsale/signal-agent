@@ -16,7 +16,9 @@ mod testing;
 mod tool;
 mod webhook;
 
-pub use limits::{Clock, LimitExceeded, Limiter, Limits, SystemClock, begin_provisioning};
+pub use limits::{
+    Clock, LimitExceeded, Limiter, Limits, SystemClock, begin_provisioning, defer_provisioning,
+};
 pub use registry::Registry;
 pub use settings::Settings;
 pub use tool::{Tool, ToolContext, ToolError};
