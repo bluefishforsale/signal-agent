@@ -2,6 +2,8 @@
 //! Claude clients launch, and the terminal setup flow, in one binary so every
 //! platform ships a single signed executable.
 
+mod setup_tty;
+
 use anyhow::bail;
 use clap::{Parser, Subcommand};
 use relay_core::prelude::*;
@@ -54,7 +56,7 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
         Cmd::Mcp => relay_mcp::run_stdio(&profile).await,
-        Cmd::Setup => bail!("terminal setup is not implemented yet (lane L9)"),
+        Cmd::Setup => setup_tty::run(profile).await,
         Cmd::Doctor => bail!("doctor is not implemented yet (lane L5)"),
         Cmd::Uninstall => bail!("uninstall is not implemented yet (lane L12)"),
     }
