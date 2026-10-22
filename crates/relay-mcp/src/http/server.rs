@@ -216,6 +216,15 @@ mod tests {
 
     /// A full-access agent serving `registry` on a fresh local endpoint.
     async fn agent(dir: &std::path::Path, registry: Registry) -> (String, Arc<FakeSignal>) {
+        agent_with(dir, registry, AccessMode::Full).await
+    }
+
+    /// An agent whose profile's access choice is `access`.
+    async fn agent_with(
+        dir: &std::path::Path,
+        registry: Registry,
+        access: AccessMode,
+    ) -> (String, Arc<FakeSignal>) {
         let name = if cfg!(windows) {
             format!(r"\\.\pipe\signal-agent-test-{}", Uuid::new_v4())
         } else {
@@ -226,7 +235,7 @@ mod tests {
             signal.clone(),
             Arc::new(MemoryStore::default()),
             registry,
-            AccessMode::Full,
+            access,
         );
         let listener = relay_agent::endpoint::Listener::bind(&name)
             .await
@@ -395,5 +404,31 @@ mod tests {
             panic!("listened off loopback without TLS")
         };
         assert!(format!("{e:#}").contains("TLS"), "unclear refusal: {e:#}");
+    }
+
+    /// A token can only narrow what the profile allows: a full token on a
+    /// profile whose owner chose read-only must still be refused every write.
+    #[tokio::test]
+    async fn a_full_token_never_lifts_a_read_only_profile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (agent, signal) = agent_with(
+            dir.path(),
+            Registry::default().with(ProbeSend),
+            AccessMode::ReadOnly,
+        )
+        .await;
+        let tokens = Tokens::at(&dir.path().join("http_tokens.json"));
+        let token = tokens.create("laptop", AccessMode::Full).expect("create");
+        let addr = start(tokens, agent).await;
+        let client = remote(addr, &token).await;
+        let listed = client.peer().list_tools(None).await.expect("tools/list");
+        assert!(listed.tools.is_empty(), "write tool listed: {listed:?}");
+        let result = client
+            .peer()
+            .call_tool(call("probe_send", json!({"body": "hi"})))
+            .await
+            .expect("a refusal is a result");
+        assert_eq!(result.is_error, Some(true), "full token wrote: {result:?}");
+        assert!(signal.sent().is_empty(), "a full token lifted read-only");
     }
 }
