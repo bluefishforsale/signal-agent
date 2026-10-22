@@ -24,6 +24,7 @@ use crate::{Supervisor, SupervisorAction};
 const RESCAN: Duration = Duration::from_secs(10);
 
 /// How long an agent gets to close its stores after being asked to stop.
+#[cfg(unix)]
 const STOP_GRACE: Duration = Duration::from_secs(10);
 
 /// Runs every ready profile's agent until the OS asks this process to stop.
