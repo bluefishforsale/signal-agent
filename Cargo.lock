@@ -5085,6 +5085,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-service-management",
  "relay-core",
+ "relay-secrets",
  "relay-setup",
  "relay-signal",
  "relay-store",

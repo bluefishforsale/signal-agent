@@ -35,6 +35,7 @@ const AGENT_START_WAIT: Duration = Duration::from_secs(15);
 // NOTE: this assumes the shim runs from the signal-agent binary itself, which
 // is what Claude clients are registered to launch.
 fn spawn_agent(profile: &ProfileName, paths: &ProfilePaths) -> anyhow::Result<()> {
+    may_start_agent(profile, paths)?;
     let exe = std::env::current_exe().context("unable to locate the signal-agent executable")?;
     create_private_dir(&paths.root)?;
     let log = OpenOptions::new()
@@ -54,6 +55,16 @@ fn spawn_agent(profile: &ProfileName, paths: &ProfilePaths) -> anyhow::Result<()
         .with_context(|| format!("unable to start \"{}\" agent", exe.display()))?;
     // Reap the agent if it exits while this shim is still running.
     std::thread::spawn(move || child.wait());
+    Ok(())
+}
+
+/// Refuses to start an agent for a profile without a saved access choice:
+/// one never set up, or one being uninstalled, whose agent would otherwise
+/// recreate its files and re-add its Claude entries.
+fn may_start_agent(profile: &ProfileName, paths: &ProfilePaths) -> anyhow::Result<()> {
+    paths.load_access().with_context(|| {
+        format!("\"{profile}\" isn't set up on this computer, so its agent isn't started")
+    })?;
     Ok(())
 }
 
@@ -348,5 +359,24 @@ mod tests {
             "not sent exactly once: {wrong:?} (all: {counts:?})"
         );
         assert_eq!(counts.len(), 100, "unexpected extra sends: {counts:?}");
+    }
+
+    /// A Claude client's health check launches this shim during uninstall;
+    /// it must not start an agent for a profile whose setup is gone, and
+    /// must still start one for a set-up profile.
+    #[test]
+    fn no_agent_is_started_for_a_profile_that_isnt_set_up() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let profile = ProfileName::default_profile();
+        let paths = ProfilePaths::under(tmp.path().to_owned(), &profile);
+        assert!(
+            may_start_agent(&profile, &paths).is_err(),
+            "started without setup"
+        );
+        assert!(!paths.root.exists(), "created the profile folder");
+        paths
+            .save_access(relay_core::AccessMode::ReadOnly)
+            .expect("save");
+        assert!(may_start_agent(&profile, &paths).is_ok());
     }
 }
