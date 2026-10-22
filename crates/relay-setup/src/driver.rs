@@ -2,7 +2,7 @@
 //! commands they return against injected services, and feeds the results back
 //! in, so each front end only renders states and reports what the user did.
 
-use std::{collections::VecDeque, fs, path::Path};
+use std::{collections::VecDeque, fs, path::Path, sync::Arc};
 
 use anyhow::{Context, bail};
 use async_trait::async_trait;
@@ -10,6 +10,7 @@ use futures::StreamExt;
 use relay_core::prelude::*;
 use relay_secrets::{SecretStore, StoreKey};
 use relay_signal::{LinkEvent, Provisioner, RegistrationStep};
+use relay_tools::{Clock, Limits, SystemClock};
 
 use crate::{
     Command, SetupEvent, SetupState,
@@ -60,6 +61,7 @@ pub struct Driver {
     server: ServerEntry,
     services: Services,
     provisioner: Option<Box<dyn Provisioner>>,
+    clock: Arc<dyn Clock>,
 }
 
 impl Driver {
@@ -79,7 +81,14 @@ impl Driver {
             server,
             services,
             provisioner: None,
+            clock: Arc::new(SystemClock),
         }
+    }
+
+    /// Replaces the wall clock the provisioning backoff is judged by.
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     pub fn state(&self) -> &SetupState {
@@ -119,6 +128,7 @@ impl Driver {
     ) -> anyhow::Result<()> {
         let event = match command {
             Command::StartLink { device_name } => {
+                self.begin_provisioning()?;
                 let mut events = self.provisioner().await?.link(device_name);
                 loop {
                     let Some(event) = events.next().await else {
@@ -137,6 +147,12 @@ impl Driver {
                 SetupEvent::Linked
             }
             Command::RequestCode { number, captcha } => {
+                // NOTE: a captcha only comes after Signal asked for one, so it
+                // finishes the attempt in progress; gating it would leave the
+                // user stuck behind the backoff with a solved captcha.
+                if captcha.is_none() {
+                    self.begin_provisioning()?;
+                }
                 let step = self
                     .provisioner()
                     .await?
@@ -205,6 +221,17 @@ impl Driver {
         Ok(&**self.provisioner.insert(provisioner))
     }
 
+    /// Refuses a link or registration too soon after the last one, before
+    /// Signal hears of it.
+    // NOTE: the default limits apply until they're read from settings (#72).
+    fn begin_provisioning(&self) -> anyhow::Result<()> {
+        let root = &self.paths.root;
+        fs::create_dir_all(root)
+            .with_context(|| format!("unable to create \"{}\"", root.display()))?;
+        let path = root.join("provisioning.json");
+        relay_tools::begin_provisioning(&path, &Limits::default(), self.clock.now_ms())
+    }
+
     // NOTE: the agent opens this same store once it starts, and two processes
     // driving one Signal store corrupt its sessions, so the provisioner must be
     // gone before ConnectClients starts the agent.
@@ -239,7 +266,10 @@ fn apply(state: &mut SetupState, event: SetupEvent, show: Show<'_>) -> Vec<Comma
 mod tests {
     use std::{
         path::PathBuf,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicU64, Ordering},
+        },
     };
 
     use futures::stream::BoxStream;
@@ -277,6 +307,26 @@ mod tests {
         failures: Arc<Mutex<Vec<&'static str>>>,
         opened_with: Arc<Mutex<Vec<StoreKey>>>,
         secrets: Arc<MemorySecretStore>,
+        clock: Arc<FakeClock>,
+    }
+
+    /// Setup's clock. Unless stopped, each reading is an hour after the last,
+    /// so tests that aren't about the provisioning backoff never land in it.
+    struct FakeClock {
+        now: AtomicU64,
+        step: u64,
+    }
+
+    impl relay_tools::Clock for FakeClock {
+        fn now_ms(&self) -> u64 {
+            self.now.fetch_add(self.step, Ordering::SeqCst)
+        }
+    }
+
+    impl FakeClock {
+        fn advance(&self, ms: u64) {
+            self.now.fetch_add(ms, Ordering::SeqCst);
+        }
     }
 
     impl World {
@@ -290,7 +340,20 @@ mod tests {
                 failures: Arc::default(),
                 opened_with: Arc::default(),
                 secrets: Arc::default(),
+                clock: Arc::new(FakeClock {
+                    now: AtomicU64::new(1_700_000_000_000),
+                    step: 60 * 60 * 1_000,
+                }),
             }
+        }
+
+        /// Time only moves when the test advances it.
+        fn stopped_clock(mut self) -> Self {
+            self.clock = Arc::new(FakeClock {
+                now: AtomicU64::new(1_700_000_000_000),
+                step: 0,
+            });
+            self
         }
 
         /// The next link session yields `events`.
@@ -512,7 +575,8 @@ mod tests {
                     world.paths(),
                     server,
                     services,
-                ),
+                )
+                .with_clock(world.clock.clone()),
                 shown: Vec::new(),
             }
         }
@@ -780,6 +844,68 @@ mod tests {
         assert!(
             matches!(state, SetupState::Failed { .. }),
             "a failed {step} left {state:?}"
+        );
+    }
+
+    /// Signal flags accounts that link or register over and over, so a second
+    /// link inside the backoff must be refused before the provisioner hears of
+    /// it, say why, and go through once the backoff has passed.
+    #[tokio::test]
+    async fn a_second_link_inside_the_backoff_is_refused_without_contacting_signal() {
+        let world = World::new()
+            .stopped_clock()
+            .link(vec![Err(anyhow::anyhow!("network down"))])
+            .link(vec![linked()]);
+        let mut h = Harness::new(&world);
+        assert_failed(&h.send(LINK).await, "link");
+        let refused = h.send(SetupEvent::Retry).await;
+        let SetupState::Failed { message, .. } = &refused else {
+            panic!("a link inside the backoff left {refused:?}");
+        };
+        assert!(message.contains("account-safety"), "{message}");
+        let links = |log: Vec<String>| log.iter().filter(|e| e.starts_with("link as")).count();
+        assert_eq!(links(world.log()), 1, "{:?}", world.log());
+
+        world.clock.advance(5 * 60 * 1_000);
+        let state = h.send(SetupEvent::Retry).await;
+        assert_eq!(
+            state,
+            SetupState::ChooseAccess {
+                kind: ProfileKind::Linked
+            }
+        );
+        assert_eq!(links(world.log()), 2, "{:?}", world.log());
+    }
+
+    /// Sending the captcha Signal asked for finishes the same attempt, so the
+    /// backoff must not refuse it.
+    #[tokio::test]
+    async fn a_captcha_resubmission_is_not_a_new_provisioning_attempt() {
+        let world = World::new()
+            .stopped_clock()
+            .code(Ok(RegistrationStep::CaptchaRequired))
+            .code(Ok(RegistrationStep::CodeSent));
+        let mut h = Harness::new(&world);
+        h.send(SetupEvent::AccountChosen {
+            choice: AccountChoice::OwnNumber,
+        })
+        .await;
+        h.send(SetupEvent::NumberEntered {
+            number: NUMBER.into(),
+        })
+        .await;
+        let state = h
+            .send(SetupEvent::CaptchaSolved {
+                token: "tok".into(),
+            })
+            .await;
+        assert_eq!(
+            state,
+            SetupState::EnterCode {
+                number: NUMBER.into()
+            },
+            "{:?}",
+            world.log()
         );
     }
 
