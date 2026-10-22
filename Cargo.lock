@@ -4897,8 +4897,23 @@ dependencies = [
 name = "relay-app"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "async-trait",
+ "dirs",
+ "futures",
+ "qrcode",
+ "relay-agent",
+ "relay-core",
+ "relay-secrets",
+ "relay-setup",
+ "relay-signal",
+ "serde",
+ "serde_json",
  "tauri",
  "tauri-build",
+ "tempfile",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

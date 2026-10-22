@@ -40,6 +40,22 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      # The setup window isn't a default member (no GUI on Linux), so it gets
+      # its own lint and test run where it ships.
+      # tauri-build won't compile relay-app until its signal-agent sidecar is
+      # staged. Lint and tests only need the file to exist, so a debug build does.
+      - if: runner.os != 'Linux'
+        shell: bash
+        run: |
+          cargo build -p signal-agent
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          ext=; [[ "$host" == *-windows-* ]] && ext=.exe
+          mkdir -p app/src-tauri/binaries
+          cp "target/debug/signal-agent$ext" "app/src-tauri/binaries/signal-agent-$host$ext"
+      - if: runner.os != 'Linux'
+        run: cargo clippy -p relay-app --all-targets --all-features -- -D warnings
+      - if: runner.os != 'Linux'
+        run: cargo test -p relay-app
 
   # Unsigned test installers on every push, so the bundling path is always
   # proven. Signed builds happen only in release.yml.
