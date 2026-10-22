@@ -3,15 +3,16 @@
 
 use std::{sync::Arc, time::Duration};
 
-use relay_core::Recipient;
-use relay_tools::{Clock, Registry, ToolContext};
-use serde_json::json;
+use relay_tools::{Clock, Registry, ToolContext, run_due};
 use tokio::time::MissedTickBehavior;
 
 /// How often due jobs are looked for.
 const TICK: Duration = Duration::from_secs(30);
 
 /// Fires every due job each tick until the task is dropped.
+// NOTE: `registry` must be the agent's own, limiter included, and `ctx` its
+// unguarded context: run_due sends through registry.call, which is where the
+// limiter applies, exactly once.
 pub(crate) async fn run(registry: Arc<Registry>, ctx: ToolContext, clock: Arc<dyn Clock>) {
     let mut ticks = tokio::time::interval(TICK);
     // A tick missed while the machine slept must not turn into a run of
@@ -19,37 +20,11 @@ pub(crate) async fn run(registry: Arc<Registry>, ctx: ToolContext, clock: Arc<dy
     ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         ticks.tick().await;
+        // Each job's outcome is recorded on the job for list_scheduled_messages.
         if let Err(e) = run_due(&registry, &ctx, clock.now_ms()).await {
             tracing::warn!("scheduled sends not fired this tick: {e:#}");
         }
     }
-}
-
-// Integration seam: lane L3g's `relay_tools::run_due(registry, ctx, now_ms)`
-// replaces this stand-in once it lands, so the tick and run_scheduled_messages
-// share one implementation. It follows the same contract (#51) meanwhile, and
-// the test below pins that contract for the swap.
-async fn run_due(registry: &Registry, ctx: &ToolContext, now_ms: u64) -> anyhow::Result<()> {
-    for job in ctx.store.take_due(now_ms).await? {
-        let body = job.send.body;
-        let (tool, input) = match job.send.recipient {
-            Recipient::Contact(id) => (
-                "send_message",
-                json!({"recipient": id.to_string(), "message": body}),
-            ),
-            Recipient::Group(id) => (
-                "send_group_message",
-                json!({"group_id": id.to_string(), "message": body}),
-            ),
-        };
-        let outcome = registry
-            .call(ctx, tool, input)
-            .await
-            .map(|_| ())
-            .map_err(|e| e.to_string());
-        ctx.store.finish_scheduled(job.id, outcome).await?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
