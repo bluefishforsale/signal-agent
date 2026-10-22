@@ -15,7 +15,7 @@ use futures::stream::BoxStream;
 use relay_core::prelude::*;
 use relay_signal::{
     Account, Contact, Device, Group, Identity, Incoming, Outgoing, RateLimited, SendableFile,
-    SignalBackend,
+    SignalBackend, StickerImage, StickerPack,
 };
 use relay_store::MessageStore;
 use serde::{Deserialize, Serialize};
@@ -516,6 +516,16 @@ impl SignalBackend for Guarded {
     }
     async fn devices(&self) -> anyhow::Result<Vec<Device>> {
         self.inner.devices().await
+    }
+    async fn sticker_packs(&self) -> anyhow::Result<Vec<StickerPack>> {
+        self.inner.sticker_packs().await
+    }
+    async fn sticker(
+        &self,
+        pack: StickerPackId,
+        sticker_id: u32,
+    ) -> anyhow::Result<Option<StickerImage>> {
+        self.inner.sticker(pack, sticker_id).await
     }
 }
 
@@ -1131,6 +1141,16 @@ mod tests {
         }
         async fn devices(&self) -> anyhow::Result<Vec<Device>> {
             self.inner.devices().await
+        }
+        async fn sticker_packs(&self) -> anyhow::Result<Vec<StickerPack>> {
+            self.inner.sticker_packs().await
+        }
+        async fn sticker(
+            &self,
+            pack: StickerPackId,
+            sticker_id: u32,
+        ) -> anyhow::Result<Option<StickerImage>> {
+            self.inner.sticker(pack, sticker_id).await
         }
     }
 

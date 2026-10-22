@@ -73,6 +73,30 @@ pub struct Device {
     pub last_seen_at_ms: u64,
 }
 
+/// A sticker pack installed on the account.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StickerPack {
+    pub id: StickerPackId,
+    pub title: String,
+    pub author: String,
+    pub stickers: Vec<StickerInfo>,
+}
+
+/// One sticker in an installed pack.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StickerInfo {
+    /// The sticker's number within its pack.
+    pub id: u32,
+    pub emoji: Option<String>,
+}
+
+/// A sticker's image as Signal stores it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StickerImage {
+    pub content_type: String,
+    pub bytes: Vec<u8>,
+}
+
 /// Something to send. Reactions, edits and deletes reference the target by its
 /// `MessageId`, as Signal does.
 // NOTE: every variant here must be classified in relay-tools' limits.rs
@@ -259,6 +283,16 @@ pub trait SignalBackend: Send + Sync {
     async fn identities(&self) -> anyhow::Result<Vec<Identity>>;
     /// Every device linked to the account, as Signal's servers report them.
     async fn devices(&self) -> anyhow::Result<Vec<Device>>;
+    /// Every sticker pack installed on the account, read from the local store.
+    async fn sticker_packs(&self) -> anyhow::Result<Vec<StickerPack>>;
+    /// Sticker `sticker_id`'s image from installed pack `pack`, read from the
+    /// local store; `None` when the pack isn't installed, holds no such
+    /// sticker, or the image was never downloaded.
+    async fn sticker(
+        &self,
+        pack: StickerPackId,
+        sticker_id: u32,
+    ) -> anyhow::Result<Option<StickerImage>>;
 }
 
 /// Progress while linking as a secondary device.

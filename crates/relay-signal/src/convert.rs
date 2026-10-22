@@ -29,7 +29,7 @@ use presage::{
 };
 use relay_core::prelude::*;
 
-use crate::{Account, Incoming, Outgoing};
+use crate::{Account, Incoming, Outgoing, StickerInfo, StickerPack};
 
 /// What `content` means to the agent, or `None` when it carries nothing the
 /// agent keeps (delivery receipts, calls, stories, key syncs). `me` is the
@@ -191,6 +191,27 @@ pub(crate) fn attachment_spec(path: &Path, length: usize) -> AttachmentSpec {
             .map(|name| name.to_string_lossy().into_owned()),
         ..Default::default()
     }
+}
+
+pub(crate) fn sticker_pack_from(pack: &presage::store::StickerPack) -> anyhow::Result<StickerPack> {
+    let id: [u8; 16] =
+        pack.id.as_slice().try_into().with_context(|| {
+            format!("stored sticker pack id is {} bytes, not 16", pack.id.len())
+        })?;
+    Ok(StickerPack {
+        id: StickerPackId::new(id),
+        title: pack.manifest.title.clone(),
+        author: pack.manifest.author.clone(),
+        stickers: pack
+            .manifest
+            .stickers
+            .iter()
+            .map(|s| StickerInfo {
+                id: s.id,
+                emoji: s.emoji.clone(),
+            })
+            .collect(),
+    })
 }
 
 /// What to put on the wire for `message`, sent at `sent_at_ms`, carrying

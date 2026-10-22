@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     Account, Contact, Device, DiscoveryUnsupported, Group, Identity, Incoming, Outgoing,
-    RateLimited, SendableFile, SignalBackend,
+    RateLimited, SendableFile, SignalBackend, StickerImage, StickerInfo, StickerPack,
 };
 
 /// A fake registered account. Build one with `FakeSignal::new`, seed it with
@@ -93,7 +93,8 @@ impl FakeSignal {
         self
     }
 
-    /// An installed sticker pack holding `sticker_ids`.
+    /// An installed sticker pack holding `sticker_ids`, titled with its id.
+    /// Each sticker's image is the bytes of "<pack>/<sticker_id>".
     pub fn with_sticker_pack(self, pack: StickerPackId, sticker_ids: Vec<u32>) -> Self {
         self.state().sticker_packs.insert(pack, sticker_ids);
         self
@@ -261,6 +262,41 @@ impl SignalBackend for FakeSignal {
 
     async fn devices(&self) -> anyhow::Result<Vec<Device>> {
         Ok(self.state().devices.clone())
+    }
+
+    async fn sticker_packs(&self) -> anyhow::Result<Vec<StickerPack>> {
+        let mut packs: Vec<_> = self
+            .state()
+            .sticker_packs
+            .iter()
+            .map(|(id, stickers)| StickerPack {
+                id: *id,
+                title: id.to_string(),
+                author: String::new(),
+                stickers: stickers
+                    .iter()
+                    .map(|&id| StickerInfo { id, emoji: None })
+                    .collect(),
+            })
+            .collect();
+        packs.sort_by_key(|p| *p.id.as_bytes());
+        Ok(packs)
+    }
+
+    async fn sticker(
+        &self,
+        pack: StickerPackId,
+        sticker_id: u32,
+    ) -> anyhow::Result<Option<StickerImage>> {
+        let installed = self
+            .state()
+            .sticker_packs
+            .get(&pack)
+            .is_some_and(|stickers| stickers.contains(&sticker_id));
+        Ok(installed.then(|| StickerImage {
+            content_type: "image/webp".into(),
+            bytes: format!("{pack}/{sticker_id}").into_bytes(),
+        }))
     }
 }
 
