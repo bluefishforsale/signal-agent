@@ -17,7 +17,9 @@ use serde::Deserialize;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use url::Url;
 
-use crate::RateLimited;
+use relay_core::LinkAndSyncKey;
+
+use crate::{HistoryTransfer, RateLimited};
 
 /// Where the phone said its archive went, or why it sent none.
 #[derive(Debug, PartialEq, Eq)]
@@ -63,6 +65,9 @@ enum ArchiveResponse {
     Failed { error: String },
 }
 
+/// The downloaded archive's name in the profile directory.
+const ARCHIVE_FILE: &str = "link-and-sync.archive";
+
 /// How much longer than the poll's own timeout to wait for Signal's answer.
 const POLL_SLACK: Duration = Duration::from_secs(15);
 
@@ -98,6 +103,25 @@ fn http_client(builder: reqwest::ClientBuilder) -> anyhow::Result<reqwest::Clien
 }
 
 impl ArchiveSource {
+    /// Waits for the phone's history and downloads it into `dir`, to be
+    /// decrypted with `key`.
+    async fn fetch(&self, key: LinkAndSyncKey, dir: &Path) -> anyhow::Result<HistoryTransfer> {
+        let (cdn, cdn_key) = match self.wait_for_archive().await? {
+            Waited::Ready { cdn, key } => (cdn, key),
+            Waited::Relink => return Ok(HistoryTransfer::Relink),
+            Waited::NoUpload => return Ok(HistoryTransfer::NoUpload),
+            Waited::TimedOut => return Ok(HistoryTransfer::TimedOut),
+        };
+        let path = dir.join(ARCHIVE_FILE);
+        if let Err(e) = self.download(cdn, &cdn_key, &path).await {
+            // A partial download is useless without a retry, which only a
+            // fresh link can give.
+            let _ = tokio::fs::remove_file(&path).await;
+            return Err(e);
+        }
+        Ok(HistoryTransfer::Archive { path, key })
+    }
+
     fn chat_url(&self, path: &str) -> anyhow::Result<Url> {
         match &self.hosts {
             #[cfg(test)]
@@ -519,5 +543,28 @@ mod tests {
             "{limited:?}"
         );
         assert_eq!(server.requests().len(), 1, "{:?}", server.requests());
+    }
+
+    /// Once the phone answers, the outcome carries the downloaded file and the
+    /// key to it, so the caller can import without asking Signal again.
+    #[tokio::test]
+    async fn a_ready_archive_is_handed_over_downloaded_with_its_key() {
+        let archive = b"encrypted archive bytes".to_vec();
+        let server = FakeServer::start(vec![
+            json("200 OK", r#"{"cdn":0,"key":"k"}"#),
+            bytes("200 OK", "", &archive, archive.len()),
+        ])
+        .await;
+        let dir = tempfile::tempdir().expect("dir");
+        let transfer = source(&server)
+            .fetch(LinkAndSyncKey::new([5; 32]), dir.path())
+            .await
+            .expect("fetched");
+        let HistoryTransfer::Archive { path, key } = transfer else {
+            panic!("no archive: {transfer:?}");
+        };
+        assert!(path.starts_with(dir.path()), "{}", path.display());
+        assert_eq!(std::fs::read(&path).expect("file"), archive);
+        assert_eq!(key.as_bytes(), &[5; 32]);
     }
 }
