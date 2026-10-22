@@ -235,6 +235,7 @@ fn apply(state: &mut SetupState, event: SetupEvent, show: Show<'_>) -> Vec<Comma
     commands
 }
 
+// Interim location until relay-core owns the path and the agent reads it (#67).
 fn save_access(paths: &ProfilePaths, access: AccessMode) -> anyhow::Result<()> {
     let path = paths.root.join("access.json");
     fs::create_dir_all(&paths.root)
