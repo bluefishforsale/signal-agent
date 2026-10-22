@@ -1325,18 +1325,25 @@ mod tests {
         let agent = crate::StoreLock::try_acquire(&paths)
             .expect("lock")
             .expect("free");
-        // The agent lets go once it sees setup running, or gives up waiting.
-        let yielding = std::thread::spawn(move || {
-            for _ in 0..500 {
-                if crate::setup_running(&paths) {
-                    break;
+        // The agent lets go once it sees setup running, as a real one does,
+        // or once the link step is over, so a broken setup can't hang the test.
+        let linked_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let yielding = {
+            let linked_done = linked_done.clone();
+            std::thread::spawn(move || {
+                while !crate::setup_running(&paths) && !linked_done.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
                 }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            drop(agent);
-        });
+                drop(agent);
+            })
+        };
         let mut h = Harness::new(&world);
-        h.send(LINK).await;
+        let linking = h.send(LINK).await;
+        linked_done.store(true, Ordering::SeqCst);
+        assert!(
+            !matches!(linking, SetupState::Failed { .. }),
+            "the link step failed: {linking:?}"
+        );
         h.send(SetupEvent::AccessChosen {
             access: AccessMode::Full,
         })
