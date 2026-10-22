@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use crate::{
     Limiter, Tool, ToolContext, ToolError, admin, directory, limits, local, mutate, pins, polls,
-    read, send,
+    read, send, webhook,
 };
 
 /// The set of tools a profile serves.
@@ -53,6 +53,7 @@ impl Registry {
             .with(polls::VotePoll)
             .with(polls::TerminatePoll)
             .with(admin::AdminDeleteMessage)
+            .with(webhook::GetWebhook)
     }
 
     /// Applies account-safety limits to every send a tool makes.
