@@ -1,7 +1,22 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "The setup window: listen for screen changes and call the app's own commands.",
-  "windows": ["main"],
-  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten"]
+  "description": "The local setup window: listen for screen changes and call the app's own commands. The captcha window is remote and gets nothing.",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "allow-current",
+    "allow-send",
+    "allow-open-captcha",
+    "allow-needs-move",
+    "allow-move-to-applications",
+    "allow-update-offer",
+    "allow-install-update",
+    "allow-uninstall",
+    "allow-quit"
+  ],
+  "local": true
 }

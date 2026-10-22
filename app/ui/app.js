@@ -13,7 +13,8 @@ function show(name) {
     section.hidden = section.dataset.screen !== name;
   }
   const section = document.querySelector(`[data-screen="${name}"]`);
-  const field = section && section.querySelector("input:not([type=radio])");
+  if (section) for (const button of section.querySelectorAll("button")) button.disabled = false;
+  const field = section && section.querySelector("input:not([type=radio]):not([type=checkbox])");
   if (field) field.focus();
 }
 
@@ -74,11 +75,65 @@ function render(view) {
   if (!visible || visible.dataset.screen !== view.screen) show(view.screen);
 }
 
+function showUpdate(offer) {
+  const banner = document.querySelector('[data-field="update"]');
+  fill(banner, "update_version", offer.version);
+  banner.hidden = false;
+}
+
+function showUninstalled(outcomes) {
+  const list = document.querySelector('[data-field="steps"]');
+  list.replaceChildren(...outcomes.map((outcome) => {
+    const item = document.createElement("li");
+    const failed = "Err" in outcome.result;
+    item.className = failed ? "bad" : "ok";
+    item.textContent = outcome.name;
+    if (failed) {
+      const why = document.createElement("small");
+      why.textContent = outcome.result.Err;
+      item.append(why);
+    }
+    return item;
+  }));
+  document.querySelector('[data-field="uninstall_retry"]').hidden = !outcomes.some((o) => "Err" in o.result);
+  show("uninstalled");
+}
+
 function checked(name) {
   return document.querySelector(`input[name="${name}"]:checked`).value;
 }
 
 const actions = {
+  install_update: async (button) => {
+    const error = document.querySelector('[data-field="update_error"]');
+    error.hidden = true;
+    try {
+      // Only this click downloads and installs; the app restarts when it's done.
+      await invoke("install_update");
+    } catch (message) {
+      error.textContent = `The update couldn't install: ${message}`;
+      error.hidden = false;
+      button.disabled = false;
+    }
+  },
+  show_uninstall: () => {
+    document.querySelector('input[name="delete_data"]').checked = false;
+    show("uninstall");
+  },
+  cancel_uninstall: async () => render(await invoke("current")),
+  uninstall: async (button) => {
+    const error = document.querySelector('[data-field="uninstall_error"]');
+    error.hidden = true;
+    const deleteData = document.querySelector('input[name="delete_data"]').checked;
+    try {
+      showUninstalled(await invoke("uninstall", { deleteData }));
+    } catch (message) {
+      error.textContent = `Uninstall couldn't start: ${message}`;
+      error.hidden = false;
+      button.disabled = false;
+    }
+  },
+  quit: () => invoke("quit"),
   choose_account: () => send({ event: "account_chosen", choice: checked("account") }),
   choose_access: () => send({ event: "access_chosen", access: checked("access") }),
   restart_desktop: () => send({ event: "restart_desktop" }),
@@ -134,6 +189,9 @@ async function start() {
     return;
   }
   await listen("setup", (e) => render(e.payload));
+  await listen("update", (e) => showUpdate(e.payload));
+  const offer = await invoke("update_offer");
+  if (offer) showUpdate(offer);
   render(await invoke("current"));
 }
 
