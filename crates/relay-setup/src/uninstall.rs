@@ -10,7 +10,7 @@ use relay_core::ProfileName;
 use relay_secrets::SecretStore;
 use serde::{Deserialize, Serialize};
 
-use crate::claude::{ClaudeClient, Clients, ServerEntry};
+use crate::claude::{ClaudeClient, Clients, Platform, Runner, ServerEntry};
 
 pub use footprint::{DELETE_DATA_LABEL, Footprint, Leftover, Roots, checklist};
 
@@ -131,6 +131,66 @@ fn remove_entry(
     machine.clients.unregister(client, &entry).map(|_| ())
 }
 
+/// Stops every `signal-agent` process of this user except `me`, politely
+/// first, so no agent is left to rewrite its files or Claude entries.
+pub fn stop_agents(runner: &dyn Runner, platform: Platform, me: u32) -> anyhow::Result<()> {
+    if platform == Platform::Windows {
+        let script = format!(
+            "$me = Get-Process -Id {me}; \
+             Get-Process -Name signal-agent -ErrorAction SilentlyContinue | \
+             Where-Object {{ $_.Id -ne {me} -and $_.SessionId -eq $me.SessionId }} | \
+             Stop-Process -Force"
+        );
+        let args = ["-NoProfile", "-NonInteractive", "-Command", &script].map(String::from);
+        return succeeded(runner, "powershell", &args).map(|_| ());
+    }
+    let uid = succeeded(runner, "id", &["-u".into()])?;
+    let uid = uid.trim();
+    let others = || -> anyhow::Result<Vec<String>> {
+        let out = runner.run(
+            Path::new("pgrep"),
+            &["-x", "-U", uid, "signal-agent"].map(String::from),
+        )?;
+        Ok(out
+            .stdout
+            .split_whitespace()
+            .filter(|pid| *pid != me.to_string())
+            .map(String::from)
+            .collect())
+    };
+    for signal in ["-TERM", "-KILL"] {
+        let pids = others()?;
+        if pids.is_empty() {
+            return Ok(());
+        }
+        let mut args = vec![signal.to_owned()];
+        args.extend(pids);
+        // Already gone by the time kill runs is fine; the recheck decides.
+        runner.run(Path::new("kill"), &args)?;
+        for _ in 0..20 {
+            if others()?.is_empty() {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    }
+    anyhow::bail!("signal-agent processes {:?} would not stop", others()?)
+}
+
+/// `program`'s stdout, or an error with its output if it failed.
+fn succeeded(runner: &dyn Runner, program: &str, args: &[String]) -> anyhow::Result<String> {
+    let out = runner.run(Path::new(program), args)?;
+    if !out.success {
+        anyhow::bail!(
+            "`{program} {}` failed: {}{}",
+            args.join(" "),
+            out.stdout.trim(),
+            out.stderr.trim()
+        );
+    }
+    Ok(out.stdout)
+}
+
 /// Removes the file or folder at `path`; one that isn't there is fine.
 fn remove_path(path: &Path) -> anyhow::Result<()> {
     let removed = match fs::symlink_metadata(path) {
@@ -144,12 +204,12 @@ fn remove_path(path: &Path) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, path::PathBuf};
+    use std::{cell::RefCell, path::PathBuf, sync::Mutex};
 
     use relay_secrets::SecretStore as _;
 
     use super::*;
-    use crate::claude::{Platform, RunOutput, Runner};
+    use crate::claude::{RunOutput, Runner};
 
     struct Succeeds;
 
@@ -489,5 +549,85 @@ mod tests {
             "no login agent plist at {}",
             plist.display()
         );
+    }
+
+    /// A process table: `pgrep` lists the live pids and `kill` ends them.
+    #[derive(Default)]
+    struct Processes {
+        live: Mutex<Vec<u32>>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl Runner for Processes {
+        fn run(&self, program: &Path, args: &[String]) -> anyhow::Result<RunOutput> {
+            self.calls.lock().expect("calls").push(format!(
+                "{} {}",
+                program.display(),
+                args.join(" ")
+            ));
+            let stdout = match program.to_str() {
+                Some("id") => "501\n".to_owned(),
+                Some("pgrep") => self
+                    .live
+                    .lock()
+                    .expect("live")
+                    .iter()
+                    .map(|p| format!("{p}\n"))
+                    .collect(),
+                Some("powershell") => String::new(),
+                Some("kill") => {
+                    let killed: Vec<u32> =
+                        args[1..].iter().map(|p| p.parse().expect("pid")).collect();
+                    self.live
+                        .lock()
+                        .expect("live")
+                        .retain(|p| !killed.contains(p));
+                    String::new()
+                }
+                _ => anyhow::bail!("unexpected {}", program.display()),
+            };
+            Ok(RunOutput {
+                success: true,
+                stdout,
+                ..RunOutput::default()
+            })
+        }
+    }
+
+    /// The CLI runs uninstall as a `signal-agent` process itself; stopping
+    /// agents must end every other one of this user's and never itself.
+    #[test]
+    fn stopping_agents_ends_this_users_others_but_never_itself() {
+        let processes = Processes::default();
+        *processes.live.lock().expect("live") = vec![40, 41, 99];
+        stop_agents(&processes, Platform::MacOs, 99).expect("stop");
+        assert_eq!(*processes.live.lock().expect("live"), [99]);
+        let calls = processes.calls.lock().expect("calls");
+        assert!(
+            calls.contains(&"pgrep -x -U 501 signal-agent".to_owned()),
+            "{calls:?}"
+        );
+        assert!(calls.contains(&"kill -TERM 40 41".to_owned()), "{calls:?}");
+        assert!(!calls.iter().any(|c| c.contains("-KILL")), "{calls:?}");
+    }
+
+    /// On Windows the uninstaller's own `signal-agent.exe uninstall` must
+    /// survive, and another user's agents on a shared machine are not ours.
+    #[test]
+    fn windows_agent_stop_spares_itself_and_other_sessions() {
+        let processes = Processes::default();
+        stop_agents(&processes, Platform::Windows, 4242).expect("stop");
+        let calls = processes.calls.lock().expect("calls");
+        let [call] = calls.as_slice() else {
+            panic!("expected one PowerShell call: {calls:?}");
+        };
+        for needle in [
+            "-Name signal-agent",
+            "$_.Id -ne 4242",
+            "$_.SessionId -eq $me.SessionId",
+            "Get-Process -Id 4242",
+        ] {
+            assert!(call.contains(needle), "{needle} missing from {call}");
+        }
     }
 }
