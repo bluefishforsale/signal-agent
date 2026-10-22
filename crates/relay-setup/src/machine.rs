@@ -14,6 +14,18 @@ pub enum AccountChoice {
     OwnNumber,
 }
 
+/// Why a newly linked device got no history from the phone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryGap {
+    /// The phone linked without transferring history.
+    NotSent,
+    /// The phone failed to send it and asks for the device to be linked again.
+    RelinkRequested,
+    /// The phone never sent it.
+    TimedOut,
+}
+
 /// What happened when registering with one Claude client.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientOutcome {
@@ -63,6 +75,22 @@ pub enum SetupState {
     ImportingHistory {
         imported: u64,
         total: Option<u64>,
+        access: AccessMode,
+    },
+    HistoryUnavailable {
+        reason: HistoryGap,
+        access: AccessMode,
+    },
+    /// Checking this computer for Signal Desktop, whose history the user may
+    /// opt to import too.
+    FindingDesktop {
+        access: AccessMode,
+    },
+    OfferDesktopImport {
+        access: AccessMode,
+    },
+    ImportingDesktop {
+        imported: u64,
         access: AccessMode,
     },
     ConnectingClients {
@@ -117,6 +145,20 @@ pub enum SetupEvent {
         total: Option<u64>,
     },
     HistoryDone,
+    NoHistory {
+        reason: HistoryGap,
+    },
+    /// Carry on without (more of) the phone's history.
+    SkipHistory,
+    DesktopFound,
+    DesktopAbsent,
+    DesktopImportChosen {
+        import: bool,
+    },
+    DesktopProgress {
+        imported: u64,
+    },
+    DesktopImportDone,
     ClientsConnected {
         clients: Vec<ClientOutcome>,
     },
@@ -146,6 +188,8 @@ pub enum Command {
         access: AccessMode,
     },
     ImportHistory,
+    FindDesktop,
+    ImportDesktop,
     ConnectClients,
     RestartDesktop,
 }
@@ -266,7 +310,38 @@ pub fn transition(state: &SetupState, event: SetupEvent) -> (SetupState, Vec<Com
             },
             Vec::new(),
         ),
-        (S::ImportingHistory { access, .. }, E::HistoryDone) => connect_clients(*access),
+        (
+            S::ImportingHistory { access, .. } | S::HistoryUnavailable { access, .. },
+            E::SkipHistory,
+        )
+        | (S::ImportingHistory { access, .. }, E::HistoryDone) => find_desktop(*access),
+        (S::ImportingHistory { access, .. }, E::NoHistory { reason }) => (
+            S::HistoryUnavailable {
+                reason,
+                access: *access,
+            },
+            Vec::new(),
+        ),
+        (S::FindingDesktop { access }, E::DesktopFound) => {
+            (S::OfferDesktopImport { access: *access }, Vec::new())
+        }
+        (S::FindingDesktop { access }, E::DesktopAbsent)
+        | (S::OfferDesktopImport { access }, E::DesktopImportChosen { import: false })
+        | (S::ImportingDesktop { access, .. }, E::DesktopImportDone) => connect_clients(*access),
+        (S::ImportingDesktop { access, .. }, E::DesktopProgress { imported }) => (
+            S::ImportingDesktop {
+                imported,
+                access: *access,
+            },
+            Vec::new(),
+        ),
+        (S::OfferDesktopImport { access }, E::DesktopImportChosen { import: true }) => (
+            S::ImportingDesktop {
+                imported: 0,
+                access: *access,
+            },
+            vec![Command::ImportDesktop],
+        ),
         (S::ConnectingClients { .. }, E::ClientsConnected { clients }) => {
             (S::Done { clients }, Vec::new())
         }
@@ -282,6 +357,10 @@ pub fn transition(state: &SetupState, event: SetupEvent) -> (SetupState, Vec<Com
             None => (state.clone(), Vec::new()),
         },
         (S::Failed { retry, .. }, E::Retry) => resume(retry),
+        (S::Failed { retry, .. }, E::SkipHistory) => match **retry {
+            S::ImportingHistory { access, .. } => find_desktop(access),
+            _ => (state.clone(), Vec::new()),
+        },
         (state, _) => (state.clone(), Vec::new()),
     }
 }
@@ -305,6 +384,7 @@ fn resume_point(state: &SetupState) -> Option<SetupState> {
             total: None,
             access: *access,
         }),
+        S::ImportingDesktop { access, .. } => Some(S::OfferDesktopImport { access: *access }),
         S::ConnectingClients { .. } | S::Done { .. } => Some(state.clone()),
         S::AlreadySetUp { .. }
         | S::ChooseAccount { .. }
@@ -312,6 +392,9 @@ fn resume_point(state: &SetupState) -> Option<SetupState> {
         | S::SolveCaptcha { .. }
         | S::EnterCode { .. }
         | S::ChooseAccess { .. }
+        | S::HistoryUnavailable { .. }
+        | S::FindingDesktop { .. }
+        | S::OfferDesktopImport { .. }
         | S::Failed { .. } => None,
     }
 }
@@ -361,6 +444,13 @@ fn import_history(access: AccessMode) -> (SetupState, Vec<Command>) {
             access,
         },
         vec![Command::ImportHistory],
+    )
+}
+
+fn find_desktop(access: AccessMode) -> (SetupState, Vec<Command>) {
+    (
+        SetupState::FindingDesktop { access },
+        vec![Command::FindDesktop],
     )
 }
 
@@ -543,16 +633,222 @@ mod tests {
         assert!(commands.is_empty(), "{commands:?}");
     }
 
-    /// The access mode must be saved before any client can connect, or a client
-    /// could reach a read-only profile's write tools in the gap.
+    /// A phone that sent no history, asked for a relink, or never answered
+    /// must leave setup on a screen that says which, keeping the access choice,
+    /// and run nothing until the user carries on.
     #[test]
-    fn finished_history_saves_access_before_connecting_clients() {
+    fn missing_history_says_why_and_waits_for_the_user() {
+        for reason in [
+            HistoryGap::NotSent,
+            HistoryGap::RelinkRequested,
+            HistoryGap::TimedOut,
+        ] {
+            let importing = SetupState::ImportingHistory {
+                imported: 0,
+                total: None,
+                access: AccessMode::ReadOnly,
+            };
+            let (state, commands) = transition(&importing, SetupEvent::NoHistory { reason });
+            assert_eq!(
+                state,
+                SetupState::HistoryUnavailable {
+                    reason,
+                    access: AccessMode::ReadOnly
+                }
+            );
+            assert!(commands.is_empty(), "{reason:?} ran {commands:?}");
+        }
+    }
+
+    /// However link-and-sync ends (imported, skipped, or given up on), setup
+    /// looks for Signal Desktop next, carrying the access choice, before
+    /// anything connects.
+    #[test]
+    fn every_way_out_of_history_looks_for_signal_desktop() {
         let importing = SetupState::ImportingHistory {
             imported: 100,
             total: Some(100),
             access: AccessMode::ReadOnly,
         };
-        let (state, commands) = transition(&importing, SetupEvent::HistoryDone);
+        let unavailable = SetupState::HistoryUnavailable {
+            reason: HistoryGap::TimedOut,
+            access: AccessMode::ReadOnly,
+        };
+        for (state, event) in [
+            (importing.clone(), SetupEvent::HistoryDone),
+            (importing, SetupEvent::SkipHistory),
+            (unavailable, SetupEvent::SkipHistory),
+        ] {
+            let (next, commands) = transition(&state, event.clone());
+            assert_eq!(
+                next,
+                SetupState::FindingDesktop {
+                    access: AccessMode::ReadOnly
+                },
+                "{event:?} in {state:?}"
+            );
+            assert_eq!(
+                commands,
+                vec![Command::FindDesktop],
+                "{event:?} in {state:?}"
+            );
+        }
+    }
+
+    /// A history import that keeps failing (an expired or corrupt archive)
+    /// must not trap the user in Retry: its failure screen can skip history
+    /// too, but no other failure screen can.
+    #[test]
+    fn a_failed_history_import_can_be_skipped_but_no_other_failure() {
+        let importing = SetupState::ImportingHistory {
+            imported: 7,
+            total: None,
+            access: AccessMode::Full,
+        };
+        let failure = SetupEvent::CommandFailed {
+            message: "archive expired".into(),
+        };
+        let (failed, _) = transition(&importing, failure.clone());
+        let (state, commands) = transition(&failed, SetupEvent::SkipHistory);
+        assert_eq!(
+            state,
+            SetupState::FindingDesktop {
+                access: AccessMode::Full
+            }
+        );
+        assert_eq!(commands, vec![Command::FindDesktop]);
+
+        let (failed, _) = transition(&requesting(), failure);
+        let (state, commands) = transition(&failed, SetupEvent::SkipHistory);
+        assert_eq!(state, failed);
+        assert!(commands.is_empty(), "{commands:?}");
+    }
+
+    /// Signal Desktop's history is opt-in: finding Desktop only asks, and
+    /// imports nothing until the user says yes.
+    #[test]
+    fn finding_signal_desktop_asks_before_importing_anything() {
+        let finding = SetupState::FindingDesktop {
+            access: AccessMode::Full,
+        };
+        let (state, commands) = transition(&finding, SetupEvent::DesktopFound);
+        assert_eq!(
+            state,
+            SetupState::OfferDesktopImport {
+                access: AccessMode::Full
+            }
+        );
+        assert!(commands.is_empty(), "{commands:?}");
+    }
+
+    /// Yes imports Desktop's history before anything connects; no goes
+    /// straight to saving access and connecting, with nothing read from
+    /// Desktop.
+    #[test]
+    fn the_desktop_offer_imports_only_on_yes() {
+        let offer = SetupState::OfferDesktopImport {
+            access: AccessMode::ReadOnly,
+        };
+        let (state, commands) =
+            transition(&offer, SetupEvent::DesktopImportChosen { import: true });
+        assert_eq!(
+            state,
+            SetupState::ImportingDesktop {
+                imported: 0,
+                access: AccessMode::ReadOnly
+            }
+        );
+        assert_eq!(commands, vec![Command::ImportDesktop]);
+
+        let (state, commands) =
+            transition(&offer, SetupEvent::DesktopImportChosen { import: false });
+        assert_eq!(
+            state,
+            SetupState::ConnectingClients {
+                access: AccessMode::ReadOnly
+            }
+        );
+        assert_eq!(
+            commands,
+            vec![
+                Command::SaveAccess {
+                    access: AccessMode::ReadOnly
+                },
+                Command::ConnectClients
+            ]
+        );
+    }
+
+    /// A Desktop import that fails (Keychain access denied, a database it
+    /// can't read) retries back to the offer, so the user can always decline
+    /// instead of being stuck on an optional extra.
+    #[test]
+    fn a_failed_desktop_import_retries_back_to_the_offer() {
+        let importing = SetupState::ImportingDesktop {
+            imported: 12,
+            access: AccessMode::Full,
+        };
+        let (failed, _) = transition(
+            &importing,
+            SetupEvent::CommandFailed {
+                message: "Keychain access denied".into(),
+            },
+        );
+        let (state, commands) = transition(&failed, SetupEvent::Retry);
+        assert_eq!(
+            state,
+            SetupState::OfferDesktopImport {
+                access: AccessMode::Full
+            }
+        );
+        assert!(commands.is_empty(), "{commands:?}");
+    }
+
+    /// Desktop import progress updates the count shown, and a finished import
+    /// saves access before connecting clients.
+    #[test]
+    fn a_finished_desktop_import_saves_access_before_connecting() {
+        let importing = SetupState::ImportingDesktop {
+            imported: 0,
+            access: AccessMode::Full,
+        };
+        let (state, commands) =
+            transition(&importing, SetupEvent::DesktopProgress { imported: 300 });
+        assert_eq!(
+            state,
+            SetupState::ImportingDesktop {
+                imported: 300,
+                access: AccessMode::Full
+            }
+        );
+        assert!(commands.is_empty(), "{commands:?}");
+
+        let (state, commands) = transition(&state, SetupEvent::DesktopImportDone);
+        assert_eq!(
+            state,
+            SetupState::ConnectingClients {
+                access: AccessMode::Full
+            }
+        );
+        assert_eq!(
+            commands,
+            vec![
+                Command::SaveAccess {
+                    access: AccessMode::Full
+                },
+                Command::ConnectClients
+            ]
+        );
+    }
+
+    /// The access mode must be saved before any client can connect, or a client
+    /// could reach a read-only profile's write tools in the gap.
+    #[test]
+    fn no_signal_desktop_saves_access_before_connecting_clients() {
+        let finding = SetupState::FindingDesktop {
+            access: AccessMode::ReadOnly,
+        };
+        let (state, commands) = transition(&finding, SetupEvent::DesktopAbsent);
         assert_eq!(
             state,
             SetupState::ConnectingClients {
@@ -926,6 +1222,15 @@ mod tests {
                 total: None,
             },
             E::HistoryDone,
+            E::NoHistory {
+                reason: HistoryGap::TimedOut,
+            },
+            E::SkipHistory,
+            E::DesktopFound,
+            E::DesktopAbsent,
+            E::DesktopImportChosen { import: false },
+            E::DesktopProgress { imported: 1 },
+            E::DesktopImportDone,
             E::ClientsConnected { clients: vec![] },
             E::RestartDesktop,
             E::CommandFailed {
@@ -1019,6 +1324,40 @@ mod tests {
                         total: None,
                     },
                     E::HistoryDone,
+                    E::NoHistory {
+                        reason: HistoryGap::NotSent,
+                    },
+                    E::SkipHistory,
+                    failure.clone(),
+                ],
+            ),
+            (
+                SetupState::HistoryUnavailable {
+                    reason: HistoryGap::RelinkRequested,
+                    access: AccessMode::Full,
+                },
+                vec![E::SkipHistory],
+            ),
+            (
+                SetupState::FindingDesktop {
+                    access: AccessMode::Full,
+                },
+                vec![E::DesktopFound, E::DesktopAbsent],
+            ),
+            (
+                SetupState::OfferDesktopImport {
+                    access: AccessMode::Full,
+                },
+                vec![E::DesktopImportChosen { import: true }],
+            ),
+            (
+                SetupState::ImportingDesktop {
+                    imported: 0,
+                    access: AccessMode::Full,
+                },
+                vec![
+                    E::DesktopProgress { imported: 0 },
+                    E::DesktopImportDone,
                     failure.clone(),
                 ],
             ),
@@ -1075,6 +1414,18 @@ mod tests {
             (any::<u64>(), any::<Option<u64>>())
                 .prop_map(|(imported, total)| E::HistoryProgress { imported, total }),
             Just(E::HistoryDone),
+            prop_oneof![
+                Just(HistoryGap::NotSent),
+                Just(HistoryGap::RelinkRequested),
+                Just(HistoryGap::TimedOut)
+            ]
+            .prop_map(|reason| E::NoHistory { reason }),
+            Just(E::SkipHistory),
+            Just(E::DesktopFound),
+            Just(E::DesktopAbsent),
+            any::<bool>().prop_map(|import| E::DesktopImportChosen { import }),
+            any::<u64>().prop_map(|imported| E::DesktopProgress { imported }),
+            Just(E::DesktopImportDone),
             Just(E::ClientsConnected { clients: vec![] }),
             Just(E::RestartDesktop),
             Just(E::Relink),

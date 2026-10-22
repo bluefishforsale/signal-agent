@@ -14,7 +14,8 @@ use relay_core::prelude::*;
 use relay_secrets::StoreKey;
 use relay_setup::{
     claude::{ClaudeClient, Clients, ServerEntry},
-    driver::{Driver, HistoryImport, LoginItem, OpenProvisioner, Services},
+    driver::{Driver, LoginItem, OpenProvisioner, Services},
+    history::{LinkAndSync, ProfileStore, SignalDesktop},
     prelude::*,
 };
 use relay_signal::{PresageProvisioner, Provisioner, Servers};
@@ -26,16 +27,34 @@ pub async fn run(profile: ProfileName) -> anyhow::Result<()> {
         bail!(why);
     }
     let server = ServerEntry::for_profile(&profile, &exe, ["mcp", "--profile", &profile])?;
+    let paths = ProfilePaths::for_profile(&profile)?;
+    let store = || -> anyhow::Result<ProfileStore> {
+        Ok(ProfileStore::new(
+            &profile,
+            &paths,
+            relay_secrets::platform_store()?,
+        ))
+    };
     let services = Services {
         signal: Box::new(Presage),
         secrets: relay_secrets::platform_store()?,
-        history: Box::new(NoHistoryYet),
+        history: Box::new(LinkAndSync::new(store()?)),
+        desktop: Box::new(SignalDesktop::usual_place(store()?)),
         login: Box::new(AgentAtLogin),
         clients: Clients::system(),
     };
-    let paths = ProfilePaths::for_profile(&profile)?;
     let start = first_state(&paths, &computer_name());
     let mut driver = Driver::new(start, profile, paths, server, services);
+    let skip = driver.history_skip();
+    // NOTE: listening for Ctrl-C replaces its default exit, so it must still
+    // exit whenever there is no history import to skip.
+    tokio::spawn(async move {
+        while tokio::signal::ctrl_c().await.is_ok() {
+            if !skip.skip() {
+                std::process::exit(130);
+            }
+        }
+    });
     drive(&mut driver, &mut terminal_input()?, &mut io::stdout()).await
 }
 
@@ -172,7 +191,7 @@ fn render(state: &SetupState, out: &mut impl Write) -> io::Result<()> {
             ..
         } => writeln!(
             out,
-            "\nImporting your earlier messages. {}",
+            "\nImporting your earlier messages. {} Press Ctrl-C to skip them.",
             relay_setup::HISTORY_NOTE
         ),
         SetupState::ImportingHistory {
@@ -181,6 +200,32 @@ fn render(state: &SetupState, out: &mut impl Write) -> io::Result<()> {
             Some(total) => writeln!(out, "  {imported} of {total} messages"),
             None => writeln!(out, "  {imported} messages"),
         },
+        SetupState::HistoryUnavailable { reason, .. } => writeln!(
+            out,
+            "\n{} Claude can still read every message from now on.",
+            match reason {
+                HistoryGap::NotSent => "Your phone didn't send any earlier messages.",
+                HistoryGap::RelinkRequested => {
+                    "Your phone couldn't send your earlier messages. To try again later, \
+                     remove this computer in Signal's Linked devices and run setup again."
+                }
+                HistoryGap::TimedOut => "Your phone didn't send your earlier messages in time.",
+            }
+        ),
+        SetupState::FindingDesktop { .. } => Ok(()),
+        SetupState::OfferDesktopImport { .. } => writeln!(
+            out,
+            "\nSignal Desktop is on this computer. Its messages can be imported too, which\n\
+             may bring in older ones your phone didn't send. Only its database is read."
+        ),
+        SetupState::ImportingDesktop { imported: 0, .. } => writeln!(
+            out,
+            "\nImporting from Signal Desktop. Your computer may ask to let this read\n\
+             Signal Desktop's key; allow it, or the import can't open the database."
+        ),
+        SetupState::ImportingDesktop { imported, .. } => {
+            writeln!(out, "  {imported} messages")
+        }
         SetupState::ConnectingClients { .. } => {
             writeln!(
                 out,
@@ -268,6 +313,26 @@ fn ask(
             };
             SetupEvent::AccessChosen { access }
         }
+        SetupState::HistoryUnavailable { .. } => {
+            prompt(input, out, "Press Enter to continue: ", |_| Ok(()))?;
+            SetupEvent::SkipHistory
+        }
+        SetupState::OfferDesktopImport { .. } => {
+            let import = prompt(
+                input,
+                out,
+                "Import Signal Desktop's messages too? [y/N]: ",
+                parse_no,
+            )?;
+            SetupEvent::DesktopImportChosen { import }
+        }
+        SetupState::Failed { retry, .. }
+            if matches!(**retry, SetupState::ImportingHistory { .. }) =>
+        {
+            let question = "Press Enter to try again, type s to skip your earlier messages, \
+                            or q to quit: ";
+            return prompt(input, out, question, parse_history_retry);
+        }
         SetupState::Failed { .. } => {
             let retry = prompt(
                 input,
@@ -335,11 +400,29 @@ fn parse_yes(answer: &str) -> Result<bool, &'static str> {
     }
 }
 
+fn parse_no(answer: &str) -> Result<bool, &'static str> {
+    match answer.to_ascii_lowercase().as_str() {
+        "y" | "yes" => Ok(true),
+        "" | "n" | "no" => Ok(false),
+        _ => Err("Type y or n, or press Enter for no."),
+    }
+}
+
 fn parse_retry(answer: &str) -> Result<bool, &'static str> {
     match answer.to_ascii_lowercase().as_str() {
         "" => Ok(true),
         "q" | "quit" => Ok(false),
         _ => Err("Press Enter to try again, or type q to quit."),
+    }
+}
+
+/// Retry or skip history, or `None` to quit.
+fn parse_history_retry(answer: &str) -> Result<Option<SetupEvent>, &'static str> {
+    match answer.to_ascii_lowercase().as_str() {
+        "" => Ok(Some(SetupEvent::Retry)),
+        "s" | "skip" => Ok(Some(SetupEvent::SkipHistory)),
+        "q" | "quit" => Ok(None),
+        _ => Err("Press Enter to try again, type s to skip, or q to quit."),
     }
 }
 
@@ -410,18 +493,6 @@ impl OpenProvisioner for Presage {
             .await
             .with_context(|| format!("unable to open the Signal store \"{}\"", path.display()))?;
         Ok(Box::new(provisioner))
-    }
-}
-
-// Integration seam: link-and-sync import (lane L7) needs the archive and key
-// from linking, which the Provisioner contract doesn't carry yet (issue #34).
-// Until then a linked device starts with an empty history.
-struct NoHistoryYet;
-
-#[async_trait]
-impl HistoryImport for NoHistoryYet {
-    async fn import(&self, _: &mut (dyn FnMut(u64, Option<u64>) + Send)) -> anyhow::Result<()> {
-        Ok(())
     }
 }
 
@@ -625,6 +696,55 @@ mod tests {
         assert_eq!(event, None);
     }
 
+    /// Desktop import is opt-in, so Enter, the answer people give without
+    /// reading, must decline it.
+    #[test]
+    fn enter_declines_the_signal_desktop_import() {
+        let offer = SetupState::OfferDesktopImport {
+            access: AccessMode::Full,
+        };
+        let mut out = Vec::new();
+        for (answer, import) in [("\n", false), ("n\n", false), ("y\n", true)] {
+            let event = ask(&offer, &mut io::Cursor::new(answer), &mut out).expect("ask");
+            assert_eq!(
+                event,
+                Some(SetupEvent::DesktopImportChosen { import }),
+                "{answer:?}"
+            );
+        }
+        let out = String::from_utf8(out).expect("utf-8");
+        assert!(out.contains("[y/N]"), "{out}");
+    }
+
+    /// A history import that keeps failing must not trap a terminal user in
+    /// retry: its failure prompt offers skipping history, and only its own.
+    #[test]
+    fn a_failed_history_import_can_be_skipped_from_the_terminal() {
+        let failed = |retry| SetupState::Failed {
+            message: "archive expired".into(),
+            retry: Box::new(retry),
+        };
+        let history = failed(SetupState::ImportingHistory {
+            imported: 0,
+            total: None,
+            access: AccessMode::Full,
+        });
+        let mut out = Vec::new();
+        let event = ask(&history, &mut io::Cursor::new("s\n"), &mut out).expect("ask");
+        assert_eq!(event, Some(SetupEvent::SkipHistory));
+        assert!(String::from_utf8(out).expect("utf-8").contains("s to skip"));
+
+        let mut out = Vec::new();
+        let event = ask(
+            &failed(SetupState::EnterNumber),
+            &mut io::Cursor::new("s\n\n"),
+            &mut out,
+        )
+        .expect("ask");
+        assert_eq!(event, Some(SetupEvent::Retry));
+        assert!(!String::from_utf8(out).expect("utf-8").contains("s to skip"));
+    }
+
     struct Phone;
 
     #[async_trait]
@@ -686,6 +806,22 @@ mod tests {
         }
     }
 
+    struct NoDesktop;
+
+    #[async_trait]
+    impl relay_setup::driver::DesktopHistory for NoDesktop {
+        fn found(&self) -> bool {
+            false
+        }
+        async fn import(
+            &self,
+            _: ServiceId,
+            _: &mut (dyn FnMut(u64) + Send),
+        ) -> anyhow::Result<()> {
+            bail!("no Signal Desktop here")
+        }
+    }
+
     struct Agent;
 
     impl LoginItem for Agent {
@@ -710,7 +846,12 @@ mod tests {
         let services = Services {
             signal: Box::new(Phone),
             secrets: Box::new(KeyFile::default()),
-            history: Box::new(NoHistoryYet),
+            history: Box::new(LinkAndSync::new(ProfileStore::new(
+                &profile,
+                &ProfilePaths::under(dir.to_path_buf(), &profile),
+                Box::new(KeyFile::default()),
+            ))),
+            desktop: Box::new(NoDesktop),
             login: Box::new(Agent),
             clients,
         };
@@ -727,7 +868,8 @@ mod tests {
 
     /// A headless box over SSH, start to finish from typed answers: the key
     /// file caveat comes before anything is stored, the QR code is drawn, the
-    /// access question defaults to yes, and done says no Claude app was found.
+    /// access question defaults to yes, a phone that sent no history says so,
+    /// and done says no Claude app was found.
     #[tokio::test]
     async fn a_headless_link_runs_from_typed_answers_to_done() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -737,7 +879,7 @@ mod tests {
             None,
             None,
         );
-        let (driver, out) = run_scripted(dir.path(), clients, "\n\n").await;
+        let (driver, out) = run_scripted(dir.path(), clients, "\n\n\n").await;
         assert!(
             out.starts_with("Note: no keyring here"),
             "caveat not shown first: {out}"
@@ -745,6 +887,10 @@ mod tests {
         assert!(!scan(&out).is_empty(), "no QR code drawn: {out}");
         assert!(
             out.contains("Let Claude send messages as you? [Y/n]"),
+            "{out}"
+        );
+        assert!(
+            out.contains("Your phone didn't send any earlier messages."),
             "{out}"
         );
         assert!(out.contains("No Claude app was found"), "{out}");
@@ -819,7 +965,7 @@ mod tests {
             None,
             Some(desktop),
         );
-        let (_, out) = run_scripted(dir.path(), clients, "\n\n\n\n\n").await;
+        let (_, out) = run_scripted(dir.path(), clients, "\n\n\n\n\n\n").await;
         assert_eq!(
             out.matches("Restart Claude Desktop now").count(),
             2,

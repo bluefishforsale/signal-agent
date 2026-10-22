@@ -57,6 +57,15 @@ pub fn script(command: &Command) -> Vec<(Duration, SetupEvent)> {
             events.push((Duration::ZERO, SetupEvent::HistoryDone));
             events
         }
+        Command::FindDesktop => vec![(ms(400), SetupEvent::DesktopFound)],
+        Command::ImportDesktop => {
+            let mut events: Vec<_> = (0..=3000)
+                .step_by(500)
+                .map(|imported| (ms(400), SetupEvent::DesktopProgress { imported }))
+                .collect();
+            events.push((Duration::ZERO, SetupEvent::DesktopImportDone));
+            events
+        }
         Command::ConnectClients => vec![(
             ms(1200),
             SetupEvent::ClientsConnected {

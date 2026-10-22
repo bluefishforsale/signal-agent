@@ -3,6 +3,7 @@
 //! platform ships a single signed executable.
 
 mod doctor;
+mod history_cli;
 mod http_cli;
 mod setup_tty;
 
@@ -54,6 +55,9 @@ enum Cmd {
     /// The HTTP endpoint for remote MCP clients (Advanced).
     #[command(subcommand)]
     Http(http_cli::HttpCmd),
+    /// Bring in earlier messages after setup.
+    #[command(subcommand)]
+    History(history_cli::HistoryCmd),
     /// The setup app's way to a profile's database key, so only this program
     /// ever touches the OS secret store.
     #[command(hide = true)]
@@ -123,6 +127,7 @@ async fn main() -> anyhow::Result<()> {
             let paths = ProfilePaths::for_profile(&profile)?;
             http_cli::run(cmd, &paths, &mut std::io::stdout())
         }
+        Cmd::History(cmd) => history_cli::run(cmd, &profile, &mut std::io::stdout()).await,
         Cmd::Key { action } => {
             let store = relay_secrets::platform_store()?;
             let printed = relay_setup::serve_key(action.into(), &profile, store.as_ref())?;
@@ -200,6 +205,28 @@ mod tests {
         assert!(
             matches!(cli.command, Cmd::Agent { all_profiles: true }),
             "parsed as a single profile's agent"
+        );
+    }
+
+    /// The human path to Signal Desktop's history after setup, as setup and
+    /// the docs name it.
+    #[test]
+    fn the_desktop_import_command_line_parses() {
+        let cli = Cli::try_parse_from([
+            "signal-agent",
+            "history",
+            "import-desktop",
+            "--from",
+            "/elsewhere/Signal",
+        ])
+        .expect("parse");
+        assert!(
+            matches!(
+                cli.command,
+                Cmd::History(history_cli::HistoryCmd::ImportDesktop { from: Some(ref dir) })
+                    if dir == std::path::Path::new("/elsewhere/Signal")
+            ),
+            "parsed as something else"
         );
     }
 

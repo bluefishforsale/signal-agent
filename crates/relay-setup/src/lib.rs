@@ -6,6 +6,7 @@ mod agent_keys;
 mod captcha;
 pub mod claude;
 pub mod driver;
+pub mod history;
 mod machine;
 mod profile_lock;
 mod profiles;
@@ -13,7 +14,9 @@ mod uninstall;
 
 pub use agent_keys::{AgentKeys, KeyAction, serve_key};
 pub use captcha::{CAPTCHA_PAGE, captcha_navigation_allowed, captcha_token, pasted_captcha_token};
-pub use machine::{AccountChoice, ClientOutcome, Command, SetupEvent, SetupState, transition};
+pub use machine::{
+    AccountChoice, ClientOutcome, Command, HistoryGap, SetupEvent, SetupState, transition,
+};
 pub use profile_lock::{SetupLock, StoreLock, setup_running};
 pub use profiles::Profiles;
 pub use uninstall::{
@@ -28,8 +31,8 @@ pub const HISTORY_NOTE: &str = "Your phone sends all the messages it has. Photos
 
 pub mod prelude {
     pub use crate::{
-        AccountChoice, CAPTCHA_PAGE, ClientOutcome, Command, HISTORY_NOTE, Profiles, SetupEvent,
-        SetupState, Step, StepOutcome, captcha_navigation_allowed, captcha_token,
+        AccountChoice, CAPTCHA_PAGE, ClientOutcome, Command, HISTORY_NOTE, HistoryGap, Profiles,
+        SetupEvent, SetupState, Step, StepOutcome, captcha_navigation_allowed, captcha_token,
         claude::{ClaudeClient, ClientReport, ClientStatus, Clients, ServerEntry},
         pasted_captcha_token, run_steps, transition, uninstall_steps,
     };
