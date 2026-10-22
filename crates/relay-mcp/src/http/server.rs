@@ -19,6 +19,7 @@ use rustls::ServerConfig;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::TcpListener,
+    sync::Semaphore,
 };
 use tokio_rustls::TlsAcceptor;
 
@@ -63,15 +64,40 @@ struct Gate {
     read_only: StreamableHttpService<Proxy, NeverSessionManager>,
 }
 
+/// What one client, or a flood of them, may hold of the endpoint.
+#[derive(Clone, Copy)]
+struct Limits {
+    /// Open connections at once; past this, new ones wait in the backlog.
+    connections: usize,
+}
+
+// A handful of personal MCP clients never comes close to these.
+const LIMITS: Limits = Limits { connections: 64 };
+
 /// Serves MCP on `listener` for every request carrying a live token, through
-/// the agent at `agent`, until accepting fails.
+/// the agent at `agent`, until accepting fails for good.
 pub async fn serve(listener: Listener, tokens: Tokens, agent: String) -> anyhow::Result<()> {
+    serve_with(listener, tokens, agent, LIMITS).await
+}
+
+async fn serve_with(
+    listener: Listener,
+    tokens: Tokens,
+    agent: String,
+    limits: Limits,
+) -> anyhow::Result<()> {
+    let slots = Arc::new(Semaphore::new(limits.connections));
     let gate = Arc::new(Gate {
         tokens,
         full: mcp_service(Proxy::new(agent.clone(), AccessMode::Full)),
         read_only: mcp_service(Proxy::new(agent, AccessMode::ReadOnly)),
     });
     loop {
+        let slot = slots
+            .clone()
+            .acquire_owned()
+            .await
+            .context("connection slots closed")?;
         let (tcp, peer) = match listener.tcp.accept().await {
             Ok(accepted) => accepted,
             Err(e) if transient(&e) => {
@@ -84,6 +110,7 @@ pub async fn serve(listener: Listener, tokens: Tokens, agent: String) -> anyhow:
         let gate = gate.clone();
         let tls = listener.tls.clone();
         tokio::spawn(async move {
+            let _slot = slot;
             let served = match tls {
                 None => connection(tcp, peer, gate).await,
                 Some(tls) => match tls.accept(tcp).await {
@@ -314,11 +341,15 @@ mod tests {
     }
 
     async fn start(tokens: Tokens, agent: String) -> SocketAddr {
+        start_with(tokens, agent, LIMITS).await
+    }
+
+    async fn start_with(tokens: Tokens, agent: String, limits: Limits) -> SocketAddr {
         let listener = Listener::bind(([127, 0, 0, 1], 0).into(), None)
             .await
             .expect("bind");
         let addr = listener.local_addr().expect("addr");
-        tokio::spawn(serve(listener, tokens, agent));
+        tokio::spawn(serve_with(listener, tokens, agent, limits));
         addr
     }
 
@@ -481,5 +512,23 @@ mod tests {
         }
         let fatal = Error::from(ErrorKind::InvalidInput);
         assert!(!transient(&fatal), "kept accepting on {fatal}");
+    }
+
+    /// A flood of idle connections must not exhaust the machine: past the
+    /// cap, a new connection waits for a slot instead of being served.
+    #[tokio::test]
+    async fn connections_past_the_cap_wait_for_a_free_slot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tokens = Tokens::at(&dir.path().join("http_tokens.json"));
+        let limits = Limits {
+            connections: 1,
+            ..LIMITS
+        };
+        let addr = start_with(tokens, "no-agent".into(), limits).await;
+        let hog = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let waiting = tokio::time::timeout(Duration::from_millis(300), post(addr, None)).await;
+        assert!(waiting.is_err(), "served past the cap: {waiting:?}");
+        drop(hog);
+        assert_eq!(post(addr, None).await, reqwest::StatusCode::UNAUTHORIZED);
     }
 }
