@@ -19,6 +19,10 @@ pub const LAUNCHD_LABEL: &str = "com.bluefishforsale.signalagent.agent";
 pub const DELETE_DATA_LABEL: &str =
     "Also delete my messages, account data and the keys that unlock them";
 
+/// Where setup saves a profile's access choice; its presence is what marks a
+/// profile as set up.
+pub(crate) const ACCESS_FILE: &str = "access.json";
+
 /// The per-user folders an install writes under, as the OS names them.
 #[derive(Clone, Debug)]
 pub struct Roots {
@@ -118,16 +122,19 @@ impl Footprint {
     }
 
     /// Every leftover for `profiles`, in the order uninstall removes them.
-    // NOTE: the order matters. The profile list goes first so the supervisor
-    // stops restarting agents, the login item next so nothing starts at
-    // login, Claude entries before running agents are stopped so no client
+    // NOTE: the order matters. The profile list and each profile's access
+    // choice go first: the supervisor stops restarting agents, the shim stops
+    // spawning them, and an agent that starts anyway no longer re-adds its
+    // Claude entries. Then the login item so nothing starts at login, Claude entries before running agents are stopped so no client
     // starts a fresh one afterwards, and files last so no agent rewrites them.
     pub fn items(&self, profiles: &[ProfileName]) -> Vec<Item> {
         let data = self.data_dir();
-        let mut items = vec![
-            Item::always(Leftover::Path(data.join("profiles.json"))),
-            Item::always(Leftover::LoginItem),
-        ];
+        let mut items = vec![Item::always(Leftover::Path(data.join("profiles.json")))];
+        items.extend(profiles.iter().map(|profile| {
+            let root = ProfilePaths::under(data.clone(), profile).root;
+            Item::always(Leftover::Path(root.join(ACCESS_FILE)))
+        }));
+        items.push(Item::always(Leftover::LoginItem));
         let clients: &[ClaudeClient] = match self.platform {
             Platform::MacOs | Platform::Windows => &[ClaudeClient::Code, ClaudeClient::Desktop],
             Platform::Linux => &[ClaudeClient::Code],

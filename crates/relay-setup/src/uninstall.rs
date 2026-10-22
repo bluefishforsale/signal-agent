@@ -749,4 +749,18 @@ mod tests {
             assert!(hooks.contains(needle), "hooks lack {needle}");
         }
     }
+
+    /// Agents and the shim treat a profile without a saved access choice as
+    /// not set up, which is how uninstall switches them off first; the path
+    /// uninstall removes must be the one setup writes.
+    #[test]
+    fn uninstall_removes_the_access_choice_where_setup_saves_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let profile = ProfileName::default_profile();
+        let paths = relay_core::ProfilePaths::under(dir.path().to_owned(), &profile);
+        paths
+            .save_access(relay_core::AccessMode::Full)
+            .expect("save");
+        assert!(paths.root.join(footprint::ACCESS_FILE).is_file());
+    }
 }
