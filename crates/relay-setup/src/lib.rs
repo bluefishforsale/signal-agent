@@ -2,15 +2,16 @@
 //! code, so the Tauri window and the Linux terminal flow behave identically and
 //! setup is tested without either.
 
+mod captcha;
 pub mod claude;
+pub mod driver;
 mod machine;
 mod profiles;
-mod registration;
 mod uninstall;
 
+pub use captcha::{CAPTCHA_PAGE, captcha_navigation_allowed, captcha_token};
 pub use machine::{AccountChoice, ClientOutcome, Command, SetupEvent, SetupState, transition};
 pub use profiles::Profiles;
-pub use registration::{CAPTCHA_PAGE, captcha_navigation_allowed, captcha_token, run_registration};
 pub use uninstall::{Step, StepOutcome, run_steps, uninstall_steps};
 
 pub mod prelude {
@@ -18,6 +19,6 @@ pub mod prelude {
         AccountChoice, CAPTCHA_PAGE, ClientOutcome, Command, Profiles, SetupEvent, SetupState,
         Step, StepOutcome, captcha_navigation_allowed, captcha_token,
         claude::{ClaudeClient, ClientReport, ClientStatus, Clients, ServerEntry},
-        run_registration, run_steps, transition, uninstall_steps,
+        run_steps, transition, uninstall_steps,
     };
 }

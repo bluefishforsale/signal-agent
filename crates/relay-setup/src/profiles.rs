@@ -6,7 +6,7 @@ use std::{fs, io, path::PathBuf};
 
 use anyhow::{Context, bail};
 use relay_core::{ProfileName, ProfilePaths};
-use relay_secrets::{SecretStore, StoreKey};
+use relay_secrets::SecretStore;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -48,22 +48,22 @@ impl Profiles {
 
     /// The profile a first install uses, created without asking if there are
     /// none yet.
-    pub fn ensure_default(&self, secrets: &dyn SecretStore) -> anyhow::Result<ProfileName> {
+    pub fn ensure_default(&self) -> anyhow::Result<ProfileName> {
         let registry = self.load()?;
         if let Some(first) = registry.profiles.first() {
             return Ok(first.clone());
         }
-        self.add(registry, ProfileName::default_profile(), secrets)
+        self.add(registry, ProfileName::default_profile())
     }
 
     /// Adds the profile `name`, which must be a valid name not already in use.
-    pub fn create(&self, name: &str, secrets: &dyn SecretStore) -> anyhow::Result<ProfileName> {
+    pub fn create(&self, name: &str) -> anyhow::Result<ProfileName> {
         let profile = ProfileName::new(name)?;
         let registry = self.load()?;
         if registry.profiles.contains(&profile) {
             bail!("a profile called \"{profile}\" already exists");
         }
-        self.add(registry, profile, secrets)
+        self.add(registry, profile)
     }
 
     /// Where `profile`'s files live.
@@ -111,18 +111,7 @@ impl Profiles {
         self.save(&registry)
     }
 
-    // NOTE: a key already in the secret store is kept, not replaced. It may be
-    // the only way to open data a previous install of this profile left
-    // behind, and overwriting it would make that data unreadable for good.
-    fn add(
-        &self,
-        mut registry: Registry,
-        profile: ProfileName,
-        secrets: &dyn SecretStore,
-    ) -> anyhow::Result<ProfileName> {
-        if secrets.get(&profile)?.is_none() {
-            secrets.set(&profile, &StoreKey::generate()?)?;
-        }
+    fn add(&self, mut registry: Registry, profile: ProfileName) -> anyhow::Result<ProfileName> {
         registry.profiles.push(profile.clone());
         self.save(&registry)?;
         Ok(profile)
@@ -165,7 +154,7 @@ impl Profiles {
 mod tests {
     use std::{cell::Cell, collections::HashSet, path::Path};
 
-    use relay_secrets::MemorySecretStore;
+    use relay_secrets::{MemorySecretStore, StoreKey};
 
     use super::*;
     use crate::{
@@ -182,16 +171,15 @@ mod tests {
     #[test]
     fn the_first_install_creates_personal_and_remembers_it() {
         let base = tempfile::tempdir().expect("temp data dir");
-        let secrets = MemorySecretStore::default();
         let created = Profiles::under(base.path().into())
-            .ensure_default(&secrets)
+            .ensure_default()
             .expect("default profile");
         assert_eq!(created, name("personal"));
 
         let reopened = Profiles::under(base.path().into());
         assert_eq!(reopened.list().expect("list"), [name("personal")]);
         assert_eq!(
-            reopened.ensure_default(&secrets).expect("default"),
+            reopened.ensure_default().expect("default"),
             name("personal")
         );
         assert_eq!(reopened.list().expect("list"), [name("personal")]);
@@ -203,14 +191,13 @@ mod tests {
     #[test]
     fn creating_a_profile_refuses_invalid_and_duplicate_names() {
         let base = tempfile::tempdir().expect("temp data dir");
-        let secrets = MemorySecretStore::default();
         let profiles = Profiles::under(base.path().into());
-        profiles.ensure_default(&secrets).expect("default profile");
+        profiles.ensure_default().expect("default profile");
 
-        let bot = profiles.create("bot", &secrets).expect("create bot");
+        let bot = profiles.create("bot").expect("create bot");
         assert_eq!(bot, name("bot"));
         for bad in ["bot", "personal", "Work Phone", "../etc", ""] {
-            let refused = profiles.create(bad, &secrets);
+            let refused = profiles.create(bad);
             assert!(refused.is_err(), "created {bad:?}: {refused:?}");
         }
         assert_eq!(
@@ -219,23 +206,21 @@ mod tests {
         );
     }
 
-    /// Two accounts on one machine must never touch each other's files, key,
-    /// agent socket or Claude entry; any overlap would mix two Signal
-    /// identities in one store or route one profile's tools to the other.
+    /// Two accounts on one machine must never touch each other's files, agent
+    /// socket or Claude entry; any overlap would mix two Signal identities in
+    /// one store or route one profile's tools to the other.
     #[test]
-    fn two_profiles_never_share_paths_keys_endpoints_or_mcp_names() {
+    fn two_profiles_never_share_paths_endpoints_or_mcp_names() {
         let base = tempfile::tempdir().expect("temp data dir");
-        let secrets = MemorySecretStore::default();
         let profiles = Profiles::under(base.path().into());
-        let personal = profiles.ensure_default(&secrets).expect("default profile");
-        let bot = profiles.create("bot", &secrets).expect("create bot");
+        let personal = profiles.ensure_default().expect("default profile");
+        let bot = profiles.create("bot").expect("create bot");
 
         let sid = Some("S-1-5-21-1004336348-1177238915-682003330-512");
         let [a, b] = [&personal, &bot].map(|p| {
             let paths = profiles.paths(p);
-            let key = secrets.get(p).expect("read key").expect("key created");
             let endpoint = paths.agent_endpoint(p, sid).expect("endpoint");
-            (paths, key, endpoint, p.mcp_server_name())
+            (paths, endpoint, p.mcp_server_name())
         });
         let files = |p: &ProfilePaths| {
             HashSet::from([
@@ -252,9 +237,8 @@ mod tests {
             b.0
         );
         assert!(!a.0.root.starts_with(&b.0.root) && !b.0.root.starts_with(&a.0.root));
-        assert_ne!(a.1, b.1, "both profiles got the same store key");
-        assert_ne!(a.2, b.2, "shared agent endpoint");
-        assert_ne!(a.3, b.3, "shared MCP server name");
+        assert_ne!(a.1, b.1, "shared agent endpoint");
+        assert_ne!(a.2, b.2, "shared MCP server name");
     }
 
     /// The agent finds its files through `ProfilePaths::for_profile`, so the
@@ -291,8 +275,8 @@ mod tests {
         );
         let secrets = MemorySecretStore::default();
         let profiles = Profiles::under(base.path().into());
-        let personal = profiles.ensure_default(&secrets).expect("default profile");
-        let bot = profiles.create("bot", &secrets).expect("create bot");
+        let personal = profiles.ensure_default().expect("default profile");
+        let bot = profiles.create("bot").expect("create bot");
         let entry = |p: &ProfileName| {
             ServerEntry::for_profile(p, &base.path().join("signal-agent"), ["mcp"]).expect("entry")
         };
@@ -300,6 +284,9 @@ mod tests {
             clients
                 .register(ClaudeClient::Desktop, &entry(p))
                 .expect("register");
+            secrets
+                .set(p, &StoreKey::generate().expect("key"))
+                .expect("store key");
             fs::create_dir_all(profiles.paths(p).root).expect("profile dir");
             fs::write(profiles.paths(p).message_store, b"db").expect("store file");
         }
@@ -352,8 +339,8 @@ mod tests {
         let base = tempfile::tempdir().expect("temp data dir");
         let secrets = MemorySecretStore::default();
         let profiles = Profiles::under(base.path().into());
-        let personal = profiles.ensure_default(&secrets).expect("default profile");
-        let bot = profiles.create("bot", &secrets).expect("create bot");
+        let personal = profiles.ensure_default().expect("default profile");
+        let bot = profiles.create("bot").expect("create bot");
         let clients = Clients::new(Platform::MacOs, Box::new(NoCli), None, None);
         let wrong = ServerEntry::for_profile(&personal, &base.path().join("signal-agent"), ["mcp"])
             .expect("entry");
