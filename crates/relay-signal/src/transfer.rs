@@ -17,6 +17,7 @@ use serde::Deserialize;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use url::Url;
 
+use presage::libsignal_service::configuration::{Endpoint, ServiceConfiguration, SignalServers};
 use relay_core::LinkAndSyncKey;
 
 use crate::{HistoryTransfer, RateLimited};
@@ -39,6 +40,7 @@ struct ArchiveSource {
 }
 
 enum Hosts {
+    Signal(Box<ServiceConfiguration>),
     #[cfg(test)]
     Local(Url),
 }
@@ -64,6 +66,9 @@ enum ArchiveResponse {
     Ready { cdn: u32, key: String },
     Failed { error: String },
 }
+
+// presage's own, so these calls look like the rest of the client's.
+const USER_AGENT: &str = "presage-rs-0.8.0-dev";
 
 /// The downloaded archive's name in the profile directory.
 const ARCHIVE_FILE: &str = "link-and-sync.archive";
@@ -103,6 +108,30 @@ fn http_client(builder: reqwest::ClientBuilder) -> anyhow::Result<reqwest::Clien
 }
 
 impl ArchiveSource {
+    /// Signal's own `servers`, as the linked device that logs in with `login`.
+    fn signal(servers: SignalServers, login: (String, String)) -> anyhow::Result<Self> {
+        let config: ServiceConfiguration = servers.into();
+        let authority = reqwest::Certificate::from_pem(config.certificate_authority.as_bytes())
+            .context("Signal's certificate authority is unreadable")?;
+        let http = http_client(
+            reqwest::Client::builder()
+                .tls_certs_only([authority])
+                .user_agent(USER_AGENT),
+        )?;
+        Ok(Self {
+            http,
+            login,
+            hosts: Hosts::Signal(Box::new(config)),
+            patience: Patience {
+                per_poll: Duration::from_secs(5 * 60),
+                total: Duration::from_secs(60 * 60),
+                min_gap: Duration::from_secs(5),
+                download_attempts: 5,
+                retry_delay: Duration::from_secs(2),
+            },
+        })
+    }
+
     /// Waits for the phone's history and downloads it into `dir`, to be
     /// decrypted with `key`.
     async fn fetch(&self, key: LinkAndSyncKey, dir: &Path) -> anyhow::Result<HistoryTransfer> {
@@ -124,6 +153,7 @@ impl ArchiveSource {
 
     fn chat_url(&self, path: &str) -> anyhow::Result<Url> {
         match &self.hosts {
+            Hosts::Signal(config) => Ok(Endpoint::service(path).into_url(config)?),
             #[cfg(test)]
             Hosts::Local(base) => Ok(base.join(path)?),
         }
@@ -131,6 +161,7 @@ impl ArchiveSource {
 
     fn cdn_url(&self, cdn: u32, key: &str) -> anyhow::Result<Url> {
         let mut url = match &self.hosts {
+            Hosts::Signal(config) => Endpoint::cdn(cdn, "/attachments").into_url(config)?,
             #[cfg(test)]
             Hosts::Local(base) => base.join(&format!("cdn{cdn}/attachments"))?,
         };
@@ -566,5 +597,25 @@ mod tests {
         assert!(path.starts_with(dir.path()), "{}", path.display());
         assert_eq!(std::fs::read(&path).expect("file"), archive);
         assert_eq!(key.as_bytes(), &[5; 32]);
+    }
+
+    /// Against Signal itself the long-poll goes to the chat service and the
+    /// download to the numbered CDN, as Signal Desktop calls them. Built
+    /// without sending anything.
+    #[test]
+    fn signals_own_hosts_serve_the_poll_and_the_download() {
+        let source = ArchiveSource::signal(SignalServers::Production, ("me.2".into(), "pw".into()))
+            .expect("source");
+        assert_eq!(
+            source
+                .chat_url("/v1/devices/transfer_archive")
+                .expect("chat")
+                .as_str(),
+            "https://chat.signal.org/v1/devices/transfer_archive"
+        );
+        assert_eq!(
+            source.cdn_url(3, "a/b").expect("cdn").as_str(),
+            "https://cdn3.signal.org/attachments/a%2Fb"
+        );
     }
 }
