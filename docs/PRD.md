@@ -66,7 +66,7 @@ The primary user is non-technical: they can download a file, double-click it, an
 
 ## Open questions and risks
 
-- Claude Desktop's custom connectors may require OAuth rather than a static bearer token, which would limit the HTTP endpoint to Claude Code and other clients.
+- Claude Desktop's custom connectors may require OAuth rather than a static bearer token, which would limit the HTTP endpoint to Claude Code and other clients. Answered in [http-endpoint.md](http-endpoint.md#claude-desktop-connectors): static headers are an Owner-only beta, and connectors call from Anthropic's servers, so they can't reach a loopback or LAN endpoint anyway.
 - Link-and-sync is new protocol work presage lacks ([whisperfish/presage#396](https://github.com/whisperfish/presage/issues/396)); the ~45-day cap is unverified against Signal's docs. Riskiest slice; it goes first.
 - Windows ARM64 depends on BoringSSL building for that target. If it doesn't, ARM64 slips to v2.1 rather than blocking v2.0.
 - Signal server changes break unofficial clients without notice; the nightly staging test is the early warning.
