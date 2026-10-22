@@ -5,7 +5,7 @@ use std::sync::Arc;
 use relay_core::prelude::*;
 use serde_json::Value;
 
-use crate::{Tool, ToolContext, ToolError, read};
+use crate::{Tool, ToolContext, ToolError, mutate, read};
 
 /// The set of tools a profile serves.
 #[derive(Clone, Default)]
@@ -24,6 +24,7 @@ impl Registry {
             .with(read::GetUnread)
             .with(read::GetConversation)
             .with(read::SearchMessages)
+            .with(mutate::ReactToMessage)
     }
 
     pub fn with(mut self, tool: impl Tool + 'static) -> Self {
