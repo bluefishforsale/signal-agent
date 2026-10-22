@@ -26,8 +26,12 @@ impl Webhook {
         // reqwest is built without a bundled crypto provider, so the process
         // needs one; an error here means one is already installed.
         let _ = rustls::crypto::ring::default_provider().install_default();
+        // NOTE: never follow a redirect. A 307 or 308 re-POSTs the message to
+        // an address WebhookUrl never vetted, plain http off the machine
+        // included; a redirecting webhook fails and is logged instead.
         let client = reqwest::Client::builder()
             .timeout(WEBHOOK_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .context("unable to build the webhook client")?;
         Ok(Self {
@@ -437,9 +441,40 @@ mod tests {
         );
     }
 
+    const OK: &str = "HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n";
+
+    /// A webhook that redirects must not move message contents anywhere the
+    /// user didn't set: a 307 re-POSTs the body, and the new address could
+    /// be plain http off the machine, which WebhookUrl forbids.
+    #[tokio::test]
+    async fn a_redirecting_webhook_is_not_followed() {
+        let (elsewhere, mut diverted) = receiver(Some(OK.into())).await;
+        let redirect = format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nlocation: {elsewhere}\r\ncontent-length: 0\r\n\r\n"
+        );
+        let (url, mut posts) = receiver(Some(redirect)).await;
+        let signal = fake();
+        let store = Arc::new(MemoryStore::default());
+        let webhook = Webhook::new(ProfileName::default_profile(), url).expect("client");
+        let capture = tokio::spawn(run(signal.clone(), store.clone(), Some(webhook)));
+        signal.push(Incoming::Message(msg(2, 10, "private")));
+        tokio::time::timeout(std::time::Duration::from_secs(5), posts.recv())
+            .await
+            .expect("no POST within 5 s");
+        let followed =
+            tokio::time::timeout(std::time::Duration::from_millis(500), diverted.recv()).await;
+        capture.abort();
+        assert!(
+            followed.is_err(),
+            "the redirect target received {followed:?}"
+        );
+    }
+
     /// A webhook receiver on loopback that hands each request body to the
-    /// test, and answers only when `answer` is true.
-    async fn receiver(answer: bool) -> (WebhookUrl, tokio::sync::mpsc::UnboundedReceiver<String>) {
+    /// test and answers with `response`, or never answers when it's None.
+    async fn receiver(
+        response: Option<String>,
+    ) -> (WebhookUrl, tokio::sync::mpsc::UnboundedReceiver<String>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -452,6 +487,7 @@ mod tests {
                     return;
                 };
                 let tx = tx.clone();
+                let response = response.clone();
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
                     let mut chunk = [0u8; 4096];
@@ -480,12 +516,10 @@ mod tests {
                         }
                     };
                     let _ = tx.send(body);
-                    if !answer {
-                        std::future::pending::<()>().await;
-                    }
-                    let _ = conn
-                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
-                        .await;
+                    let Some(response) = response else {
+                        return std::future::pending::<()>().await;
+                    };
+                    let _ = conn.write_all(response.as_bytes()).await;
                 });
             }
         });
@@ -496,7 +530,7 @@ mod tests {
     /// named with its profile, in the shape the contract fixes.
     #[tokio::test]
     async fn a_captured_message_is_posted_to_the_webhook() {
-        let (url, mut posts) = receiver(true).await;
+        let (url, mut posts) = receiver(Some(OK.into())).await;
         let signal = fake();
         let store = Arc::new(MemoryStore::default());
         let webhook = Webhook::new(ProfileName::default_profile(), url).expect("client");
@@ -525,7 +559,7 @@ mod tests {
     /// duplicate is posted once, and a forged one not at all.
     #[tokio::test]
     async fn a_message_the_store_refused_is_never_posted() {
-        let (url, mut posts) = receiver(true).await;
+        let (url, mut posts) = receiver(Some(OK.into())).await;
         let signal = fake();
         let store = Arc::new(MemoryStore::default());
         let webhook = Webhook::new(ProfileName::default_profile(), url).expect("client");
@@ -571,7 +605,7 @@ mod tests {
     /// messages still land in the store right away.
     #[tokio::test]
     async fn a_webhook_that_never_answers_does_not_stall_capture() {
-        let (url, _posts) = receiver(false).await;
+        let (url, _posts) = receiver(None).await;
         let signal = fake();
         let store = Arc::new(MemoryStore::default());
         let webhook = Webhook::new(ProfileName::default_profile(), url).expect("client");
