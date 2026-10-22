@@ -28,6 +28,7 @@ impl Registry {
             .with(send::SendGroupMessage)
             .with(send::SendNoteToSelf)
             .with(send::SetTyping)
+            .with(send::SendReadReceipt)
     }
 
     pub fn with(mut self, tool: impl Tool + 'static) -> Self {
@@ -197,6 +198,7 @@ mod tests {
                 Some("string") => json!("x"),
                 Some("integer") => prop["minimum"].clone(),
                 Some("boolean") => json!(true),
+                Some("array") => json!([sample(name, &prop["items"])]),
                 other => panic!("{name}: no sample for type {other:?}; add one here"),
             },
         }
@@ -257,6 +259,23 @@ mod tests {
                 ]);
             }
             Some("boolean") => bad.extend([json!("true"), json!(1)]),
+            // An empty array is already refused above, so arrays must not be empty.
+            Some("array") => {
+                let (Some(1..), Some(max)) = (prop["minItems"].as_u64(), prop["maxItems"].as_u64())
+                else {
+                    panic!(
+                        "{name}: array properties must declare minItems >= 1 and maxItems: {prop}"
+                    );
+                };
+                let item = sample(name, &prop["items"]);
+                let too_many = vec![item; max as usize + 1];
+                bad.extend([json!("x"), json!(1), json!(true), json!(too_many)]);
+                bad.extend(
+                    bad_values(name, &prop["items"])
+                        .into_iter()
+                        .map(|v| json!([v])),
+                );
+            }
             other => panic!("{name}: no bad values for type {other:?}; add some here"),
         }
         bad

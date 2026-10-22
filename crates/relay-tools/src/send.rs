@@ -204,6 +204,81 @@ impl Tool for SetTyping {
     }
 }
 
+pub struct SendReadReceipt;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SendReadReceiptInput {
+    sender: String,
+    timestamps: Vec<Timestamp>,
+}
+
+impl SendReadReceipt {
+    const MAX_TIMESTAMPS: usize = 500;
+}
+
+#[async_trait]
+impl Tool for SendReadReceipt {
+    fn name(&self) -> &'static str {
+        "send_read_receipt"
+    }
+    fn description(&self) -> &'static str {
+        "Send a read receipt so a contact's Signal shows their messages as Read, and mark \
+         those messages read in the local store. Not for groups. sender is the contact who \
+         wrote the messages; timestamps are their sent_at_ms values (1 to 500, batched in \
+         one call). Only shown if the sender has read receipts on. Repeating is harmless."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "sender": contact_schema("Who wrote the messages being acknowledged"),
+                "timestamps": {
+                    "type": "array",
+                    "items": Timestamp::schema("Send time of a message being acknowledged"),
+                    "minItems": 1,
+                    "maxItems": Self::MAX_TIMESTAMPS,
+                    "description": "Send times of the messages to acknowledge",
+                },
+            },
+            "required": ["sender", "timestamps"],
+            "additionalProperties": false,
+        })
+    }
+    fn writes(&self) -> bool {
+        true
+    }
+    async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
+        let input: SendReadReceiptInput = parse(input)?;
+        if !(1..=Self::MAX_TIMESTAMPS).contains(&input.timestamps.len()) {
+            return Err(ToolError::InvalidInput(format!(
+                "timestamps must hold 1 to {} entries, got {}",
+                Self::MAX_TIMESTAMPS,
+                input.timestamps.len()
+            )));
+        }
+        let sender = contact(ctx, &input.sender).await?;
+        let targets: Vec<_> = input
+            .timestamps
+            .iter()
+            .map(|t| MessageId {
+                author: sender,
+                sent_at_ms: t.ms(),
+            })
+            .collect();
+        ctx.signal
+            .send(
+                Recipient::Contact(sender),
+                Outgoing::ReadReceipt {
+                    targets: targets.clone(),
+                },
+            )
+            .await?;
+        ctx.store.mark_read(&targets).await?;
+        Ok(json!({ "status": "read receipt sent" }))
+    }
+}
+
 /// The quoted message named by an author and send time, which must come
 /// together or not at all.
 async fn quote(
@@ -475,6 +550,35 @@ mod tests {
         );
         let stats = ctx.store.stats().await.unwrap();
         assert_eq!(stats.messages, 0, "{stats:?}");
+    }
+
+    /// One receipt covers every timestamp, each naming the sender's message,
+    /// and those messages stop counting as unread locally too.
+    #[tokio::test]
+    async fn send_read_receipt_acknowledges_the_senders_messages_and_marks_them_read() {
+        let (ctx, signal) = ctx(AccessMode::Full, ProfileKind::Linked);
+        for (t, body) in [(100, "a"), (200, "b"), (300, "c")] {
+            ctx.store.insert(&incoming(2, t, body)).await.unwrap();
+        }
+        Registry::standard()
+            .call(
+                &ctx,
+                "send_read_receipt",
+                json!({"sender": sid(2).to_string(), "timestamps": [100, 200]}),
+            )
+            .await
+            .unwrap();
+        let targets = [100, 200].map(|sent_at_ms| MessageId {
+            author: sid(2),
+            sent_at_ms,
+        });
+        let receipt = Outgoing::ReadReceipt {
+            targets: targets.to_vec(),
+        };
+        assert_eq!(signal.sent(), [(Recipient::Contact(sid(2)), receipt)]);
+        let unread: Vec<_> = ctx.store.unread().await.unwrap();
+        assert_eq!(unread.len(), 1, "{unread:?}");
+        assert_eq!(unread[0].id.sent_at_ms, 300);
     }
 
     /// Half a quote can't name a message; sending it as a plain message would
