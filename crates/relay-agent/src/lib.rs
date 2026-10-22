@@ -147,7 +147,7 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
     // start capturing whether or not that works.
     tokio::task::spawn_blocking(move || startup::reregister_claude_entries(&profile));
     let (signal, store) = open_backend_and_store(&config).await?;
-    let registry = registry(&config.paths, Arc::new(SystemClock))?;
+    let registry = registry(&config.paths, Arc::new(SystemClock));
     Agent::new(signal, store, registry, config.access)
         .serve(listener, stop_requested())
         .await
@@ -156,10 +156,9 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
 /// The shipped tools under limits kept in the profile directory, so
 /// restarting the agent doesn't reset them.
 // NOTE: the default limits apply until they're read from settings (#72).
-fn registry(paths: &ProfilePaths, clock: Arc<dyn Clock>) -> anyhow::Result<Registry> {
-    let limiter =
-        Limiter::new(Limits::default(), clock).persisted(paths.root.join("limits.json"))?;
-    Ok(Registry::standard().with_limiter(limiter))
+fn registry(paths: &ProfilePaths, clock: Arc<dyn Clock>) -> Registry {
+    let limiter = Limiter::new(Limits::default(), clock).persisted(paths.root.join("limits.json"));
+    Registry::standard().with_limiter(limiter)
 }
 
 /// Resolves when the OS asks the agent to stop: Ctrl-C anywhere, and SIGTERM
@@ -258,7 +257,7 @@ pub(crate) mod tests {
             let to = ServiceId::new(Uuid::from_u128(n)).to_string();
             serde_json::json!({"recipient": to, "message": "hi"})
         };
-        let agent = registry(&paths, clock.clone()).expect("registry");
+        let agent = registry(&paths, clock.clone());
         for n in 10..30 {
             let result = agent.call(&ctx, "send_message", dm(n)).await;
             assert!(
@@ -267,7 +266,7 @@ pub(crate) mod tests {
             );
             clock.advance(3_000);
         }
-        let restarted = registry(&paths, clock.clone()).expect("registry after restart");
+        let restarted = registry(&paths, clock.clone());
         let result = restarted.call(&ctx, "send_message", dm(30)).await;
         let Err(relay_tools::ToolError::Internal(e)) = &result else {
             panic!("21st new recipient after a restart was not refused: {result:?}");
@@ -282,6 +281,49 @@ pub(crate) mod tests {
             20,
             "a refused first contact reached Signal"
         );
+    }
+
+    /// A damaged limits file must not keep the agent from starting, since that
+    /// would stop message capture too: it still builds its tools, read tools
+    /// answer, and sending is refused instead of the agent going down.
+    #[tokio::test]
+    async fn a_damaged_limits_file_doesnt_stop_the_agent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let profile = ProfileName::new("default").expect("valid profile");
+        let paths = ProfilePaths::under(tmp.path().to_owned(), &profile);
+        std::fs::create_dir_all(&paths.root).expect("profile dir");
+        std::fs::write(paths.root.join("limits.json"), b"\0\0garbage").expect("damage file");
+        let signal = fake_signal();
+        let ctx = ToolContext {
+            store: Arc::new(MemoryStore::default()),
+            signal: signal.clone(),
+            access: AccessMode::Full,
+            kind: ProfileKind::Linked,
+        };
+        let registry = registry(&paths, Arc::new(FakeClock(0.into())));
+        let stats = registry
+            .call(&ctx, "store_stats", serde_json::json!({}))
+            .await;
+        assert!(
+            stats.is_ok(),
+            "read tool failed after a damaged limits file: {stats:?}"
+        );
+        let to = ServiceId::new(Uuid::from_u128(2)).to_string();
+        let sent = registry
+            .call(
+                &ctx,
+                "send_message",
+                serde_json::json!({"recipient": to, "message": "hi"}),
+            )
+            .await;
+        let Err(relay_tools::ToolError::Internal(e)) = &sent else {
+            panic!("a send after a damaged limits file wasn't refused: {sent:?}");
+        };
+        assert!(
+            e.downcast_ref::<relay_tools::LimitExceeded>().is_some(),
+            "refused for the wrong reason: {e:#}"
+        );
+        assert!(signal.sent().is_empty(), "a refused send reached Signal");
     }
 
     /// Wraps a MemoryStore and records whether close() was awaited.

@@ -91,6 +91,24 @@ struct State {
     hour: Bucket,
     /// Conversations first messaged in the last day, oldest first.
     first_contacts: Vec<(Recipient, u64)>,
+    /// No first contacts before this time.
+    first_contacts_paused_until_ms: u64,
+}
+
+impl State {
+    /// Every budget spent as of `now`, for when the real count is unknown.
+    fn exhausted(now: u64) -> Self {
+        let empty = || Bucket {
+            level: 0,
+            last_ms: Some(now),
+        };
+        Self {
+            minute: empty(),
+            hour: empty(),
+            first_contacts: vec![],
+            first_contacts_paused_until_ms: now + DAY_MS,
+        }
+    }
 }
 
 /// A token bucket in exact integer units: one token is `window_ms` units, and
@@ -134,19 +152,31 @@ impl Limiter {
 
     /// Keeps the send budget and new-recipient count in `path`, so a restart
     /// doesn't reset them.
-    pub fn persisted(mut self, path: PathBuf) -> anyhow::Result<Self> {
-        match std::fs::read(&path) {
-            Ok(bytes) => {
-                *self.state.get_mut().expect("limiter state") = serde_json::from_slice(&bytes)
-                    .with_context(|| format!("unreadable limits file {}", path.display()))?;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+    // NOTE: an unreadable file must not stop the agent, which would also stop
+    // message capture. It's set aside for inspection and the limiter starts
+    // with every budget spent, failing safe on sending instead.
+    pub fn persisted(mut self, path: PathBuf) -> Self {
+        let state = match load(&path) {
+            Ok(state) => state,
             Err(e) => {
-                return Err(e).with_context(|| format!("can't read {}", path.display()));
+                let now = self.clock.now_ms();
+                let mut aside = path.clone().into_os_string();
+                aside.push(format!(".corrupt-{now}"));
+                match std::fs::rename(&path, &aside) {
+                    Ok(()) => tracing::warn!(
+                        "{e:#}; kept it as {} and paused sending until the limits refill",
+                        Path::new(&aside).display()
+                    ),
+                    Err(r) => tracing::warn!(
+                        "{e:#}; couldn't set it aside ({r}); paused sending until the limits refill"
+                    ),
+                }
+                State::exhausted(now)
             }
-        }
+        };
+        *self.state.get_mut().expect("limiter state") = state;
         self.path = Some(path);
-        Ok(self)
+        self
     }
 
     /// Counts one message to `to`, or refuses it.
@@ -164,6 +194,15 @@ impl Limiter {
             .first_contacts
             .retain(|(_, at)| now.saturating_sub(*at) < DAY_MS);
         let first = !known && !state.first_contacts.iter().any(|(r, _)| *r == to);
+        if first && now < state.first_contacts_paused_until_ms {
+            return Err(LimitExceeded {
+                limit: "no new conversations while the limits recover from a damaged \
+                        limits file"
+                    .into(),
+                retry_after: Duration::from_millis(state.first_contacts_paused_until_ms - now),
+            }
+            .into());
+        }
         if first && state.first_contacts.len() >= new_recipients_per_day as usize {
             let oldest = state.first_contacts.first().map_or(now, |(_, at)| *at);
             return Err(LimitExceeded {
@@ -175,19 +214,20 @@ impl Limiter {
             }
             .into());
         }
-        if let Some(retry_after) = state.minute.wait(now, burst_per_minute, MINUTE_MS) {
-            return Err(LimitExceeded {
-                limit: format!("at most {burst_per_minute} messages a minute"),
-                retry_after,
-            }
-            .into());
-        }
-        if let Some(retry_after) = state.hour.wait(now, per_hour, HOUR_MS) {
-            return Err(LimitExceeded {
-                limit: format!("at most {per_hour} messages an hour"),
-                retry_after,
-            }
-            .into());
+        // Report the longer wait, so a client that retries when told isn't
+        // refused again by the other bucket.
+        let waits = [
+            (
+                state.minute.wait(now, burst_per_minute, MINUTE_MS),
+                format!("at most {burst_per_minute} messages a minute"),
+            ),
+            (
+                state.hour.wait(now, per_hour, HOUR_MS),
+                format!("at most {per_hour} messages an hour"),
+            ),
+        ];
+        if let Some((Some(retry_after), limit)) = waits.into_iter().max_by_key(|(w, _)| *w) {
+            return Err(LimitExceeded { limit, retry_after }.into());
         }
         state.minute.take(MINUTE_MS);
         state.hour.take(HOUR_MS);
@@ -233,8 +273,18 @@ fn provisioning_wait(last_ms: Option<u64>, now_ms: u64, minutes: NonZeroU32) -> 
     Some(Duration::from_millis(wait))
 }
 
-// NOTE: a torn write would fail to load and keep the agent from starting, so
-// write beside the file and rename over it.
+/// The saved state at `path`, or a fresh one if there's none yet.
+fn load(path: &Path) -> anyhow::Result<State> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .with_context(|| format!("unreadable limits file {}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(State::default()),
+        Err(e) => Err(e).with_context(|| format!("can't read {}", path.display())),
+    }
+}
+
+// NOTE: a torn write would pause sending for a day on the next start, so write
+// beside the file and rename over it.
 fn write_atomically(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, bytes).with_context(|| format!("can't write {}", tmp.display()))?;
@@ -516,11 +566,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("limits.json");
         let clock = Arc::new(FakeClock::default());
-        let start = || {
-            Limiter::new(Limits::default(), clock.clone())
-                .persisted(path.clone())
-                .expect("load limiter state")
-        };
+        let start = || Limiter::new(Limits::default(), clock.clone()).persisted(path.clone());
         let (ctx, signal) = ctx();
         let input = json!({"recipient": sid(2).to_string(), "message": "hi"});
         let registry = Registry::standard().with_limiter(start());
@@ -538,6 +584,73 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("clean temp dir");
     }
 
+    /// A damaged limits file can't say how much was already sent, so the
+    /// limiter must start as if every budget were spent: known conversations
+    /// wait for a token, first contacts wait a day, and the damaged file is
+    /// kept aside rather than deleted.
+    #[tokio::test]
+    async fn after_a_damaged_limits_file_sends_are_refused_until_the_window_passes() {
+        let dir = std::env::temp_dir().join(format!("relay-limits-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("limits.json");
+        std::fs::write(&path, b"{\"minute\": tru").expect("write damaged file");
+        let clock = Arc::new(FakeClock::default());
+        clock.advance(1_000_000);
+        let limiter = Limiter::new(Limits::default(), clock.clone()).persisted(path.clone());
+        let registry = Registry::standard().with_limiter(limiter);
+        let (ctx, signal) = ctx();
+        ctx.store
+            .insert(&incoming(2, 1, "hey"))
+            .await
+            .expect("seed");
+        let dm = |n: u128| json!({"recipient": sid(n).to_string(), "message": "hi"});
+
+        let result = registry.call(&ctx, "send_message", dm(2)).await;
+        let Some(e) = refused(&result) else {
+            panic!("a send right after a damaged limits file went through: {result:?}");
+        };
+        let wait = e.retry_after.as_millis() as u64;
+        clock.advance(wait - 1);
+        let result = registry.call(&ctx, "send_message", dm(2)).await;
+        assert!(
+            refused(&result).is_some(),
+            "sent before the retry time: {result:?}"
+        );
+        clock.advance(1);
+        let result = registry.call(&ctx, "send_message", dm(2)).await;
+        assert!(
+            result.is_ok(),
+            "known conversation still refused at the retry time: {result:?}"
+        );
+
+        let result = registry.call(&ctx, "send_message", dm(3)).await;
+        assert!(
+            refused(&result).is_some(),
+            "a first contact went through: {result:?}"
+        );
+        clock.advance(DAY_MS);
+        let result = registry.call(&ctx, "send_message", dm(3)).await;
+        assert!(
+            result.is_ok(),
+            "first contacts still refused a day later: {result:?}"
+        );
+        assert_eq!(signal.sent().len(), 2, "a refused send reached Signal");
+
+        let aside: Vec<_> = std::fs::read_dir(&dir)
+            .expect("list temp dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("limits.json.corrupt-")
+            })
+            .collect();
+        assert_eq!(aside.len(), 1, "damaged file not kept aside");
+        let kept = std::fs::read(aside[0].path()).expect("read kept file");
+        assert_eq!(kept, b"{\"minute\": tru", "the damaged file was altered");
+        std::fs::remove_dir_all(&dir).expect("clean temp dir");
+    }
+
     /// Restarting the agent must not hand out a fresh day of first contacts.
     #[tokio::test]
     async fn the_new_recipient_cap_survives_a_restart() {
@@ -549,11 +662,7 @@ mod tests {
             new_recipients_per_day: 1,
             ..Limits::default()
         };
-        let start = || {
-            Limiter::new(limits, clock.clone())
-                .persisted(path.clone())
-                .expect("load limiter state")
-        };
+        let start = || Limiter::new(limits, clock.clone()).persisted(path.clone());
         let (ctx, signal) = ctx();
         let dm = |n: u128| json!({"recipient": sid(n).to_string(), "message": "hi"});
         let registry = Registry::standard().with_limiter(start());
