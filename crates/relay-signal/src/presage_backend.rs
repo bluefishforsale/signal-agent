@@ -3,7 +3,7 @@
 //! dedicated thread and the trait methods only pass work to it.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt::Display,
     future::Future,
     path::Path,
@@ -161,7 +161,14 @@ pub struct PresageSignal {
     account: Account,
     incoming_taken: AtomicBool,
     last_sent_at_ms: AtomicU64,
+    changed_identities: ChangedIdentities,
 }
+
+/// Contacts whose identity key the receive loop saw change.
+// NOTE: in memory only, so it starts empty on every start. presage keeps no
+// record of a replaced key or of verification (its contact sync drops the
+// phone's Verified record), so this is the only source `changed` has.
+type ChangedIdentities = Arc<Mutex<HashSet<ServiceId>>>;
 
 impl PresageSignal {
     /// Opens the account in the store at `path`, encrypted with `key`. Nothing
@@ -186,6 +193,7 @@ impl PresageSignal {
             account,
             incoming_taken: AtomicBool::new(false),
             last_sent_at_ms: AtomicU64::new(0),
+            changed_identities: ChangedIdentities::default(),
         })
     }
 }
@@ -265,17 +273,18 @@ impl SignalBackend for PresageSignal {
             .boxed();
         }
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let (worker, manager, me) = (
+        let (worker, manager, me, changed) = (
             self.worker.clone(),
             self.manager.clone(),
             self.account.service_id,
+            self.changed_identities.clone(),
         );
         // Connecting waits for the first poll, so holding the stream unpolled
         // never touches the network.
         let start = async move {
             let started = worker
                 .run(move || async move {
-                    tokio::task::spawn_local(receive(manager, me, tx));
+                    tokio::task::spawn_local(receive(manager, me, changed, tx));
                 })
                 .await;
             match started {
@@ -371,6 +380,11 @@ impl SignalBackend for PresageSignal {
     async fn identities(&self) -> anyhow::Result<Vec<Identity>> {
         let me = self.account.service_id;
         let store = self.manager.store().clone();
+        let changed = self
+            .changed_identities
+            .lock()
+            .expect("changed identities lock")
+            .clone();
         self.worker
             .run(move || async move {
                 let keys = store.aci_protocol_store();
@@ -393,8 +407,10 @@ impl SignalBackend for PresageSignal {
                     identities.push(Identity {
                         service_id: them,
                         safety_number: convert::safety_number(me, mine.identity_key(), them, &key)?,
+                        // NOTE: nothing in presage's store records a
+                        // verification, so no key reads as verified here.
                         trust: Trust::Unverified,
-                        changed: false,
+                        changed: changed.contains(&them),
                     });
                 }
                 anyhow::Ok(identities)
@@ -764,10 +780,11 @@ async fn admitted(store: &SqliteStore, content: &Content) -> bool {
 // message. A stranger's first key is new, not changed, and isn't reported.
 struct IdentityWatch {
     known: HashMap<String, IdentityKey>,
+    changed: ChangedIdentities,
 }
 
 impl IdentityWatch {
-    async fn primed(store: &SqliteStore) -> Self {
+    async fn primed(store: &SqliteStore, changed: ChangedIdentities) -> Self {
         let mut people: Vec<SignalServiceId> = Vec::new();
         match store.contacts().await {
             Ok(contacts) => people.extend(
@@ -787,6 +804,7 @@ impl IdentityWatch {
         }
         let mut watch = Self {
             known: HashMap::new(),
+            changed,
         };
         for who in people {
             watch.changed(store, who).await;
@@ -808,9 +826,17 @@ impl IdentityWatch {
                 return false;
             }
         };
-        self.known
+        let changed = self
+            .known
             .insert(name, current)
-            .is_some_and(|previous| previous != current)
+            .is_some_and(|previous| previous != current);
+        if changed {
+            self.changed
+                .lock()
+                .expect("changed identities lock")
+                .insert(ServiceId::new(who.raw_uuid()));
+        }
+        changed
     }
 }
 
@@ -828,9 +854,10 @@ fn protocol_address(who: SignalServiceId) -> anyhow::Result<ProtocolAddress> {
 async fn receive(
     mut manager: Manager<SqliteStore, Registered>,
     me: ServiceId,
+    changed: ChangedIdentities,
     tx: mpsc::UnboundedSender<anyhow::Result<Incoming>>,
 ) {
-    let mut identities = IdentityWatch::primed(manager.store()).await;
+    let mut identities = IdentityWatch::primed(manager.store(), changed).await;
     let mut delay = MIN_RECONNECT_DELAY;
     while !tx.is_closed() {
         let mut wait = delay;
@@ -1486,6 +1513,75 @@ mod tests {
         );
     }
 
+    /// A contact whose key the receive loop saw change is listed as changed,
+    /// so list_identities shows the new safety number for what it is.
+    #[tokio::test]
+    async fn an_identity_whose_key_changed_while_receiving_is_listed_as_changed() {
+        let (_dir, path) = temp_store();
+        register_linked(&path).await;
+        let alice = uuid::Uuid::from_u128(0xa11ce);
+        let alice_id = SignalServiceId::from(convert::aci(ServiceId::new(alice)));
+        seed(&path, move |mut store| async move {
+            let mine = presage::libsignal_service::protocol::PrivateKey::deserialize(&[9; 32])
+                .ok()
+                .and_then(|private| IdentityKeyPair::try_from(private).ok())
+                .expect("a key pair");
+            store
+                .set_aci_identity_key_pair(mine)
+                .await
+                .expect("own key");
+            store
+                .save_contact(&presage::model::contacts::Contact {
+                    uuid: alice,
+                    phone_number: None,
+                    name: "Alice".into(),
+                    verified: Default::default(),
+                    profile_key: Vec::new(),
+                    expire_timer: 0,
+                    expire_timer_version: 2,
+                    inbox_position: 0,
+                    avatar: None,
+                })
+                .await
+                .expect("contact");
+            store
+                .aci_protocol_store()
+                .save_identity(
+                    &protocol_address(alice_id).expect("address"),
+                    &identity_key(1),
+                )
+                .await
+                .expect("first key");
+        })
+        .await;
+        let signal = PresageSignal::open(&path, &KEY).await.expect("opens");
+        let (store, changed) = (
+            signal.manager.store().clone(),
+            signal.changed_identities.clone(),
+        );
+        signal
+            .worker
+            .run(move || async move {
+                let mut watch = IdentityWatch::primed(&store, changed).await;
+                store
+                    .aci_protocol_store()
+                    .save_identity(
+                        &protocol_address(alice_id).expect("address"),
+                        &identity_key(2),
+                    )
+                    .await
+                    .expect("new key");
+                assert!(watch.changed(&store, alice_id).await, "change missed");
+            })
+            .await
+            .expect("worker ran");
+        let identities = signal.identities().await.expect("identities");
+        assert!(
+            matches!(identities.as_slice(), [identity] if identity.changed),
+            "{identities:?}"
+        );
+    }
+
     /// Sending to a group the account isn't in must fail with a reason, before
     /// anything reaches Signal, as it does on FakeSignal.
     #[tokio::test]
@@ -1681,7 +1777,7 @@ mod tests {
                 .save_identity(&address, &identity_key(1))
                 .await
                 .expect("first key");
-            let mut watch = IdentityWatch::primed(&store).await;
+            let mut watch = IdentityWatch::primed(&store, ChangedIdentities::default()).await;
             assert!(
                 !watch.changed(&store, alice_id).await,
                 "an unchanged key was reported"
