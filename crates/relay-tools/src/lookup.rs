@@ -2,12 +2,14 @@
 //! servers or the protocol store but never a person, so nothing here sends.
 
 use async_trait::async_trait;
+use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
     Tool, ToolContext, ToolError,
-    input::{contact, contact_schema, parse},
+    directory::MAX_ATTACHMENT_BYTES,
+    input::{contact, contact_schema, parse, recipient, recipient_schema},
 };
 
 pub struct ListDevices;
@@ -126,6 +128,63 @@ impl Tool for ListIdentities {
     }
 }
 
+pub struct GetAvatar;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GetAvatarInput {
+    identifier: String,
+}
+
+#[async_trait]
+impl Tool for GetAvatar {
+    fn name(&self) -> &'static str {
+        "get_avatar"
+    }
+    fn description(&self) -> &'static str {
+        "Fetch a contact's profile picture or a group's avatar. identifier is a contact's phone \
+         number or service id, or a group id from list_groups. Returns identifier, has_avatar, \
+         size (bytes) and the image as base64 (JPEG or PNG), or has_avatar false and base64 \
+         null when there is none. Images over 5 MiB are refused rather than returned. Nothing \
+         is sent."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {"identifier": recipient_schema()},
+            "required": ["identifier"],
+            "additionalProperties": false,
+        })
+    }
+    fn writes(&self) -> bool {
+        false
+    }
+    async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
+        let GetAvatarInput { identifier } = parse(input)?;
+        let of = recipient(ctx, &identifier).await?;
+        let Some(bytes) = ctx.signal.avatar(of).await? else {
+            return Ok(json!({
+                "identifier": identifier,
+                "has_avatar": false,
+                "size": null,
+                "base64": null,
+            }));
+        };
+        let size = bytes.len() as u64;
+        if size > MAX_ATTACHMENT_BYTES {
+            return Err(ToolError::InvalidInput(format!(
+                "the avatar of \"{identifier}\" is {size} bytes, over the 5 MiB cap"
+            )));
+        }
+        Ok(json!({
+            "identifier": identifier,
+            "has_avatar": true,
+            "size": size,
+            "base64": STANDARD.encode(bytes),
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -134,7 +193,7 @@ mod tests {
     use relay_store::MemoryStore;
     use serde_json::json;
 
-    use crate::{Registry, ToolContext, testing::*};
+    use crate::{Registry, ToolContext, ToolError, testing::*};
     use relay_core::prelude::*;
 
     /// A read-only linked profile whose Signal knows `signal`'s seeded state.
@@ -267,5 +326,52 @@ mod tests {
             .collect();
         assert_eq!(ids, [sid(3).to_string()], "{out}");
         assert_eq!(out["changed"], json!([]), "{out}");
+    }
+
+    /// A group id names the group's avatar, not a member's, and someone with
+    /// no picture is an answer, not an error.
+    #[tokio::test]
+    async fn get_avatar_returns_a_groups_image_and_reports_a_missing_one() {
+        let group = GroupId::new([0xaa; 32]);
+        let ctx = ctx_of(|s| s.with_avatar(Recipient::Group(group), vec![0xff, 0x00, 0xfe]));
+        let registry = Registry::standard();
+        let out = registry
+            .call(&ctx, "get_avatar", json!({"identifier": group.to_string()}))
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            json!({"identifier": group.to_string(), "has_avatar": true, "size": 3, "base64": "/wD+"})
+        );
+        let none = registry
+            .call(
+                &ctx,
+                "get_avatar",
+                json!({"identifier": sid(2).to_string()}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(none["has_avatar"], json!(false), "{none}");
+        assert_eq!(none["base64"], json!(null), "{none}");
+    }
+
+    /// An oversized avatar base64'd into one response would flood the client
+    /// the same way a big attachment would, so get_attachment's cap applies.
+    #[tokio::test]
+    async fn get_avatar_refuses_an_image_over_the_attachment_cap() {
+        let big = usize::try_from(crate::directory::MAX_ATTACHMENT_BYTES).unwrap() + 1;
+        let ctx = ctx_of(|s| s.with_avatar(Recipient::Contact(sid(2)), vec![0; big]));
+        let result = Registry::standard()
+            .call(
+                &ctx,
+                "get_avatar",
+                json!({"identifier": sid(2).to_string()}),
+            )
+            .await;
+        assert!(
+            matches!(&result, Err(ToolError::InvalidInput(e)) if e.contains("5 MiB")),
+            "got {:?}",
+            result.map(|_| "an avatar over the cap")
+        );
     }
 }

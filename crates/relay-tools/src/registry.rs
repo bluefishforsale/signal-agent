@@ -47,6 +47,7 @@ impl Registry {
             .with(local::PruneStore)
             .with(lookup::ListDevices)
             .with(lookup::ListIdentities)
+            .with(lookup::GetAvatar)
     }
 
     /// Applies account-safety limits to every send a tool makes.

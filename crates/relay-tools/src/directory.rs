@@ -192,7 +192,7 @@ pub struct GetAttachment;
 
 /// The largest file get_attachment returns: 5 MiB, the most an image block in
 /// the Claude API accepts, and already about 7 MB once base64'd.
-const MAX_ATTACHMENT_BYTES: u64 = 5 * 1024 * 1024;
+pub(crate) const MAX_ATTACHMENT_BYTES: u64 = 5 * 1024 * 1024;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
