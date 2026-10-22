@@ -13,7 +13,7 @@ use relay_signal::{LinkEvent, Provisioner, RateLimited, RegistrationStep};
 use relay_tools::{Clock, Limits, Settings, SystemClock};
 
 use crate::{
-    Command, SetupEvent, SetupState,
+    Command, HistoryGap, SetupEvent, SetupState,
     claude::{Clients, ServerEntry},
     transition,
 };
@@ -29,11 +29,11 @@ pub trait OpenProvisioner: Send + Sync {
 #[async_trait]
 pub trait HistoryImport: Send + Sync {
     /// Imports everything available, reporting messages imported so far and
-    /// the total when known.
+    /// the total when known. Returns why there was nothing to import, if so.
     async fn import(
         &self,
         progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
-    ) -> anyhow::Result<()>;
+    ) -> anyhow::Result<Option<HistoryGap>>;
 }
 
 /// Signal Desktop's own history on this computer, read only if the user opts in.
@@ -216,8 +216,10 @@ impl Driver {
                     let event = SetupEvent::HistoryProgress { imported, total };
                     pending.extend(apply(state, event, show));
                 };
-                self.services.history.import(&mut progress).await?;
-                SetupEvent::HistoryDone
+                match self.services.history.import(&mut progress).await? {
+                    None => SetupEvent::HistoryDone,
+                    Some(reason) => SetupEvent::NoHistory { reason },
+                }
             }
             Command::FindDesktop if self.services.desktop.found() => SetupEvent::DesktopFound,
             Command::FindDesktop => SetupEvent::DesktopAbsent,
@@ -345,7 +347,7 @@ mod tests {
         }
     }
 
-    type Imports = VecDeque<anyhow::Result<Vec<(u64, Option<u64>)>>>;
+    type Imports = VecDeque<anyhow::Result<(Vec<(u64, Option<u64>)>, Option<HistoryGap>)>>;
 
     /// The fakes' shared state: what Signal and the OS will do, and everything
     /// every fake did, in order. Clones share it, so two setup runs can see one
@@ -425,7 +427,15 @@ mod tests {
 
         /// The next history import reports `progress`, or fails.
         fn import(self, progress: anyhow::Result<Vec<(u64, Option<u64>)>>) -> Self {
-            self.imports.lock().expect("imports").push_back(progress);
+            let import = progress.map(|steps| (steps, None));
+            self.imports.lock().expect("imports").push_back(import);
+            self
+        }
+
+        /// The next history import finds nothing to import, for `reason`.
+        fn no_history(self, reason: HistoryGap) -> Self {
+            let import = Ok((Vec::new(), Some(reason)));
+            self.imports.lock().expect("imports").push_back(import);
             self
         }
 
@@ -551,18 +561,18 @@ mod tests {
         async fn import(
             &self,
             progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
-        ) -> anyhow::Result<()> {
+        ) -> anyhow::Result<Option<HistoryGap>> {
             self.push("import history");
-            let steps = self
+            let (steps, gap) = self
                 .imports
                 .lock()
                 .expect("imports")
                 .pop_front()
-                .unwrap_or_else(|| Ok(vec![]))?;
+                .unwrap_or_else(|| Ok((vec![], None)))?;
             for (imported, total) in steps {
                 progress(imported, total);
             }
-            Ok(())
+            Ok(gap)
         }
     }
 
@@ -861,6 +871,43 @@ mod tests {
                 assert!(started > Some(read), "agent started first: {log:?}");
             }
         }
+    }
+
+    /// When the phone sends no history, setup says why and waits; carrying on
+    /// still saves access before the agent starts.
+    #[tokio::test]
+    async fn missing_history_waits_on_the_user_then_finishes_setup() {
+        let world = World::new()
+            .link(vec![linked()])
+            .no_history(HistoryGap::RelinkRequested);
+        let mut h = Harness::new(&world);
+        h.send(LINK).await;
+        let waiting = h
+            .send(SetupEvent::AccessChosen {
+                access: AccessMode::ReadOnly,
+            })
+            .await;
+        assert_eq!(
+            waiting,
+            SetupState::HistoryUnavailable {
+                reason: HistoryGap::RelinkRequested,
+                access: AccessMode::ReadOnly
+            }
+        );
+        assert!(
+            !world.log().iter().any(|e| e.starts_with("start agent")),
+            "{:?}",
+            world.log()
+        );
+        let done = h.send(SetupEvent::SkipHistory).await;
+        assert!(matches!(done, SetupState::Done { .. }), "{done:?}");
+        assert!(
+            world
+                .log()
+                .contains(&"start agent personal, access ReadOnly".to_owned()),
+            "{:?}",
+            world.log()
+        );
     }
 
     const NUMBER: &str = "+15555550100";
