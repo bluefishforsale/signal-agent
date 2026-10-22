@@ -2,6 +2,8 @@
 //! send tools, so read-only mode, the input rules and the send limiter judge
 //! it at fire time exactly as they would a live send.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use anyhow::Context;
 use async_trait::async_trait;
 use relay_core::prelude::*;
@@ -12,6 +14,7 @@ use serde_json::{Value, json};
 use crate::{
     Registry, Tool, ToolContext, ToolError,
     input::{Instant, non_blank, parse, recipient, recipient_schema},
+    send,
 };
 
 pub struct ScheduleMessage;
@@ -144,6 +147,56 @@ impl Tool for CancelScheduledMessage {
     }
 }
 
+pub struct RunScheduledMessages;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunScheduledMessagesInput {}
+
+#[async_trait]
+impl Tool for RunScheduledMessages {
+    fn name(&self) -> &'static str {
+        "run_scheduled_messages"
+    }
+    fn description(&self) -> &'static str {
+        "Send every scheduled message that's due now, without waiting for the agent's next \
+         check (about every 30 seconds). Each goes out as an ordinary send under the profile's \
+         send limits; a refused or failed one is kept as failed and never retried. Returns \
+         {sent, failed}: the job ids sent, and {job_id, error} for each failure."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false,
+        })
+    }
+    fn writes(&self) -> bool {
+        true
+    }
+    async fn call(&self, ctx: &ToolContext, input: Value) -> Result<Value, ToolError> {
+        let RunScheduledMessagesInput {} = parse(input)?;
+        // NOTE: no limiter on this inner registry. The registry that called
+        // this tool already routed ctx.signal through its limiter, and a second
+        // one would meter every send twice.
+        let senders = Registry::default()
+            .with(send::SendMessage)
+            .with(send::SendGroupMessage);
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(anyhow::Error::from)?
+            .as_millis() as u64;
+        let (mut sent, mut failed) = (vec![], vec![]);
+        for (id, outcome) in run_due(&senders, ctx, now_ms).await? {
+            match outcome {
+                Ok(()) => sent.push(id.0),
+                Err(error) => failed.push(json!({ "job_id": id.0, "error": error })),
+            }
+        }
+        Ok(json!({ "sent": sent, "failed": failed }))
+    }
+}
+
 /// A job id as a client sends it: 1 to 2^53 - 1, the integers JSON carries exactly.
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(try_from = "u64")]
@@ -204,7 +257,7 @@ pub async fn run_due(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{num::NonZeroU32, sync::Arc};
 
     use relay_signal::Outgoing;
     use relay_store::{JobState, ScheduledJob};
@@ -379,5 +432,26 @@ mod tests {
         }
         assert!(run_due(&registry, &ctx, 1).await.unwrap().is_empty());
         assert!(signal.sent().is_empty(), "sent {:?}", signal.sent());
+    }
+
+    /// run_scheduled_messages already runs behind the calling registry's
+    /// limiter; a due job must still go out under a budget of one send a
+    /// minute, and be reported by id.
+    #[tokio::test]
+    async fn run_scheduled_messages_sends_a_due_job_under_a_one_send_budget() {
+        let (ctx, signal) = ctx(AccessMode::Full, ProfileKind::Primary);
+        let one_a_minute = Limits {
+            burst_per_minute: NonZeroU32::MIN,
+            ..Limits::default()
+        };
+        let registry =
+            Registry::standard().with_limiter(Limiter::new(one_a_minute, Arc::new(SystemClock)));
+        let id = schedule_hi(&ctx).await;
+        let out = registry
+            .call(&ctx, "run_scheduled_messages", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(out, json!({"sent": [id], "failed": []}));
+        assert_eq!(signal.sent().len(), 1, "sent {:?}", signal.sent());
     }
 }

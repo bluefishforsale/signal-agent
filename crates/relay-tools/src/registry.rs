@@ -57,6 +57,7 @@ impl Registry {
             .with(schedule::ScheduleMessage)
             .with(schedule::ListScheduledMessages)
             .with(schedule::CancelScheduledMessage)
+            .with(schedule::RunScheduledMessages)
     }
 
     /// Applies account-safety limits to every send a tool makes.
