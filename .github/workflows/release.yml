@@ -360,8 +360,9 @@ jobs:
         run: |
           $record = Join-Path $env:RUNNER_TEMP sign-record.txt
           Get-Content $record
-          $outside = @(Get-Content $record | Where-Object { -not ($_ -replace '^\\\\\?\\', '').StartsWith($env:GITHUB_WORKSPACE, 'OrdinalIgnoreCase') })
-          if ($outside.Count -eq 0) { throw "no path outside the workspace reached the sign hook, so the uninstaller (written to a temp file by NSIS) was not signed" }
+          # makensis hands !uninstfinalize its temp file, named nst*.tmp
+          $uninstaller = @(Get-Content $record | Where-Object { (Split-Path -Leaf $_) -like 'nst*.tmp' })
+          if ($uninstaller.Count -ne 1) { throw "the sign hook got $($uninstaller.Count) NSIS uninstaller temp files, expected 1" }
       - name: The installer puts signal-agent.exe next to the app
         run: ./scripts/check-nsis-payload.ps1 -Installer (Get-Item target/${{ matrix.target }}/release/bundle/nsis/*-setup.exe).FullName -RequireSigned:$${{ github.event_name == 'push' }}
         shell: pwsh
