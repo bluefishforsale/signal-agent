@@ -307,13 +307,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: windows-latest
-            arch: x64
+          - arch: x64
             target: x86_64-pc-windows-msvc
-          - runner: windows-11-arm
-            arch: arm64
+          - arch: arm64
             target: aarch64-pc-windows-msvc
-    runs-on: ${{ matrix.runner }}
+    # Bundling only packs exes built earlier, so arm64 bundles on x64 too: the
+    # signing tooling below is x64, and this keeps it off ARM emulation.
+    runs-on: windows-latest
+    environment: ${{ github.event_name == 'push' && 'release' || '' }}
+    permissions:
+      contents: read
+      id-token: write
     env:
       VERSION: ${{ needs.preflight.outputs.version }}
     steps:
@@ -326,8 +330,39 @@ jobs:
           name: windows-app-${{ matrix.arch }}
           path: target/${{ matrix.target }}/release
       - run: scripts/stage-agent-sidecar.sh ${{ matrix.target }}
-      - run: $TAURI_CLI bundle --ci --target ${{ matrix.target }} --bundles nsis
+      - uses: azure/login@v3
+        if: github.event_name == 'push'
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - if: github.event_name == 'push'
+        run: Install-Module -Name ArtifactSigning -RequiredVersion 0.1.20 -Force -Repository PSGallery
+        shell: pwsh
+      # The uninstaller is written while NSIS compiles, so only Tauri's
+      # signCommand can sign it (#76). Unsigned runs record what the hook was
+      # handed instead of signing it.
+      - name: Bundle, signing through scripts/sign-windows.ps1
+        env:
+          AZURE_SIGNING_ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          AZURE_SIGNING_ACCOUNT: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          AZURE_CERT_PROFILE: ${{ vars.AZURE_CERT_PROFILE }}
+          SIGN_RECORD: ${{ github.event_name != 'push' && format('{0}\sign-record.txt', runner.temp) || '' }}
+        run: |
+          config=$(jq -nc --arg record "$SIGN_RECORD" '{bundle: {windows: {signCommand: {cmd: "pwsh",
+            args: (["-NoProfile", "-File", "../../scripts/sign-windows.ps1", "-Path", "%1"]
+              + (if $record == "" then [] else ["-Record", $record] end))}}}}')
+          $TAURI_CLI bundle --ci --target ${{ matrix.target }} --bundles nsis --config "$config"
         working-directory: app/src-tauri
+      - name: The sign hook reached the uninstaller
+        if: github.event_name != 'push'
+        shell: pwsh
+        run: |
+          $record = Join-Path $env:RUNNER_TEMP sign-record.txt
+          Get-Content $record
+          # makensis hands !uninstfinalize its temp file, named nst*.tmp
+          $uninstaller = @(Get-Content $record | Where-Object { (Split-Path -Leaf $_) -like 'nst*.tmp' })
+          if ($uninstaller.Count -ne 1) { throw "the sign hook got $($uninstaller.Count) NSIS uninstaller temp files, expected 1" }
       - name: The installer puts signal-agent.exe next to the app
         run: ./scripts/check-nsis-payload.ps1 -Installer (Get-Item target/${{ matrix.target }}/release/bundle/nsis/*-setup.exe).FullName -RequireSigned:$${{ github.event_name == 'push' }}
         shell: pwsh
