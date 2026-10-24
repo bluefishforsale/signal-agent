@@ -641,7 +641,10 @@ pub(crate) mod tests {
         drop(signal);
         relay_store::SqlCipherStore::open(&config.paths.message_store, &key)
             .await
-            .expect("the message store is encrypted with the profile's key");
+            .expect("the message store is encrypted with the profile's key")
+            .close()
+            .await
+            .expect("close");
     }
 
     /// A key that doesn't match a store (a replaced Keychain item, a restored

@@ -7,7 +7,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use relay_core::{LinkAndSyncKey, prelude::*};
 use relay_secrets::SecretStore;
-use relay_store::SqlCipherStore;
+use relay_store::{MessageStore, SqlCipherStore};
 
 use crate::driver::{DesktopHistory, HistoryImport};
 
@@ -63,11 +63,13 @@ impl HistoryImport for LinkAndSync {
             .await
             .with_context(|| format!("unable to read \"{}\"", archive.display()))?;
         let store = self.store.open().await?;
-        relay_history::import_link_and_sync(&bytes, key, our_aci, &store, &mut |p| {
-            progress(p.imported, p.total)
-        })
-        .await?;
-        Ok(())
+        let imported =
+            relay_history::import_link_and_sync(&bytes, key, our_aci, &store, &mut |p| {
+                progress(p.imported, p.total)
+            })
+            .await;
+        store.close().await?;
+        imported.map(drop)
     }
 }
 
@@ -107,10 +109,14 @@ impl DesktopHistory for SignalDesktop {
             anyhow::bail!("Signal Desktop isn't on this computer");
         };
         let store = self.store.open().await?;
-        relay_history::import_signal_desktop(dir, our_aci, &store, &mut |p| progress(p.imported))
-            .await
-            .with_context(|| format!("importing Signal Desktop from \"{}\"", dir.display()))?;
-        Ok(())
+        let imported = relay_history::import_signal_desktop(dir, our_aci, &store, &mut |p| {
+            progress(p.imported)
+        })
+        .await;
+        store.close().await?;
+        imported
+            .map(drop)
+            .with_context(|| format!("importing Signal Desktop from \"{}\"", dir.display()))
     }
 }
 
@@ -141,7 +147,8 @@ mod tests {
             .set(&profile, &StoreKey::generate().expect("key"))
             .expect("save key");
         let store = ProfileStore::new(&profile, &paths, Box::new(secrets));
-        store.open().await.expect("open with the saved key");
+        let opened = store.open().await.expect("open with the saved key");
+        opened.close().await.expect("close");
         assert!(paths.message_store.exists());
     }
 
@@ -169,6 +176,36 @@ mod tests {
             panic!("imported a file that isn't an archive");
         };
         assert!(format!("{e:#}").contains("authenticate"), "{e:#}");
+    }
+
+    /// A SQLCipher store dropped without close() is closed later on a sqlx
+    /// thread, which segfaults if the process exits meanwhile (#126). An
+    /// import must close the store before it returns, failed or not; SQLite
+    /// removes the WAL file when the last connection closes.
+    #[tokio::test]
+    async fn a_failed_import_closes_the_message_store_before_it_returns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let profile = ProfileName::default_profile();
+        let paths = ProfilePaths::under(dir.path().to_path_buf(), &profile);
+        std::fs::create_dir_all(&paths.root).expect("profile dir");
+        let secrets = MemorySecretStore::default();
+        secrets
+            .set(&profile, &StoreKey::generate().expect("key"))
+            .expect("save key");
+        let archive = paths.root.join("history.archive");
+        std::fs::write(&archive, b"not an archive").expect("archive");
+        let history = LinkAndSync::new(ProfileStore::new(&profile, &paths, Box::new(secrets)));
+        let aci = ServiceId::new(uuid::Uuid::from_u128(7));
+        let imported = history
+            .import(&archive, &LinkAndSyncKey::new([7; 32]), aci, &mut |_, _| {})
+            .await;
+        assert!(imported.is_err(), "imported a file that isn't an archive");
+        let mut wal = paths.message_store.clone().into_os_string();
+        wal.push("-wal");
+        assert!(
+            !PathBuf::from(wal).exists(),
+            "the message store was still open after the import returned"
+        );
     }
 
     /// No Desktop folder on this OS, or one without Desktop's data, must
