@@ -29,9 +29,13 @@ impl Webhook {
         // NOTE: never follow a redirect. A 307 or 308 re-POSTs the message to
         // an address WebhookUrl never vetted, plain http off the machine
         // included; a redirecting webhook fails and is logged instead.
+        // NOTE: no idle connections. A POST sent on a pooled connection the
+        // receiver is closing fails with IncompleteMessage and isn't retried,
+        // so the message would never reach the webhook (#107).
         let client = reqwest::Client::builder()
             .timeout(WEBHOOK_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
+            .pool_max_idle_per_host(0)
             .build()
             .context("unable to build the webhook client")?;
         Ok(Self {
