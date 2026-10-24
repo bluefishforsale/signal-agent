@@ -308,6 +308,33 @@ mod tests {
         assert!(switched.is_ok(), "refused from already set up");
     }
 
+    /// Cancel on "Something went wrong" starts the account's setup over. A
+    /// failure retrying can't fix (an unsigned app refused as a login item)
+    /// was a dead end until it could be left this way.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_setup_can_be_started_over() {
+        let (session, mut rx) = {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let failed = SetupState::Failed {
+                message: "SMAppService refused the login agent".into(),
+                retry: Box::new(SetupState::ConnectingClients {
+                    access: relay_core::AccessMode::Full,
+                }),
+            };
+            let (session, run) =
+                Session::new(Box::new(Scripted::new(failed, link_at_once)), move |view| {
+                    tx.send(screen_name(view)).unwrap()
+                });
+            tokio::spawn(run);
+            (session, rx)
+        };
+        let run = session
+            .switch_to(scripted())
+            .expect("a failed setup switches");
+        tokio::spawn(run);
+        assert_eq!(next(&mut rx).await, "choose_account");
+    }
+
     /// A click setup ignores changes nothing, but the page still needs a
     /// redraw to re-enable the button it disabled.
     #[tokio::test(start_paused = true)]

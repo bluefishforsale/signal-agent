@@ -189,6 +189,12 @@
           "markdownDescription": "Enables the add_account command without any pre-configured scope."
         },
         {
+          "description": "Enables the cancel_setup command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-cancel-setup",
+          "markdownDescription": "Enables the cancel_setup command without any pre-configured scope."
+        },
+        {
           "description": "Enables the current command without any pre-configured scope.",
           "type": "string",
           "const": "allow-current",
@@ -259,6 +265,12 @@
           "type": "string",
           "const": "deny-add-account",
           "markdownDescription": "Denies the add_account command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cancel_setup command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-cancel-setup",
+          "markdownDescription": "Denies the cancel_setup command without any pre-configured scope."
         },
         {
           "description": "Denies the current command without any pre-configured scope.",

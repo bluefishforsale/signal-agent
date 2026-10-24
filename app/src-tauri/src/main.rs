@@ -17,7 +17,7 @@ mod session;
 mod updater;
 mod view;
 
-use std::time::Duration;
+use std::{sync::Mutex, time::Duration};
 
 use relay_core::ProfileName;
 use relay_setup::prelude::*;
@@ -140,15 +140,36 @@ fn accounts() -> Result<Vec<accounts::Account>, String> {
         .map_err(|e| format!("{e:#}"))
 }
 
+/// The account whose setup the window shows, so Cancel can start it over.
+struct Shown(Mutex<ProfileName>);
+
 /// Starts setup of a new account called `name` in the window.
 #[tauri::command]
-fn add_account(name: String, session: State<'_, Session>) -> Result<View, String> {
+fn add_account(
+    name: String,
+    session: State<'_, Session>,
+    shown: State<'_, Shown>,
+) -> Result<View, String> {
     let start = || -> anyhow::Result<View> {
         let profile = profiles()?.available(&name)?;
-        tauri::async_runtime::spawn(session.switch_to(setup(profile))?);
+        tauri::async_runtime::spawn(session.switch_to(setup(profile.clone()))?);
+        *shown.0.lock().expect("shown lock") = profile;
         Ok(session.view())
     };
     start().map_err(|e| format!("{e:#}"))
+}
+
+/// Leaves a failed setup for the screen that account's setup opens on, which
+/// offers Accounts and Uninstall, so a failure retrying can't fix is never a
+/// dead end.
+#[tauri::command]
+fn cancel_setup(session: State<'_, Session>, shown: State<'_, Shown>) -> Result<View, String> {
+    let profile = shown.0.lock().expect("shown lock").clone();
+    let run = session
+        .switch_to(setup(profile))
+        .map_err(|e| format!("{e:#}"))?;
+    tauri::async_runtime::spawn(run);
+    Ok(session.view())
 }
 
 #[tauri::command]
@@ -323,8 +344,10 @@ fn main() {
                     eprintln!("unable to redraw the setup window: {e}");
                 }
             };
-            let (session, run) = Session::new(setup(ProfileName::default_profile()), redraw);
+            let profile = ProfileName::default_profile();
+            let (session, run) = Session::new(setup(profile.clone()), redraw);
             app.manage(session);
+            app.manage(Shown(Mutex::new(profile)));
             tauri::async_runtime::spawn(run);
             tauri::async_runtime::spawn(updater::watch(app.handle().clone()));
             // Screenshot mode for development builds: a fixed theme, kept on top.
@@ -348,6 +371,7 @@ fn main() {
             send,
             accounts,
             add_account,
+            cancel_setup,
             open_captcha,
             needs_move,
             move_to_applications,

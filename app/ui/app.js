@@ -228,6 +228,17 @@ const actions = {
   choose_access: () => send({ event: "access_chosen", access: checked("access") }),
   restart_desktop: () => send({ event: "restart_desktop" }),
   retry: () => send({ event: "retry" }),
+  cancel_setup: async (button) => {
+    const error = document.querySelector('[data-field="cancel_error"]');
+    error.hidden = true;
+    try {
+      render(await invoke("cancel_setup"));
+    } catch (message) {
+      error.textContent = `Setup couldn't be cancelled: ${message}`;
+      error.hidden = false;
+      button.disabled = false;
+    }
+  },
   skip_history: () => send({ event: "skip_history" }),
   desktop_yes: () => send({ event: "desktop_import_chosen", import: true }),
   desktop_no: () => send({ event: "desktop_import_chosen", import: false }),
