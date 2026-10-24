@@ -266,7 +266,9 @@
     <section data-screen="failed" hidden>
       <h1>Something went wrong</h1>
       <p data-field="message"></p>
+      <p class="error" data-field="cancel_error" hidden></p>
       <div class="actions">
+        <button data-action="cancel_setup">Cancel</button>
         <button class="primary" data-action="retry">Try again</button>
         <button data-action="skip_history" data-field="skip_history" hidden>Skip earlier messages</button>
       </div>

@@ -6,6 +6,7 @@ const APP_COMMANDS: &[&str] = &[
     "send",
     "accounts",
     "add_account",
+    "cancel_setup",
     "open_captcha",
     "needs_move",
     "move_to_applications",

@@ -12,6 +12,7 @@
     "allow-send",
     "allow-accounts",
     "allow-add-account",
+    "allow-cancel-setup",
     "allow-open-captcha",
     "allow-needs-move",
     "allow-move-to-applications",
