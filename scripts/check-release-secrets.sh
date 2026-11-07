@@ -4,9 +4,13 @@
 # only and never prints a value.
 set -euo pipefail
 
+# Scope `all` (the default) gates a release; `apple` gates the macOS-only
+# signing test, which needs no Windows or updater signing.
+scope="${1:-all}"
+
 # NOTE: names come from docs/signing-setup.md. release.yml must map each one into
 # this step's env; a name it forgets to map reads as missing, which fails closed.
-required=(
+apple=(
   APPLE_CERTIFICATE
   APPLE_CERTIFICATE_PASSWORD
   APPLE_SIGNING_IDENTITY
@@ -15,6 +19,9 @@ required=(
   APPLE_API_KEY
   APPLE_API_PRIVATE_KEY
   KEYCHAIN_PASSWORD
+)
+required=(
+  "${apple[@]}"
   AZURE_TENANT_ID
   AZURE_CLIENT_ID
   AZURE_SUBSCRIPTION_ID
@@ -24,6 +31,11 @@ required=(
   TAURI_SIGNING_PRIVATE_KEY
   TAURI_SIGNING_PRIVATE_KEY_PASSWORD
 )
+case "$scope" in
+  all) ;;
+  apple) required=("${apple[@]}") ;;
+  *) echo "unknown scope \"$scope\" (want all or apple)" >&2; exit 2 ;;
+esac
 
 missing=()
 for name in "${required[@]}"; do
@@ -33,7 +45,8 @@ done
 # The updater's public key is committed rather than secret, but until it is
 # the real one no release can be installed as an update.
 config="$(dirname "$0")/../app/src-tauri/tauri.conf.json"
-if ! jq -r .plugins.updater.pubkey "$config" | base64 -d 2>/dev/null | grep -q '^untrusted comment: minisign public key'; then
+if [[ "$scope" == all ]] \
+  && ! jq -r .plugins.updater.pubkey "$config" | base64 -d 2>/dev/null | grep -q '^untrusted comment: minisign public key'; then
   missing+=("plugins.updater.pubkey in app/src-tauri/tauri.conf.json")
 fi
 

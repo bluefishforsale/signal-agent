@@ -42,6 +42,9 @@ env:
   CARGO_HTTP_MULTIPLEXING: false
   CARGO_NET_GIT_FETCH_WITH_CLI: true
   TAURI_CLI: npx --yes @tauri-apps/cli@2.12.4
+  # Builds, signs, notarizes and staples only the macOS app into a draft
+  # release, to prove the Apple half before every signing input exists.
+  SIGNING_TEST_TAG: v0.0.0-signing-test
 
 defaults:
   run:
@@ -53,11 +56,14 @@ jobs:
     environment: ${{ (github.event_name == 'push' || inputs.mode == 'check-secrets') && 'release' || '' }}
     outputs:
       version: ${{ steps.version.outputs.version }}
+      signing_test: ${{ github.ref_name == env.SIGNING_TEST_TAG }}
     steps:
       - uses: actions/checkout@v4
       - name: Every signing input is present
         if: github.event_name == 'push' || inputs.mode == 'check-secrets'
         env:
+          # The signing test only signs the macOS app, so it needs only Apple's.
+          SCOPE: ${{ github.ref_name == env.SIGNING_TEST_TAG && 'apple' || 'all' }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -74,14 +80,14 @@ jobs:
           AZURE_CERT_PROFILE: ${{ vars.AZURE_CERT_PROFILE }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: scripts/check-release-secrets.sh
+        run: scripts/check-release-secrets.sh "$SCOPE"
       - id: version
         name: Tag matches the app and workspace versions
         run: |
           version=$(jq -r .version app/src-tauri/tauri.conf.json)
           workspace=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
           [[ "$version" == "$workspace" ]] || { echo "::error::tauri.conf.json is $version but Cargo.toml is $workspace"; exit 1; }
-          if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF_NAME" != "v$version" ]]; then
+          if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF_NAME" != "v$version" && "$GITHUB_REF_NAME" != "$SIGNING_TEST_TAG" ]]; then
             echo "::error::tag $GITHUB_REF_NAME does not match app version $version"
             exit 1
           fi
@@ -178,7 +184,7 @@ jobs:
   # oldest the PRD promises; a newer build host would silently raise the floor.
   linux:
     needs: preflight
-    if: inputs.mode != 'check-secrets'
+    if: inputs.mode != 'check-secrets' && needs.preflight.outputs.signing_test != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -229,7 +235,7 @@ jobs:
   # runners: the app exe is signed before NSIS packs it, then the installer.
   windows-build:
     needs: preflight
-    if: inputs.mode != 'check-secrets'
+    if: inputs.mode != 'check-secrets' && needs.preflight.outputs.signing_test != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -479,4 +485,29 @@ jobs:
           else
             gh release create "$GITHUB_REF_NAME" dist/* --draft --verify-tag \
               --title "MCP Relay for Signal $VERSION" --generate-notes
+          fi
+
+  signing-test:
+    needs: [preflight, macos]
+    if: needs.preflight.outputs.signing_test == 'true'
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-macos-universal
+          path: dist
+      - name: Attach the signed macOS app to a draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if [[ "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft 2>/dev/null)" == true ]]; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* --draft --verify-tag \
+              --title "Signing test (not a release)" \
+              --notes "The macOS app, signed with Developer ID, notarized and stapled on the homelab runner. Never publish this draft."
           fi

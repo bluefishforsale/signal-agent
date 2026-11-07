@@ -81,4 +81,4 @@ You don't need to do these; the agent handles them once the values above exist:
 
 ## Hand-off
 
-Put the values in the usual secret store, not in chat, and say which entries hold them. The agent sets them with `gh secret set --env release` and `gh variable set`, then confirms by pushing a `v0.0.0-signing-test` tag, which builds, signs and notarizes a hello-world app into a draft release, so nothing public changes. Until all of them exist, the release job fails on purpose (PRD acceptance 11).
+Put the values in the usual secret store, not in chat, and say which entries hold them. The agent sets them with `gh secret set --env release` and `gh variable set`, then confirms by pushing a `v0.0.0-signing-test` tag, which builds, signs, notarizes and staples the macOS app on mini-tv into a draft release, so nothing public changes. That tag needs only the Apple inputs; a real `v*` release fails on purpose until all of them exist (PRD acceptance 11).
