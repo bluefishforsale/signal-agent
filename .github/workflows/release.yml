@@ -90,7 +90,10 @@ jobs:
   macos:
     needs: preflight
     if: inputs.mode != 'check-secrets'
-    runs-on: macos-latest
+    # NOTE: never route pull_request here to mini-tv, the homelab's Mac (homelab
+    # repo, macos_runner.yaml). This repo is public, so a fork's pull request
+    # would run its code on that machine. Tags and dispatches come from owners.
+    runs-on: ${{ github.event_name == 'pull_request' && 'macos-latest' || fromJSON('["self-hosted", "macOS", "mini-tv"]') }}
     environment: ${{ github.event_name == 'push' && 'release' || '' }}
     env:
       VERSION: ${{ needs.preflight.outputs.version }}
@@ -165,6 +168,9 @@ jobs:
           name: dist-macos-universal
           path: dist/*
           if-no-files-found: error
+      - name: Remove the signing keychain
+        if: always() && github.event_name == 'push'
+        run: scripts/macos-signing-cleanup.sh
 
   # Built inside Ubuntu 20.04 so the binary links against glibc 2.31, the
   # oldest the PRD promises; a newer build host would silently raise the floor.
