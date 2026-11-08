@@ -48,7 +48,6 @@ What you hand over from Microsoft:
 |---|---|---|
 | `AZURE_TENANT_ID` | secret | Entra ID > Overview > Tenant ID |
 | `AZURE_CLIENT_ID` | secret | The `signal-agent-ci` app registration's Application (client) ID |
-| `AZURE_SUBSCRIPTION_ID` | secret | The subscription from step 1 |
 | `AZURE_SIGNING_ENDPOINT` | variable | Region endpoint from step 3 |
 | `AZURE_SIGNING_ACCOUNT` | variable | Account name from step 3 |
 | `AZURE_CERT_PROFILE` | variable | Profile name from step 6 |
