@@ -57,13 +57,17 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       signing_test: ${{ github.ref_name == env.SIGNING_TEST_TAG }}
+      # NOTE: WINDOWS_UNSIGNED=true on the release environment ships Windows
+      # unsigned until Azure Artifact Signing works. It must be set on purpose;
+      # missing Azure inputs alone still fail the release (PRD acceptance 11).
+      windows_signed: ${{ github.event_name == 'push' && vars.WINDOWS_UNSIGNED != 'true' }}
     steps:
       - uses: actions/checkout@v4
       - name: Every signing input is present
         if: github.event_name == 'push' || inputs.mode == 'check-secrets'
         env:
           # The signing test only signs the macOS app, so it needs only Apple's.
-          SCOPE: ${{ github.ref_name == env.SIGNING_TEST_TAG && 'apple' || 'all' }}
+          SCOPE: ${{ github.ref_name == env.SIGNING_TEST_TAG && 'apple' || vars.WINDOWS_UNSIGNED == 'true' && 'no-windows' || 'all' }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -274,8 +278,8 @@ jobs:
           if-no-files-found: error
 
   windows-sign-app:
-    needs: windows-build
-    if: github.event_name == 'push'
+    needs: [preflight, windows-build]
+    if: needs.preflight.outputs.windows_signed == 'true'
     strategy:
       matrix:
         arch: [x64, arm64]
@@ -316,7 +320,7 @@ jobs:
     needs: [preflight, windows-build, windows-sign-app]
     if: >-
       !cancelled() && needs.windows-build.result == 'success' &&
-      (needs.windows-sign-app.result == 'success' || github.event_name != 'push')
+      (needs.windows-sign-app.result == 'success' || needs.preflight.outputs.windows_signed != 'true')
     strategy:
       fail-fast: false
       matrix:
@@ -345,12 +349,12 @@ jobs:
           path: target/${{ matrix.target }}/release
       - run: scripts/stage-agent-sidecar.sh ${{ matrix.target }}
       - uses: azure/login@v3
-        if: github.event_name == 'push'
+        if: needs.preflight.outputs.windows_signed == 'true'
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-      - if: github.event_name == 'push'
+      - if: needs.preflight.outputs.windows_signed == 'true'
         run: Install-Module -Name ArtifactSigning -RequiredVersion 0.1.20 -Force -Repository PSGallery
         shell: pwsh
       # The uninstaller is written while NSIS compiles, so only Tauri's
@@ -361,7 +365,7 @@ jobs:
           AZURE_SIGNING_ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
           AZURE_SIGNING_ACCOUNT: ${{ vars.AZURE_SIGNING_ACCOUNT }}
           AZURE_CERT_PROFILE: ${{ vars.AZURE_CERT_PROFILE }}
-          SIGN_RECORD: ${{ github.event_name != 'push' && format('{0}\sign-record.txt', runner.temp) || '' }}
+          SIGN_RECORD: ${{ needs.preflight.outputs.windows_signed != 'true' && format('{0}\sign-record.txt', runner.temp) || '' }}
         run: |
           config=$(jq -nc --arg record "$SIGN_RECORD" '{bundle: {windows: {signCommand: {cmd: "pwsh",
             args: (["-NoProfile", "-File", "../../scripts/sign-windows.ps1", "-Path", "%1"]
@@ -369,7 +373,7 @@ jobs:
           $TAURI_CLI bundle --ci --target ${{ matrix.target }} --bundles nsis --config "$config"
         working-directory: app/src-tauri
       - name: The sign hook reached the uninstaller
-        if: github.event_name != 'push'
+        if: needs.preflight.outputs.windows_signed != 'true'
         shell: pwsh
         run: |
           $record = Join-Path $env:RUNNER_TEMP sign-record.txt
@@ -378,7 +382,7 @@ jobs:
           $uninstaller = @(Get-Content $record | Where-Object { (Split-Path -Leaf $_) -like 'nst*.tmp' })
           if ($uninstaller.Count -ne 1) { throw "the sign hook got $($uninstaller.Count) NSIS uninstaller temp files, expected 1" }
       - name: The installer puts signal-agent.exe next to the app
-        run: ./scripts/check-nsis-payload.ps1 -Installer (Get-Item target/${{ matrix.target }}/release/bundle/nsis/*-setup.exe).FullName -RequireSigned:$${{ github.event_name == 'push' }}
+        run: ./scripts/check-nsis-payload.ps1 -Installer (Get-Item target/${{ matrix.target }}/release/bundle/nsis/*-setup.exe).FullName -RequireSigned:$${{ needs.preflight.outputs.windows_signed == 'true' }}
         shell: pwsh
       - name: Name the installer
         run: |
@@ -391,8 +395,8 @@ jobs:
           if-no-files-found: error
 
   windows-sign-installer:
-    needs: windows-bundle
-    if: github.event_name == 'push'
+    needs: [preflight, windows-bundle]
+    if: needs.preflight.outputs.windows_signed == 'true'
     strategy:
       matrix:
         arch: [x64, arm64]
@@ -436,7 +440,7 @@ jobs:
     if: >-
       !cancelled() && needs.macos.result == 'success' && needs.linux.result == 'success' &&
       needs.windows-bundle.result == 'success' &&
-      (needs.windows-sign-installer.result == 'success' || github.event_name != 'push')
+      (needs.windows-sign-installer.result == 'success' || needs.preflight.outputs.windows_signed != 'true')
     runs-on: ubuntu-latest
     environment: ${{ github.event_name == 'push' && 'release' || '' }}
     permissions:
@@ -478,13 +482,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          WINDOWS_SIGNED: ${{ needs.preflight.outputs.windows_signed }}
         run: |
+          notes=""
+          if [[ "$WINDOWS_SIGNED" != true ]]; then
+            notes="The Windows installers in this release are not code-signed yet, so Windows SmartScreen shows \"Windows protected your PC\". Choose More info, then Run anyway. The macOS app is signed and notarized."
+          fi
           # A re-run refreshes an existing draft; a published release is never touched.
           if [[ "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft 2>/dev/null)" == true ]]; then
             gh release upload "$GITHUB_REF_NAME" dist/* --clobber
           else
             gh release create "$GITHUB_REF_NAME" dist/* --draft --verify-tag \
-              --title "MCP Relay for Signal $VERSION" --generate-notes
+              --title "MCP Relay for Signal $VERSION" --notes "$notes" --generate-notes
           fi
 
   signing-test:
