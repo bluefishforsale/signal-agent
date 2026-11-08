@@ -53,7 +53,7 @@ What you hand over from Microsoft:
 | `AZURE_SIGNING_ACCOUNT` | variable | Account name from step 3 |
 | `AZURE_CERT_PROFILE` | variable | Profile name from step 6 |
 
-Until all of that works, a release can ship Windows unsigned on purpose: set the variable `WINDOWS_UNSIGNED` to `true` on the `release` environment. The release then skips the Windows signing jobs and the Azure inputs, still requires the Apple and updater ones, and the draft release notes tell Windows users to expect SmartScreen's "More info, Run anyway". Delete the variable once Azure works, and releases require Windows signing again.
+Until all of that works, a release can ship Windows unsigned on purpose: set the variable `WINDOWS_UNSIGNED` to `true` on the `release` environment. The release then skips the Windows signing jobs and the Azure inputs, still requires the Apple and updater ones, and the release notes tell Windows users to expect SmartScreen's "More info, Run anyway". Delete the variable once Azure works, and releases require Windows signing again.
 
 Two constraints the pipeline is built around. The signing action runs only on Windows x64 runners and doesn't support Windows ARM runners, so the ARM64 build is compiled on an ARM runner and signed on an x64 runner. And a brand-new publisher can still see a SmartScreen warning until Microsoft has seen enough clean installs, which is acceptable under PRD acceptance criterion 3.
 

@@ -1,7 +1,8 @@
 name: release
 
-# A v* tag builds, signs and notarizes every installer into a draft GitHub
-# release (PRD goal 2). Everything else never signs or publishes: a pull request
+# A v* tag builds, signs and notarizes every installer and publishes them as a
+# GitHub release once every job passes (PRD goal 2); v0.0.0-signing-test stays a
+# draft. Everything else never signs or publishes: a pull request
 # that touches the release path, or a manual `dry-run`, proves the whole pipeline
 # unsigned; a manual `check-secrets` runs only the signing-input gate.
 #
@@ -477,7 +478,10 @@ jobs:
           name: release-${{ github.event_name == 'push' && github.ref_name || 'dry-run' }}
           path: dist/*
           if-no-files-found: error
-      - name: Attach everything to a draft release
+      # Publishing is the last step, so it happens only after every platform
+      # built, signed and passed its checks. It's live at once: installed
+      # copies read releases/latest/download/latest.json.
+      - name: Publish the release
         if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -488,13 +492,21 @@ jobs:
           if [[ "$WINDOWS_SIGNED" != true ]]; then
             notes="The Windows installers in this release are not code-signed yet, so Windows SmartScreen shows \"Windows protected your PC\". Choose More info, then Run anyway. The macOS app is signed and notarized."
           fi
-          # A re-run refreshes an existing draft; a published release is never touched.
-          if [[ "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft 2>/dev/null)" == true ]]; then
-            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
-          else
-            gh release create "$GITHUB_REF_NAME" dist/* --draft --verify-tag \
-              --title "MCP Relay for Signal $VERSION" --notes "$notes" --generate-notes
-          fi
+          # NOTE: a published release's files are never replaced; people may
+          # already have them. A leftover draft (an earlier failed run, or a
+          # release made before auto-publish) is refreshed and published.
+          is_draft="$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft 2>/dev/null || echo none)"
+          case "$is_draft" in
+            none)
+              gh release create "$GITHUB_REF_NAME" dist/* --verify-tag \
+                --title "MCP Relay for Signal $VERSION" --notes "$notes" --generate-notes ;;
+            true)
+              gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+              gh release edit "$GITHUB_REF_NAME" --draft=false ;;
+            *)
+              echo "::error::$GITHUB_REF_NAME is already published; refusing to replace its files. Tag a new version."
+              exit 1 ;;
+          esac
 
   signing-test:
     needs: [preflight, macos]
