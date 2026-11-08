@@ -25,7 +25,7 @@
       "endpoints": [
         "https://github.com/bluefishforsale/signal-agent/releases/latest/download/latest.json"
       ],
-      "pubkey": "UNSET: generate with `tauri signer generate`, see docs/signing-setup.md",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDlCREQ1MDY4QkZBRjlFNEEKUldSS25xKy9hRkRkbTE5TW9SZXA5U3QvRW1zcjRwQjExajlwZ2h2R0M4SG9DVzB3MmV6UDE1WHcK",
       "windows": {
         "installMode": "passive"
       }
