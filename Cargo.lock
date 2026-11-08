@@ -5074,7 +5074,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "relay-agent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5105,7 +5105,7 @@ dependencies = [
 
 [[package]]
 name = "relay-app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5134,7 +5134,7 @@ dependencies = [
 
 [[package]]
 name = "relay-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "dirs",
@@ -5147,7 +5147,7 @@ dependencies = [
 
 [[package]]
 name = "relay-history"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes 0.9.3",
  "aes-gcm",
@@ -5177,7 +5177,7 @@ dependencies = [
 
 [[package]]
 name = "relay-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5214,7 +5214,7 @@ dependencies = [
 
 [[package]]
 name = "relay-secrets"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "getrandom 0.4.3",
@@ -5227,7 +5227,7 @@ dependencies = [
 
 [[package]]
 name = "relay-setup"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5251,7 +5251,7 @@ dependencies = [
 
 [[package]]
 name = "relay-signal"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5281,7 +5281,7 @@ dependencies = [
 
 [[package]]
 name = "relay-store"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5300,7 +5300,7 @@ dependencies = [
 
 [[package]]
 name = "relay-tools"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5991,7 +5991,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "signal-agent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
