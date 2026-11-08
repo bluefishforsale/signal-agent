@@ -4,8 +4,9 @@
 # only and never prints a value.
 set -euo pipefail
 
-# Scope `all` (the default) gates a release; `apple` gates the macOS-only
-# signing test, which needs no Windows or updater signing.
+# Scope `all` (the default) gates a release; `no-windows` gates one shipped
+# with WINDOWS_UNSIGNED=true; `apple` gates the macOS-only signing test, which
+# needs no Windows or updater signing.
 scope="${1:-all}"
 
 # NOTE: names come from docs/signing-setup.md. release.yml must map each one into
@@ -20,21 +21,23 @@ apple=(
   APPLE_API_PRIVATE_KEY
   KEYCHAIN_PASSWORD
 )
-required=(
-  "${apple[@]}"
+azure=(
   AZURE_TENANT_ID
   AZURE_CLIENT_ID
   AZURE_SUBSCRIPTION_ID
   AZURE_SIGNING_ENDPOINT
   AZURE_SIGNING_ACCOUNT
   AZURE_CERT_PROFILE
+)
+updater=(
   TAURI_SIGNING_PRIVATE_KEY
   TAURI_SIGNING_PRIVATE_KEY_PASSWORD
 )
 case "$scope" in
-  all) ;;
+  all) required=("${apple[@]}" "${azure[@]}" "${updater[@]}") ;;
+  no-windows) required=("${apple[@]}" "${updater[@]}") ;;
   apple) required=("${apple[@]}") ;;
-  *) echo "unknown scope \"$scope\" (want all or apple)" >&2; exit 2 ;;
+  *) echo "unknown scope \"$scope\" (want all, no-windows or apple)" >&2; exit 2 ;;
 esac
 
 missing=()
@@ -45,7 +48,7 @@ done
 # The updater's public key is committed rather than secret, but until it is
 # the real one no release can be installed as an update.
 config="$(dirname "$0")/../app/src-tauri/tauri.conf.json"
-if [[ "$scope" == all ]] \
+if [[ "$scope" != apple ]] \
   && ! jq -r .plugins.updater.pubkey "$config" | base64 -d 2>/dev/null | grep -q '^untrusted comment: minisign public key'; then
   missing+=("plugins.updater.pubkey in app/src-tauri/tauri.conf.json")
 fi
