@@ -81,8 +81,8 @@ impl Tool for ListScheduledMessages {
         "list_scheduled_messages"
     }
     fn description(&self) -> &'static str {
-        "List scheduled messages not yet sent, soonest first. Each job has its id (for \
-         cancel_scheduled_message), what it sends (recipient, body, send_at_ms) and its state: \
+        "List scheduled messages not yet sent, soonest first. Each job has its id (the job_id \
+         the cancel tool takes), what it sends (recipient, body, send_at_ms) and its state: \
          pending; sending (claimed by a send that didn't finish, never retried); or failed, \
          with the error. Sent jobs are removed."
     }

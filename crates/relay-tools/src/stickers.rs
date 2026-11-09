@@ -25,7 +25,7 @@ impl Tool for ListStickerPacks {
     }
     fn description(&self) -> &'static str {
         "List the sticker packs installed on this account: id (pass it as pack_id to \
-         send_sticker, send_group_sticker and get_sticker), title, author, and each sticker's \
+         the other sticker tools), title, author, and each sticker's \
          id and emoji. Takes no parameters. Local only: nothing is downloaded or sent."
     }
     fn input_schema(&self) -> Value {
