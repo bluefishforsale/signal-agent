@@ -199,11 +199,42 @@ mod tests {
             );
         }
         let html = include_str!("../../ui/index.html");
-        for value in ["link_existing", "own_number", "full", "read_only"] {
+        for value in ["link_existing", "own_number"] {
             assert!(
                 html.contains(&format!(r#"value="{value}""#)),
                 "no {value} choice in index.html"
             );
         }
+    }
+
+    /// Setup must end read-only unless the user goes looking for sending:
+    /// the only way to full access is a box under Advanced that starts
+    /// unticked, and app.js sends read_only whenever it's unticked.
+    #[test]
+    fn setup_is_read_only_unless_the_user_ticks_allow_sending_under_advanced() {
+        let html = include_str!("../../ui/index.html");
+        let screen = html
+            .split(r#"<section data-screen="choose_access""#)
+            .nth(1)
+            .and_then(|rest| rest.split("</section>").next())
+            .expect("index.html has a choose_access screen");
+        let advanced = screen
+            .split(r#"<details class="advanced">"#)
+            .nth(1)
+            .expect("choose_access has an Advanced section");
+        assert!(
+            advanced.contains(r#"<input type="checkbox" name="allow_send">"#),
+            "allow_send isn't an unticked box under Advanced"
+        );
+        assert_eq!(
+            screen.matches("<input").count(),
+            1,
+            "choose_access offers another way to pick access"
+        );
+        let page = include_str!("../../ui/app.js");
+        assert!(
+            page.contains(r#"access: allowSend.checked ? "full" : "read_only""#),
+            "app.js doesn't send read_only for an unticked allow_send"
+        );
     }
 }

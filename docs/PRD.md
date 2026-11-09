@@ -1,6 +1,6 @@
 # PRD: MCP Relay for Signal (repo `signal-agent`) v2.0
 
-Status: approved 2026-10-21. Implementation is scoped to this document; changes to goals or anti-goals come back here first.
+Status: approved 2026-10-21; amended 2026-11-08 to make read-only the default access (goal 3, anti-goal 10, acceptance 12). Implementation is scoped to this document; changes to goals or anti-goals come back here first.
 
 ## Summary
 
@@ -18,7 +18,7 @@ The primary user is non-technical: they can download a file, double-click it, an
    - Account type: link my account (default), or give the agent its own number.
    - Linking: QR code that refreshes itself until scanned; a readable device name on the phone, e.g. "Claude (Terrac's MacBook)".
    - Registration (own number): the captcha page opens inside the window and its `signalcaptcha://` result is captured automatically (Linux: paste); then the SMS or voice code.
-   - Access: a plain-language screen, "Let Claude send messages as you?", Yes preselected, one line on the risk. No means read-only.
+   - Access: read-only by default. A plain-language screen says Claude can read your messages but can't send as you. Sending is a box under Advanced, "Allow Claude to send messages as you", unticked, with one line on the risk. Continuing without ticking it means read-only. The terminal asks "Let Claude send messages as you? [y/N]", where Enter means no.
    - History import via link-and-sync.
    - Claude registration for Claude Code and Claude Desktop, ending with a "Restart Claude Desktop" button.
    - The app moves itself to Applications before setup on macOS, so client configs never point into a translocated path.
@@ -45,7 +45,7 @@ The primary user is non-technical: they can download a file, double-click it, an
 7. No maintained fork of presage or libsignal-service-rs. Additions go upstream; we pin a git revision meanwhile.
 8. Deferred to v2.x: group administration (create, update, join, leave, terminate), registration-lock PIN, usernames, account settings, and storage-service contact edits (block, unblock, update, remove). Added by the slice-0 audit (`docs/tool-audit.md`): `update_device` (presage doesn't expose device renaming), `send_story` (needs storage-service distribution lists), `upload_sticker_pack` (no upload endpoint at the pinned libsignal-service rev), and `start_change_number` / `finish_change_number` (no change-number flow). Four tools ship narrower than upstream in v2.0: `update_profile` without avatar or MobileCoin fields (presage only uploads a profile without an avatar), and primary-only by choice, because on a linked profile it would rename the owner to every contact; `set_expiration_timer` for direct messages only (a group timer is a group change); `send_message_request_response` with accept and delete only (block is a storage-service contact edit); and `list_accounts` reporting only its own profile (each profile is its own MCP server, and one profile's client shouldn't learn the others). Any other tool presage can't back joins this list. The rule decides, not taste.
 9. No OAuth on the HTTP endpoint.
-10. No read-only default.
+10. No send access by default. Sending as the user is an opt-in under Advanced in setup; a missing or unreadable saved choice also starts the agent read-only.
 11. No Signal logo or Signal-blue speech bubble in the icon, and no "Signal"-first product name.
 12. No bulk or broadcast send tool, ever: messaging many people at once is what gets accounts banned.
 13. No `set_webhook` MCP tool, a deliberate gap in 81-tool parity. A webhook forwards every incoming message to a URL, so a client that could set it would be one prompt injection away from silently exfiltrating the account. The webhook URL is set only by the human in Advanced settings; `get_webhook` stays as a read (contract round 2, #88).
@@ -63,6 +63,7 @@ The primary user is non-technical: they can download a file, double-click it, an
 9. Read-only mode hides every write tool and refuses them if called directly, enforced in the tool registry and checked by property tests.
 10. The HTTP endpoint rejects missing and revoked tokens, refuses to listen off loopback without TLS, and a read-only token can't call a write tool.
 11. A tag push with any signing secret missing fails the release job and publishes nothing.
+12. A setup that never opens Advanced on the access screen ends read-only: Claude lists no write tools until the user ticks "Allow Claude to send messages as you".
 
 ## Open questions and risks
 
@@ -73,10 +74,10 @@ The primary user is non-technical: they can download a file, double-click it, an
 
 ## Prerequisites (owner, not code)
 
-- Apple Developer Program, individual: Developer ID Application certificate and a notarization API key.
-- Azure Artifact Signing account and certificate profile, verified as an individual.
+- Apple Developer Program, individual: Developer ID Application certificate and a notarization API key. Done; macOS releases build on the homelab's self-hosted Mac (mini-tv).
+- Azure Artifact Signing account and certificate profile, verified as an individual. Done; v0.1.1 was the first release with signed Windows installers.
 - One or two spare phone numbers, registered once on Signal's staging servers.
-- CI secrets set from those (`gh secret set`).
+- CI secrets set from those (`gh secret set`). Done for signing, in the `release` environment (docs/signing-setup.md); the staging numbers are still open.
 
 ## Delivery order
 

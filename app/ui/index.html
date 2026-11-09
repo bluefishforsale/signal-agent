@@ -128,22 +128,17 @@
     </section>
 
     <section data-screen="choose_access" hidden>
-      <h1>Let Claude send messages as you?</h1>
-      <fieldset class="choices">
-        <legend>What can Claude do?</legend>
-        <label class="choice">
-          <input type="radio" name="access" value="full" checked>
-          <span><strong>Yes</strong>
-          <small>Claude can read and send messages.</small></span>
-        </label>
-        <label class="choice">
-          <input type="radio" name="access" value="read_only">
-          <span><strong>No</strong>
-          <small>Claude can only read messages.</small></span>
-        </label>
-      </fieldset>
-      <p class="note">Claude could send something you didn't mean to, so read what it's about to send before you approve.</p>
+      <h1>Claude can read your messages</h1>
+      <p>Claude can search and read your Signal messages, but it can't send anything as you.</p>
       <div class="actions"><button class="primary" data-action="choose_access">Continue</button></div>
+      <details class="advanced">
+        <summary>Advanced</summary>
+        <label class="choice">
+          <input type="checkbox" name="allow_send">
+          <span><strong>Allow Claude to send messages as you</strong>
+          <small>Claude could send something you didn't mean to, so read what it's about to send before you approve.</small></span>
+        </label>
+      </details>
     </section>
 
     <section data-screen="importing_history" hidden>
