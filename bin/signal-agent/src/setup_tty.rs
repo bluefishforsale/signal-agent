@@ -178,8 +178,9 @@ fn render(state: &SetupState, out: &mut impl Write) -> io::Result<()> {
         SetupState::VerifyingCode { .. } => writeln!(out, "Checking the code..."),
         SetupState::ChooseAccess { kind } => writeln!(
             out,
-            "\n{}. One question about what Claude may do:\n\
-             Yes lets Claude send, react and delete as you; no lets it only read and search.",
+            "\n{}. Claude can read and search your messages, but it can't send anything as you\n\
+             unless you say yes here. Yes lets it send, react and delete as you, so read what\n\
+             it's about to send before you approve.",
             match kind {
                 ProfileKind::Linked => "Linked",
                 ProfileKind::Primary => "Registered",
@@ -306,7 +307,8 @@ fn ask(
             SetupEvent::CodeEntered { code }
         }
         SetupState::ChooseAccess { .. } => {
-            let access = if ask_yes(input, out, "Let Claude send messages as you?")? {
+            let question = "Let Claude send messages as you? [y/N]: ";
+            let access = if prompt(input, out, question, parse_no)? {
                 AccessMode::Full
             } else {
                 AccessMode::ReadOnly
@@ -597,13 +599,16 @@ mod tests {
     }
 
     /// Enter takes the recommended answer at every question with one: linking,
-    /// and full access ("Yes preselected").
+    /// restarting Claude Desktop, retrying, and read-only access (sending is
+    /// opt-in).
     #[test]
     fn enter_takes_the_recommended_answers() {
         assert_eq!(parse_account_choice(""), Ok(AccountChoice::LinkExisting));
         assert_eq!(parse_account_choice("2"), Ok(AccountChoice::OwnNumber));
         assert_eq!(parse_yes(""), Ok(true));
         assert_eq!(parse_yes("N"), Ok(false));
+        assert_eq!(parse_no(""), Ok(false));
+        assert_eq!(parse_no("Y"), Ok(true));
         assert_eq!(parse_retry(""), Ok(true));
         assert_eq!(parse_retry("q"), Ok(false));
         for typo in ["3", "maybe"] {
@@ -868,8 +873,9 @@ mod tests {
 
     /// A headless box over SSH, start to finish from typed answers: the key
     /// file caveat comes before anything is stored, the QR code is drawn, the
-    /// access question defaults to yes, a phone that sent no history says so,
-    /// and done says no Claude app was found.
+    /// access question defaults to no so pressing Enter ends read-only, a
+    /// phone that sent no history says so, and done says no Claude app was
+    /// found.
     #[tokio::test]
     async fn a_headless_link_runs_from_typed_answers_to_done() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -886,7 +892,7 @@ mod tests {
         );
         assert!(!scan(&out).is_empty(), "no QR code drawn: {out}");
         assert!(
-            out.contains("Let Claude send messages as you? [Y/n]"),
+            out.contains("Let Claude send messages as you? [y/N]"),
             "{out}"
         );
         assert!(
@@ -900,7 +906,10 @@ mod tests {
             driver.state()
         );
         let paths = ProfilePaths::under(dir.path().to_path_buf(), &ProfileName::default_profile());
-        assert_eq!(paths.load_access().expect("access saved"), AccessMode::Full);
+        assert_eq!(
+            paths.load_access().expect("access saved"),
+            AccessMode::ReadOnly
+        );
     }
 
     /// Setup run again on a set-up box must default to reconnecting Claude,

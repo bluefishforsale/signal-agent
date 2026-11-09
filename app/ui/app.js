@@ -225,7 +225,12 @@ const actions = {
   reconnect: () => send({ event: "reconnect" }),
   relink: () => send({ event: "relink" }),
   choose_account: () => send({ event: "account_chosen", choice: checked("account") }),
-  choose_access: () => send({ event: "access_chosen", access: checked("access") }),
+  choose_access: () => {
+    const allowSend = document.querySelector('input[name="allow_send"]');
+    send({ event: "access_chosen", access: allowSend.checked ? "full" : "read_only" });
+    // Setup can come back to this screen; it starts read-only every time.
+    allowSend.checked = false;
+  },
   restart_desktop: () => send({ event: "restart_desktop" }),
   retry: () => send({ event: "retry" }),
   cancel_setup: async (button) => {
