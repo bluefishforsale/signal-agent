@@ -63,7 +63,7 @@ jobs:
       # missing Azure inputs alone still fail the release (PRD acceptance 11).
       windows_signed: ${{ github.event_name == 'push' && vars.WINDOWS_UNSIGNED != 'true' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Every signing input is present
         if: github.event_name == 'push' || inputs.mode == 'check-secrets'
         env:
@@ -111,11 +111,11 @@ jobs:
       VERSION: ${{ needs.preflight.outputs.version }}
       BUNDLE: target/universal-apple-darwin/release/bundle
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: release-universal-apple-darwin
       - uses: ./.github/actions/setup-protoc
@@ -175,7 +175,7 @@ jobs:
           mkdir dist
           cp "$BUNDLE"/dmg/*.dmg "dist/signal-agent-$VERSION-macos-universal.dmg"
           COPYFILE_DISABLE=1 tar -czf "dist/signal-agent-$VERSION-macos-universal.app.tar.gz" -C "$BUNDLE/macos" "MCP Relay for Signal.app"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: dist-macos-universal
           path: dist/*
@@ -209,12 +209,12 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             binutils build-essential ca-certificates clang cmake curl git perl pkg-config unzip
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Rust toolchain
         run: |
           curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
           echo "$HOME/.cargo/bin" >>"$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: release-linux-${{ matrix.arch }}
       - uses: ./.github/actions/setup-protoc
@@ -229,7 +229,7 @@ jobs:
           mkdir -p "stage/$name" dist
           cp target/release/signal-agent LICENSE README.md "stage/$name/"
           tar -czf "dist/$name.tar.gz" -C stage "$name"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: dist-linux-${{ matrix.arch }}
           path: dist/*
@@ -252,11 +252,11 @@ jobs:
             target: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: release-${{ matrix.target }}
       - uses: ./.github/actions/setup-protoc
@@ -269,7 +269,7 @@ jobs:
       - run: Invoke-Expression "$env:TAURI_CLI build --ci --target ${{ matrix.target }} --no-bundle"
         shell: pwsh
         working-directory: app/src-tauri
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-app-${{ matrix.arch }}
           path: |
@@ -289,20 +289,20 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: windows-app-${{ matrix.arch }}
           path: app-exe
       # NOTE: signal-agent-ci's only role is Certificate Profile Signer on the
       # signing account, not the subscription, so login must not require one
       # ("No subscriptions found" otherwise). Same at every azure/login below.
-      - uses: azure/login@v3
+      - uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           allow-no-subscriptions: true
-      - uses: Azure/artifact-signing-action@v2
+      - uses: Azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
         with:
           endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
           signing-account-name: ${{ vars.AZURE_SIGNING_ACCOUNT }}
@@ -312,7 +312,7 @@ jobs:
           exclude-environment-credential: true
       - run: ./scripts/verify-authenticode.ps1 -Folder app-exe
         shell: pwsh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-app-${{ matrix.arch }}
           path: app-exe/*.exe
@@ -342,16 +342,16 @@ jobs:
     env:
       VERSION: ${{ needs.preflight.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: windows-app-${{ matrix.arch }}
           path: target/${{ matrix.target }}/release
       - run: scripts/stage-agent-sidecar.sh ${{ matrix.target }}
-      - uses: azure/login@v3
+      - uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
         if: needs.preflight.outputs.windows_signed == 'true'
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -391,7 +391,7 @@ jobs:
         run: |
           mkdir dist
           cp target/${{ matrix.target }}/release/bundle/nsis/*-setup.exe "dist/signal-agent-$VERSION-windows-${{ matrix.arch }}-setup.exe"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: dist-windows-${{ matrix.arch }}
           path: dist/*
@@ -409,17 +409,17 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: dist-windows-${{ matrix.arch }}
           path: dist
-      - uses: azure/login@v3
+      - uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           allow-no-subscriptions: true
-      - uses: Azure/artifact-signing-action@v2
+      - uses: Azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
         with:
           endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
           signing-account-name: ${{ vars.AZURE_SIGNING_ACCOUNT }}
@@ -431,7 +431,7 @@ jobs:
         shell: pwsh
       - run: ./scripts/check-nsis-payload.ps1 -Installer (Get-Item dist/*-setup.exe).FullName -RequireSigned
         shell: pwsh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: dist-windows-${{ matrix.arch }}
           path: dist/*
@@ -452,11 +452,11 @@ jobs:
       VERSION: ${{ needs.preflight.outputs.version }}
       BASE_URL: https://github.com/${{ github.repository }}/releases/download/v${{ needs.preflight.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: dist-*
           path: dist
@@ -475,7 +475,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PATH="$RUNNER_TEMP/throwaway.key" TAURI_SIGNING_PRIVATE_KEY_PASSWORD="" \
             UPDATER_PUBKEY="$(cat "$RUNNER_TEMP/throwaway.key.pub")" \
             scripts/release-manifest.sh dist "$VERSION" "$BASE_URL"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-${{ github.event_name == 'push' && github.ref_name || 'dry-run' }}
           path: dist/*
@@ -518,7 +518,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: dist-macos-universal
           path: dist
