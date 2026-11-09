@@ -6,7 +6,7 @@ members = ["crates/*", "bin/signal-agent", "app/src-tauri"]
 default-members = ["crates/*", "bin/signal-agent"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "AGPL-3.0-only"
 repository = "https://github.com/bluefishforsale/signal-agent"
