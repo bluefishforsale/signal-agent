@@ -241,6 +241,44 @@ mod tests {
         assert!(signal.sent().is_empty(), "a read-only sweep reached Signal");
     }
 
+    /// A client only sees the visible tools, so a visible tool's description
+    /// that points at a hidden one sends the model after a tool it can't
+    /// call. Found in read-only mode by the installed-app test on 2026-11-07.
+    #[test]
+    fn no_visible_tool_description_names_a_hidden_tool() {
+        let registry = Registry::standard();
+        let names_tool = |text: &str, name: &str| {
+            text.match_indices(name).any(|(i, _)| {
+                let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+                let before = text[..i].chars().next_back();
+                let after = text[i + name.len()..].chars().next();
+                !before.is_some_and(word) && !after.is_some_and(word)
+            })
+        };
+        for (mode, kind) in [
+            (AccessMode::ReadOnly, ProfileKind::Primary),
+            (AccessMode::Full, ProfileKind::Linked),
+            (AccessMode::ReadOnly, ProfileKind::Linked),
+        ] {
+            let (ctx, _) = ctx(mode, kind);
+            let visible: Vec<_> = registry.visible(&ctx).collect();
+            let hidden: Vec<_> = registry
+                .all()
+                .filter(|t| !visible.iter().any(|v| v.name() == t.name()))
+                .collect();
+            for tool in &visible {
+                for gone in &hidden {
+                    assert!(
+                        !names_tool(tool.description(), gone.name()),
+                        "{} names {}, which {mode:?} on a {kind:?} profile hides",
+                        tool.name(),
+                        gone.name()
+                    );
+                }
+            }
+        }
+    }
+
     /// Sweep every shipped tool: on a linked profile a primary-only tool must
     /// be neither listed nor run, even with full access and an input its own
     /// schema accepts, and nothing may reach Signal. Linked profiles are the
